@@ -173,3 +173,9 @@ configs/local/default.yaml
 .claude/
 .codex/
 .codex
+
+/datasets
+!arc/datasets/
+!arc/datasets/**/*.py
+
+*.pdf

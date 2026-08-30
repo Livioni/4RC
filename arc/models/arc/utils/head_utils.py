@@ -157,7 +157,7 @@ def create_uv_grid(
     device: torch.device = None,
 ) -> torch.Tensor:
     """
-    Create a normalized UV grid of shape (width, height, 2).
+    Create a normalized UV grid of shape (height, width, 2).
 
     The grid spans horizontally and vertically according to an aspect ratio,
     ensuring the top-left corner is at (-x_span, -y_span) and the bottom-right
@@ -171,7 +171,7 @@ def create_uv_grid(
         device (torch.device, optional): Device on which the tensor is created.
 
     Returns:
-        torch.Tensor: A (width, height, 2) tensor of UV coordinates.
+        torch.Tensor: A (height, width, 2) tensor of UV coordinates.
     """
     # Derive aspect ratio if not explicitly provided
     if aspect_ratio is None:
@@ -192,7 +192,7 @@ def create_uv_grid(
     x_coords = torch.linspace(left_x, right_x, steps=width, dtype=dtype, device=device)
     y_coords = torch.linspace(top_y, bottom_y, steps=height, dtype=dtype, device=device)
 
-    # Create 2D meshgrid (width x height) and stack into UV
+    # Create 2D meshgrid (height x width) and stack into UV
     uu, vv = torch.meshgrid(x_coords, y_coords, indexing="xy")
     uv_grid = torch.stack((uu, vv), dim=-1)
 

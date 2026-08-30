@@ -1,5 +1,6 @@
 # --------- lightning --------- #
 lightning>=2.5.0
+tensorboard
 lightning-bolts
 lightning-utilities
 torchmetrics

@@ -188,6 +188,33 @@ class Arc(
         }
         if freeze in to_be_frozen:
              freeze_all_params(to_be_frozen[freeze])
+
+    def configure_trainable_modules(
+        self,
+        *,
+        backbone: bool = True,
+        geometry_head: bool = True,
+        camera_decoder: bool = False,
+        motion_decoder: bool = False,
+    ) -> dict[str, bool]:
+        """Configure trainable 4RC components with an explicit whitelist.
+
+        ``motion_decoder`` controls both the conditional motion decoder and its
+        dense DPT tracking head. Starting from an all-frozen model prevents a
+        later global ``requires_grad_(True)`` call from accidentally unfreezing
+        camera or motion parameters.
+        """
+        self.requires_grad_(False)
+        modules = {
+            "backbone": (self.backbone, backbone),
+            "geometry_head": (self.head, geometry_head),
+            "camera_decoder": (self.cam_dec, camera_decoder),
+            "motion_decoder": (self.motion_decoder, motion_decoder),
+            "track_head": (self.track_head, motion_decoder),
+        }
+        for module, trainable in modules.values():
+            module.requires_grad_(trainable)
+        return {name: trainable for name, (_, trainable) in modules.items()}
     
     def forward(
         self,
@@ -196,6 +223,8 @@ class Arc(
         profiling=False,
         force_no_output_conversion=False,
         inference_track = True,
+        decode_camera: bool = True,
+        decode_motion: bool = True,
         **kwargs
     ):
         if profiling:
@@ -204,7 +233,14 @@ class Arc(
 
         images, track_query_idx = self._preprocess_input(views)
 
-        predictions = self._forward(images, track_query_idx, inference_track=inference_track, **kwargs)
+        predictions = self._forward(
+            images,
+            track_query_idx,
+            inference_track=inference_track,
+            decode_camera=decode_camera,
+            decode_motion=decode_motion,
+            **kwargs,
+        )
         
         if not self.training and not force_no_output_conversion:
             predictions = self._postprocess_output(predictions, use_ray_pose)
@@ -221,6 +257,8 @@ class Arc(
         track_query_idx,
         ref_view_strategy: str = "first",
         inference_track: bool = True,
+        decode_camera: bool = True,
+        decode_motion: bool = True,
     ) -> Dict[str, torch.Tensor]:
         feats, _ = self.backbone(
             x, ref_view_strategy=ref_view_strategy,
@@ -233,11 +271,12 @@ class Arc(
         # Process features through depth head
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
             output = self.head(feats, H, W, patch_start_idx=0)
-            pose_enc = self.cam_dec(feats[-1][1])
-            output["pose_enc"] = pose_enc
-            output["pose_enc_list"] = [pose_enc]
+            if decode_camera:
+                pose_enc = self.cam_dec(feats[-1][1])
+                output["pose_enc"] = pose_enc
+                output["pose_enc_list"] = [pose_enc]
             
-        if inference_track:
+        if inference_track and decode_motion:
             frames_chunk_size = 1 if self.training else 8
             track_list = []
             conf_list = []

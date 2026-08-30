@@ -124,6 +124,50 @@ with torch.no_grad():
     )
 ``` 
 
+## Geometry training on RoboTwin
+
+The repository includes a geometry-only training path adapted from
+Depth-Anything-Next. It trains the ViT backbone and the complete `DualDPT`
+geometry head with the 4RC depth and ray objectives; the camera decoder,
+motion decoder, and tracking head are frozen and skipped during forward.
+
+RoboTwin is sampled as a video: each clip contains 2-18 frames in strict
+temporal order with a random interval of 1-5 frames. Only `head_view` is used.
+The native 320x240 images are not resized or cropped. They are reflect-padded
+to 322x252 for patch-size-14 compatibility, and the padding is excluded from
+all losses.
+
+```bash
+conda activate 4rc
+accelerate launch train_4rc.py \
+  --config configs/train/4rc-giant-train.py \
+  --data-root datasets/RoboTwin
+```
+
+
+See [README_TRAIN_CN.md](README_TRAIN_CN.md) for the complete Chinese guide to configuration, launch, resume, losses, and memory usage.
+Use `--pretrained-model /path/to/checkpoint-or-hf-directory` for a local
+checkpoint and `--resume outputs/.../checkpoint-N` to restore the complete
+optimizer, scheduler, RNG, epoch, and batch state. A short pipeline check can
+be run with `--max-episodes 1 --max-train-steps 1`.
+
+Trainability can also be configured directly:
+
+```python
+model.configure_trainable_modules(
+    backbone=True,
+    geometry_head=True,
+    camera_decoder=False,
+    motion_decoder=False,  # also freezes track_head
+)
+```
+
+RoboTwin's `head_view` calibration is fixed. Depth supervision remains useful,
+but the ray branch can learn a camera-specific spatial template rather than a
+general camera model. Furthermore, frozen camera and motion weights still see
+a changing backbone feature distribution; fine-tune those decoders before
+re-enabling them in a later motion-training stage.
+
 ## :zap: Demo
 
 Launch the interactive Gradio demo:
