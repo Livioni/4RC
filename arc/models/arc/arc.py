@@ -15,6 +15,7 @@ from arc.models.arc.heads.dualdpt import DualDPT
 from arc.models.arc.heads.cam_dec import CameraDec
 from arc.models.arc.heads.motiondecoder import MotionDecoder
 from arc.models.arc.heads.dpt_head import DPTHead
+from arc.models.arc.heads.tcp_head import TCPQueryEncoder, TCPTrackHead
 
 from arc.dust3r.utils.image import ImgRenormalize
 from arc.dust3r.utils.misc import freeze_all_params
@@ -66,6 +67,9 @@ class Arc(
             conf_activation="expp1",
             intermediate_layer_idx=[0, 1, 2, 3],
         )
+
+        self.tcp_query_encoder = TCPQueryEncoder(embed_dim=1536)
+        self.tcp_track_head = TCPTrackHead(embed_dim=1536)
 
         self.set_freeze(freeze)
 
@@ -167,7 +171,7 @@ class Arc(
                 preds["depth"].device
             )
 
-            output_list.append({
+            frame_output = {
                 "pts": pts3d_world,
                 "conf": depth_conf_list[i],
                 "track": track,
@@ -177,7 +181,21 @@ class Arc(
                 "track_query_idx": track_query_idx_tensor,
                 "extrinsic": extrinsic_c2w,
                 "intrinsic": intrinsic_matrix,
-            })
+            }
+            if "tcp_position" in preds:
+                for key in (
+                    "tcp_delta_position",
+                    "tcp_position",
+                    "tcp_relative_rotation",
+                    "tcp_rotation",
+                    "tcp_gripper_logit",
+                    "tcp_confidence",
+                ):
+                    frame_output[key] = preds[key][:, i]
+                frame_output["tcp_gripper_probability"] = torch.sigmoid(
+                    preds["tcp_gripper_logit"][:, i]
+                )
+            output_list.append(frame_output)
 
         return output_list
 
@@ -196,21 +214,23 @@ class Arc(
         geometry_head: bool = True,
         camera_decoder: bool = False,
         motion_decoder: bool = False,
+        tcp_tracker: bool = False,
     ) -> dict[str, bool]:
         """Configure trainable 4RC components with an explicit whitelist.
 
-        ``motion_decoder`` controls both the conditional motion decoder and its
-        dense DPT tracking head. Starting from an all-frozen model prevents a
-        later global ``requires_grad_(True)`` call from accidentally unfreezing
-        camera or motion parameters.
+        The sparse TCP tracker and dense tracker share ``motion_decoder`` but
+        have independent output heads.
         """
         self.requires_grad_(False)
+        train_shared_motion = motion_decoder or tcp_tracker
         modules = {
             "backbone": (self.backbone, backbone),
             "geometry_head": (self.head, geometry_head),
             "camera_decoder": (self.cam_dec, camera_decoder),
-            "motion_decoder": (self.motion_decoder, motion_decoder),
+            "motion_decoder": (self.motion_decoder, train_shared_motion),
             "track_head": (self.track_head, motion_decoder),
+            "tcp_query_encoder": (self.tcp_query_encoder, tcp_tracker),
+            "tcp_track_head": (self.tcp_track_head, tcp_tracker),
         }
         for module, trainable in modules.values():
             module.requires_grad_(trainable)
@@ -225,6 +245,8 @@ class Arc(
         inference_track = True,
         decode_camera: bool = True,
         decode_motion: bool = True,
+        tcp_query_state: torch.Tensor | None = None,
+        decode_tcp: bool = False,
         **kwargs
     ):
         if profiling:
@@ -239,6 +261,8 @@ class Arc(
             inference_track=inference_track,
             decode_camera=decode_camera,
             decode_motion=decode_motion,
+            tcp_query_state=tcp_query_state,
+            decode_tcp=decode_tcp,
             **kwargs,
         )
         
@@ -259,6 +283,8 @@ class Arc(
         inference_track: bool = True,
         decode_camera: bool = True,
         decode_motion: bool = True,
+        tcp_query_state: torch.Tensor | None = None,
+        decode_tcp: bool = False,
         return_aux_pyramid: bool = True,
     ) -> Dict[str, torch.Tensor]:
         feats, _ = self.backbone(
@@ -306,6 +332,26 @@ class Arc(
             output["conf_track"] = conf_list[0]
             output["track_multi"] = torch.stack(track_list, dim=1)
             output["conf_track_multi"] = torch.stack(conf_list, dim=1)
+
+        if decode_tcp:
+            if tcp_query_state is None:
+                raise ValueError("tcp_query_state is required when decode_tcp=True")
+            query_tokens = self.tcp_query_encoder(tcp_query_state)
+            sparse_motion_levels = []
+            for feature in feats:
+                feature = torch.cat(
+                    [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
+                    dim=2,
+                )[..., 1536:]
+                sparse_motion_levels.append(
+                    self.motion_decoder(
+                        feature,
+                        images=x,
+                        patch_start_idx=2,
+                        query_tokens=query_tokens,
+                    )
+                )
+            output.update(self.tcp_track_head(sparse_motion_levels, tcp_query_state))
 
         output['track_query_idx'] = output_track_query_idx
 

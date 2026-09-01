@@ -1,11 +1,11 @@
-"""Default geometry-only 4RC training configuration for RoboTwin."""
+"""Single-stage geometry and sparse TCP tracking configuration for RoboTwin."""
 
 # ======================================================
-# 4RC Geometry Training Configuration
+# 4RC Geometry + TCP Tracking Configuration
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-robotwin-geometry"
+output_dir = "outputs/4rc-robotwin-tcp-debug"
 logging_dir = "logs"
 pretrained_model = "Luo-Yihang/4RC"
 resume = None
@@ -17,8 +17,12 @@ min_views = 2
 max_views = 18
 min_interval = 1
 max_interval = 5
-# Randomly reverse half of the sampled clips for bidirectional temporal training.
+# Each clip's first sampled frame is its query. Random starts and reversal make
+# both forward and reverse queries arbitrary episode frames.
 reverse_probability = 0.5
+# One saved frame spans 14 simulator steps at 0.004 seconds per step:
+# dt = 0.004 * 14 = 0.056 s, frame rate = 1 / dt ~= 17.857 Hz.
+frame_rate = 1.0 / (0.004 * 14)
 max_episodes = None
 augment = True
 # Keep RoboTwin depth and camera translations in meters. Set to True to use
@@ -35,6 +39,7 @@ train_backbone = True
 train_geometry_head = True
 train_camera_decoder = False
 train_motion_decoder = False
+train_tcp_tracker = True
 
 # == Training Configuration ==
 seed = 42
@@ -50,6 +55,8 @@ find_unused_parameters = True
 # == Optimizer Configuration ==
 lr_backbone = 1e-5
 lr_head = 2e-5
+lr_motion_decoder = 1e-5
+lr_tcp = 1e-4
 adam_beta1 = 0.9
 adam_beta2 = 0.95
 adam_epsilon = 1e-8
@@ -66,6 +73,14 @@ loss_gamma = 1.0
 loss_alpha = 0.2
 depth_valid_range = 0.98
 gradient_scales = 4
+
+tcp_loss_weight = 1.0
+tcp_point_scale = 0.1
+tcp_virtual_point_radius = 0.03
+tcp_rotation_weight = 0.5
+tcp_temporal_weight = 0.2
+tcp_gripper_weight = 0.2
+tcp_velocity_scale = 1.0
 
 # == Logging and Checkpoint Configuration ==
 log_every_steps = 10

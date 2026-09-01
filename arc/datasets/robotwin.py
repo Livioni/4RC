@@ -26,6 +26,9 @@ class RoboTwinEpisode:
 class RoboTwin4RC(Dataset[dict[str, Any]]):
     """One forward- or reverse-ordered ``head_view`` clip per episode and epoch.
 
+    The first sampled frame is always the TCP query. Random clip starts and
+    temporal reversal therefore allow the query to be any valid episode frame.
+
     RoboTwin frames stay at their native 320x240 resolution. They are only
     padded to 322x252 so both dimensions are divisible by 4RC's patch size 14.
     """
@@ -49,6 +52,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         min_interval: int = 1,
         max_interval: int = 5,
         reverse_probability: float = 0.5,
+        frame_rate: float = 1.0 / (0.004 * 14),
         seed: int = 42,
         augment: bool = True,
         max_episodes: int | None = None,
@@ -60,6 +64,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         self.min_interval = min_interval
         self.max_interval = max_interval
         self.reverse_probability = float(reverse_probability)
+        self.frame_rate = float(frame_rate)
         self.seed = seed
         self.augment = augment
         self.epoch = 0
@@ -72,6 +77,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             raise ValueError("Expected 1 <= min_interval <= max_interval")
         if not 0.0 <= self.reverse_probability <= 1.0:
             raise ValueError("reverse_probability must be between 0 and 1")
+        if self.frame_rate <= 0:
+            raise ValueError("frame_rate must be positive")
 
         episodes: list[RoboTwinEpisode] = []
         for episode_path in sorted(self.root.glob("*/*")):
@@ -81,11 +88,15 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             depth_dir = episode_path / "depths" / view
             intrinsics_file = episode_path / "intrinsics" / f"{view}.npy"
             extrinsics_file = episode_path / "extrinsics" / f"{view}.npy"
+            left_tcp_file = episode_path / "TCP" / "left_state.npy"
+            right_tcp_file = episode_path / "TCP" / "right_state.npy"
             if not (
                 rgb_dir.is_dir()
                 and depth_dir.is_dir()
                 and intrinsics_file.is_file()
                 and extrinsics_file.is_file()
+                and left_tcp_file.is_file()
+                and right_tcp_file.is_file()
             ):
                 continue
             extrinsics = np.load(extrinsics_file, mmap_mode="r")
@@ -97,6 +108,12 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             first_depth = depth_dir / "000000.png"
             last_depth = depth_dir / f"{num_frames - 1:06d}.png"
             if not all(path.is_file() for path in (first_rgb, last_rgb, first_depth, last_depth)):
+                continue
+            left_tcp = np.load(left_tcp_file, mmap_mode="r")
+            right_tcp = np.load(right_tcp_file, mmap_mode="r")
+            if left_tcp.shape != right_tcp.shape or left_tcp.ndim != 2:
+                continue
+            if left_tcp.shape[0] < num_frames or left_tcp.shape[1] != 7:
                 continue
             episodes.append(
                 RoboTwinEpisode(
@@ -229,6 +246,15 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         extrinsics_all = np.load(
             episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r"
         )
+        left_tcp_all = np.load(
+            episode.path / "TCP" / "left_state.npy", mmap_mode="r"
+        )
+        right_tcp_all = np.load(
+            episode.path / "TCP" / "right_state.npy", mmap_mode="r"
+        )
+        tcp_state = np.stack(
+            (left_tcp_all[frame_indices], right_tcp_all[frame_indices]), axis=1
+        ).astype(np.float32, copy=False)
 
         images: list[torch.Tensor] = []
         depths: list[torch.Tensor] = []
@@ -289,6 +315,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             "intrinsics": torch.from_numpy(intrinsics).expand(len(images), -1, -1).clone(),
             "extrinsics": torch.from_numpy(np.asarray(extrinsics_all[frame_indices]).copy()),
             "frame_indices": torch.from_numpy(frame_indices),
+            "frame_times": torch.from_numpy(frame_indices.astype(np.float32) / self.frame_rate),
+            "tcp_state": torch.from_numpy(tcp_state.copy()),
             "interval": interval,
             "task": episode.task,
             "episode": episode.name,

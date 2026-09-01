@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Geometry-only 4RC training on RoboTwin.
+"""Single-stage geometry and sparse TCP tracking training on RoboTwin.
 
 Example:
     accelerate launch train_4rc.py --config configs/train/4rc-giant-train.py
@@ -36,7 +36,7 @@ from arc.datasets.utils import (
     geometry_to_first_camera,
     resize_ray_valid_mask,
 )
-from arc.loss import GeometryLoss
+from arc.loss import GeometryLoss, TCPTrackingLoss
 
 
 LOGGER = logging.getLogger("4rc.train")
@@ -125,12 +125,15 @@ def build_optimizer(model: Arc, config: dict[str, Any]) -> torch.optim.AdamW:
     for name, module, learning_rate in (
         ("backbone", model.backbone, config["lr_backbone"]),
         ("geometry_head", model.head, config["lr_head"]),
+        ("motion_decoder", model.motion_decoder, config["lr_motion_decoder"]),
+        ("tcp_query_encoder", model.tcp_query_encoder, config["lr_tcp"]),
+        ("tcp_track_head", model.tcp_track_head, config["lr_tcp"]),
     ):
         parameters = [parameter for parameter in module.parameters() if parameter.requires_grad]
         if parameters:
             groups.append({"params": parameters, "lr": learning_rate, "name": name})
     if not groups:
-        raise RuntimeError("No trainable backbone or geometry-head parameters")
+        raise RuntimeError("No trainable model parameters")
     return torch.optim.AdamW(
         groups,
         betas=(config["adam_beta1"], config["adam_beta2"]),
@@ -250,7 +253,7 @@ def main() -> None:
         key: json.dumps(value) if isinstance(value, (tuple, list, dict)) else value
         for key, value in config.items()
     }
-    accelerator.init_trackers("4RC-RoboTwin-Geometry", config=tracker_config)
+    accelerator.init_trackers("4RC-RoboTwin-TCP", config=tracker_config)
 
     dataset = RoboTwin4RC(
         config["data_root"],
@@ -260,6 +263,7 @@ def main() -> None:
         min_interval=config["min_interval"],
         max_interval=config["max_interval"],
         reverse_probability=config.get("reverse_probability", 0.5),
+        frame_rate=config.get("frame_rate", 1.0 / (0.004 * 14)),
         seed=config["seed"],
         augment=config["augment"],
         max_episodes=config.get("max_episodes"),
@@ -287,9 +291,10 @@ def main() -> None:
         geometry_head=config["train_geometry_head"],
         camera_decoder=config["train_camera_decoder"],
         motion_decoder=config["train_motion_decoder"],
+        tcp_tracker=config.get("train_tcp_tracker", True),
     )
     optimizer = build_optimizer(model, config)
-    criterion = GeometryLoss(
+    geometry_criterion = GeometryLoss(
         depth_weight=config["depth_loss_weight"],
         ray_weight=config["ray_loss_weight"],
         gamma=config["loss_gamma"],
@@ -297,8 +302,19 @@ def main() -> None:
         depth_valid_range=config["depth_valid_range"],
         gradient_scales=config["gradient_scales"],
     )
+    tcp_criterion = TCPTrackingLoss(
+        point_scale=config.get("tcp_point_scale", 0.1),
+        virtual_point_radius=config.get("tcp_virtual_point_radius", 0.03),
+        rotation_weight=config.get("tcp_rotation_weight", 0.5),
+        temporal_weight=config.get("tcp_temporal_weight", 0.2),
+        gripper_weight=config.get("tcp_gripper_weight", 0.2),
+        velocity_scale=config.get("tcp_velocity_scale", 1.0),
+        gamma=config["loss_gamma"],
+        alpha=config["loss_alpha"],
+    )
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
-    criterion = criterion.to(accelerator.device)
+    geometry_criterion = geometry_criterion.to(accelerator.device)
+    tcp_criterion = tcp_criterion.to(accelerator.device)
 
     steps_per_epoch = math.ceil(len(dataloader) / config["gradient_accumulation_steps"])
     planned_steps = steps_per_epoch * config["num_train_epochs"]
@@ -368,6 +384,8 @@ def main() -> None:
                         inference_track=False,
                         decode_camera=False,
                         decode_motion=False,
+                        tcp_query_state=batch["tcp_state"][:, 0],
+                        decode_tcp=True,
                         return_aux_pyramid=False,
                         ref_view_strategy="first",
                     )
@@ -376,8 +394,16 @@ def main() -> None:
                     predictions,
                     normalize=config.get("normalize_geometry", False),
                 )
-                losses = criterion(predictions, batch)
-                accelerator.backward(losses["objective"])
+                geometry_losses = geometry_criterion(predictions, batch)
+                tcp_losses = tcp_criterion(predictions, batch)
+                total_objective = (
+                    geometry_losses["objective"]
+                    + config.get("tcp_loss_weight", 1.0) * tcp_losses["objective"]
+                )
+                losses = {f"geometry/{key}": value for key, value in geometry_losses.items()}
+                losses.update({f"tcp/{key}": value for key, value in tcp_losses.items()})
+                losses["objective"] = total_objective
+                accelerator.backward(total_objective)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
                 optimizer.step()

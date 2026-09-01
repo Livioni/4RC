@@ -180,3 +180,5 @@ configs/local/default.yaml
 
 *.pdf
 /outputs/
+/checkpoints/
+/glb_outputs/

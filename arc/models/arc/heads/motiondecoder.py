@@ -97,6 +97,7 @@ class MotionDecoder(nn.Module):
         images: torch.Tensor,
         patch_start_idx: int,
         track_query_idx = 0,
+        query_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -109,8 +110,18 @@ class MotionDecoder(nn.Module):
         patches = tokens[:, :, patch_start_idx:, :] # [B, S, P, C]
         P = patches.shape[2]
 
-        query_patches = patches[:, track_query_idx:track_query_idx+1, :, :]
-        query_patches = query_patches.expand(B, S, P, C)
+        if query_tokens is None:
+            query_patches = patches[:, track_query_idx:track_query_idx+1, :, :]
+            query_patches = query_patches.expand(B, S, P, C)
+            query_count = P
+        else:
+            if query_tokens.ndim != 3 or query_tokens.shape[0] != B or query_tokens.shape[2] != C:
+                raise ValueError(
+                    f"Expected query_tokens [B,Q,C] with B={B}, C={C}, "
+                    f"got {tuple(query_tokens.shape)}"
+                )
+            query_count = query_tokens.shape[1]
+            query_patches = query_tokens[:, None].expand(B, S, query_count, C)
         
         time_emb = tokens[:, :, 1:2, :]
         
@@ -132,9 +143,18 @@ class MotionDecoder(nn.Module):
 
             pos_patches = pos_patches + 1
 
-            pos_time = torch.zeros(B * S, 1, 2, device=tokens.device, dtype=pos_patches.dtype)
-
-            pos_q = torch.cat([pos_time, pos_patches], dim=1)
+            pos_time = torch.zeros(
+                B * S, 1, 2, device=tokens.device, dtype=pos_patches.dtype
+            )
+            if query_tokens is None:
+                pos_q = torch.cat([pos_time, pos_patches], dim=1)
+            else:
+                pos_tcp = torch.zeros(
+                    B * S, query_count, 2,
+                    device=tokens.device,
+                    dtype=pos_patches.dtype,
+                )
+                pos_q = torch.cat([pos_time, pos_tcp], dim=1)
 
             pos_k = pos_patches
 
@@ -176,6 +196,6 @@ class MotionDecoder(nn.Module):
                     else:
                         query = self.self_blocks[cur_i](query, pos=pos_q)
 
-        query = query.view(B, S, 1+P, C)
+        query = query.view(B, S, 1 + query_count, C)
         
         return query
