@@ -131,6 +131,10 @@ train_motion_decoder = False
 
 `train_motion_decoder=False` 会同时冻结 motion decoder 和 track head。训练前向还会跳过 camera/motion decoder，因此不只是关闭梯度，也能节省计算和显存。
 
+`find_unused_parameters=True` 必须保持开启：DualDPT 为兼容预训练权重保留了
+ray 金字塔各层的预测模块，而当前几何目标只监督最终 ray 层。关闭该选项会让
+DDP 在第二次同步反传后报 `Expected to have finished reduction`。
+
 等价的模型接口为：
 
 ```python

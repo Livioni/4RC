@@ -259,6 +259,7 @@ class Arc(
         inference_track: bool = True,
         decode_camera: bool = True,
         decode_motion: bool = True,
+        return_aux_pyramid: bool = True,
     ) -> Dict[str, torch.Tensor]:
         feats, _ = self.backbone(
             x, ref_view_strategy=ref_view_strategy,
@@ -271,6 +272,9 @@ class Arc(
         # Process features through depth head
         with torch.autocast(device_type=next(self.parameters()).device.type, dtype=torch.float32):
             output = self.head(feats, H, W, patch_start_idx=0)
+            if not return_aux_pyramid:
+                output.pop("ray_list", None)
+                output.pop("ray_conf_list", None)
             if decode_camera:
                 pose_enc = self.cam_dec(feats[-1][1])
                 output["pose_enc"] = pose_enc

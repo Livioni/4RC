@@ -224,7 +224,12 @@ def main() -> None:
     project_config = ProjectConfiguration(
         project_dir=str(output_dir), logging_dir=str(output_dir / config["logging_dir"])
     )
-    ddp = DistributedDataParallelKwargs(find_unused_parameters=False)
+    # DualDPT keeps prediction layers for every ray-pyramid level for checkpoint
+    # compatibility, while the geometry objective supervises only the final level.
+    # Those intermediate prediction layers therefore intentionally have no grad.
+    ddp = DistributedDataParallelKwargs(
+        find_unused_parameters=config.get("find_unused_parameters", True)
+    )
     accelerator = Accelerator(
         mixed_precision=config["mixed_precision"],
         gradient_accumulation_steps=config["gradient_accumulation_steps"],
@@ -363,6 +368,7 @@ def main() -> None:
                         inference_track=False,
                         decode_camera=False,
                         decode_motion=False,
+                        return_aux_pyramid=False,
                         ref_view_strategy="first",
                     )
                 batch = prepare_geometry_batch(
@@ -445,4 +451,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # ``Accelerator.end_training`` handles the normal path. Also clean up
+        # after an exception so NCCL does not report a leaked process group.
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()

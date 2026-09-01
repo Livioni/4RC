@@ -25,9 +25,8 @@ augment = True
 # the legacy per-scene unit-mean-distance normalization.
 normalize_geometry = False
 num_workers = 8
-train_batch_images = 2
-# scene_counts = (1, 2, 3, 6, 9)
-scene_counts = (1,2)
+train_batch_images = 18
+scene_counts = (1, 2, 3, 6, 9)
 batches_per_epoch = None
 recent_buffer_size = 10_000
 
@@ -44,6 +43,9 @@ max_train_steps = 50_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"
 max_grad_norm = 1.0
+# DualDPT retains intermediate ray-pyramid prediction layers, but this
+# geometry-only objective supervises only the final ray level.
+find_unused_parameters = True
 
 # == Optimizer Configuration ==
 lr_backbone = 1e-5

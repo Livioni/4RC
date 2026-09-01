@@ -179,3 +179,4 @@ configs/local/default.yaml
 !arc/datasets/**/*.py
 
 *.pdf
+/outputs/
