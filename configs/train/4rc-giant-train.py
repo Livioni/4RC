@@ -17,6 +17,8 @@ min_views = 2
 max_views = 18
 min_interval = 1
 max_interval = 5
+# Randomly reverse half of the sampled clips for bidirectional temporal training.
+reverse_probability = 0.5
 max_episodes = None
 augment = True
 # Keep RoboTwin depth and camera translations in meters. Set to True to use

@@ -131,8 +131,9 @@ Depth-Anything-Next. It trains the ViT backbone and the complete `DualDPT`
 geometry head with the 4RC depth and ray objectives; the camera decoder,
 motion decoder, and tracking head are frozen and skipped during forward.
 
-RoboTwin is sampled as a video: each clip contains 2-18 frames in strict
-temporal order with a random interval of 1-5 frames. Only `head_view` is used.
+RoboTwin is sampled as a video: each clip contains 2-18 frames with a random
+interval of 1-5 frames, then is kept forward or reversed with equal probability.
+Only `head_view` is used.
 The native 320x240 images are not resized or cropped. They are reflect-padded
 to 322x252 for patch-size-14 compatibility, and the padding is excluded from
 all losses.

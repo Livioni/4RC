@@ -254,6 +254,7 @@ def main() -> None:
         max_views=config["max_views"],
         min_interval=config["min_interval"],
         max_interval=config["max_interval"],
+        reverse_probability=config.get("reverse_probability", 0.5),
         seed=config["seed"],
         augment=config["augment"],
         max_episodes=config.get("max_episodes"),

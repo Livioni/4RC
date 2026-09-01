@@ -76,6 +76,7 @@ min_views = 2
 max_views = 18
 min_interval = 1
 max_interval = 5
+reverse_probability = 0.5
 max_episodes = None
 augment = True
 num_workers = 8
@@ -95,7 +96,10 @@ DataLoader batch 始终输入 18 张图。每步从 `scene_counts` 均匀选择�
 
 张量形状为 `[B,S,3,252,322]`，不会把不同 episode 当成同一个 18 帧
 序列。每个场景仍使用 4RC 时序采样：随机选择 `min_interval～max_interval`
-的固定时间间隔，再随机选择合法起点；外参不参与帧选择。
+的固定时间间隔，再随机选择合法起点；采样完成后以
+`reverse_probability` 的概率将整个 clip 倒序（默认正序、倒序各 50%）。RGB、
+depth 和相机参数会同步倒序；外参不参与帧选择。设为 `0` 可保持仅正序，设为
+`1` 则始终倒序。
 
 `batches_per_epoch=None` 表示每个 epoch 产生 `len(dataset)` 个逻辑
 batch。`recent_buffer_size` 用于降低 episode 在相邻 batch 中被重复选择的

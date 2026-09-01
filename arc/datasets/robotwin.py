@@ -24,7 +24,7 @@ class RoboTwinEpisode:
 
 
 class RoboTwin4RC(Dataset[dict[str, Any]]):
-    """One temporally ordered ``head_view`` clip per episode and epoch.
+    """One forward- or reverse-ordered ``head_view`` clip per episode and epoch.
 
     RoboTwin frames stay at their native 320x240 resolution. They are only
     padded to 322x252 so both dimensions are divisible by 4RC's patch size 14.
@@ -48,6 +48,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         max_views: int = 18,
         min_interval: int = 1,
         max_interval: int = 5,
+        reverse_probability: float = 0.5,
         seed: int = 42,
         augment: bool = True,
         max_episodes: int | None = None,
@@ -58,6 +59,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         self.max_views = max_views
         self.min_interval = min_interval
         self.max_interval = max_interval
+        self.reverse_probability = float(reverse_probability)
         self.seed = seed
         self.augment = augment
         self.epoch = 0
@@ -68,6 +70,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             raise ValueError("Expected 2 <= min_views <= max_views")
         if min_interval < 1 or max_interval < min_interval:
             raise ValueError("Expected 1 <= min_interval <= max_interval")
+        if not 0.0 <= self.reverse_probability <= 1.0:
+            raise ValueError("reverse_probability must be between 0 and 1")
 
         episodes: list[RoboTwinEpisode] = []
         for episode_path in sorted(self.root.glob("*/*")):
@@ -155,7 +159,14 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         interval = int(rng.integers(self.min_interval, max_interval + 1))
         last_offset = (num_views - 1) * interval
         start = int(rng.integers(0, num_frames - last_offset))
-        return start + np.arange(num_views, dtype=np.int64) * interval, interval
+        frame_indices = start + np.arange(num_views, dtype=np.int64) * interval
+        reverse = self.reverse_probability >= 1.0 or (
+            self.reverse_probability > 0.0
+            and rng.random() < self.reverse_probability
+        )
+        if reverse:
+            frame_indices = frame_indices[::-1].copy()
+        return frame_indices, interval
 
     @staticmethod
     def _sample_augmentation(rng: np.random.Generator) -> dict[str, Any]:
