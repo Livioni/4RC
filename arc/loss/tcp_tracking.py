@@ -118,14 +118,31 @@ class TCPTrackingLoss(nn.Module):
             + self.temporal_weight * temporal_loss
             + self.gripper_weight * gripper_loss
         )
+        position_error = torch.linalg.vector_norm(
+            pred_position - target_position, dim=-1
+        )
+        if target_state.shape[1] > 1:
+            nonquery_position_error = position_error[:, 1:].mean()
+            predicted_displacement = torch.linalg.vector_norm(
+                pred_position[:, 1:] - pred_position[:, :1], dim=-1
+            ).mean()
+            static_baseline = torch.linalg.vector_norm(
+                target_position[:, 1:] - target_position[:, :1], dim=-1
+            ).mean()
+        else:
+            nonquery_position_error = position_error.new_zeros(())
+            predicted_displacement = position_error.new_zeros(())
+            static_baseline = position_error.new_zeros(())
+
         return {
             "objective": objective,
             "loss_tcp_pose": pose_loss.detach(),
             "loss_tcp_temporal": temporal_loss.detach(),
             "loss_tcp_gripper": gripper_loss.detach(),
-            "metric_tcp_position_m": torch.linalg.vector_norm(
-                pred_position - target_position, dim=-1
-            ).mean().detach(),
+            "metric_tcp_position_m": position_error.mean().detach(),
+            "metric_tcp_position_nonquery_m": nonquery_position_error.detach(),
+            "metric_tcp_predicted_displacement_m": predicted_displacement.detach(),
+            "metric_tcp_static_baseline_m": static_baseline.detach(),
             "metric_tcp_rotation_deg": (
                 so3_geodesic_angle(pred_rotation, target_rotation).mean()
                 * (180.0 / math.pi)

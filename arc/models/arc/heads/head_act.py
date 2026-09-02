@@ -124,15 +124,23 @@ def inverse_log_transform(y):
     """
     Apply inverse log transform: sign(y) * (exp(|y|) - 1)
 
+    The piecewise form is value-equivalent to the sign/abs expression, while
+    retaining a unit derivative at zero. This matters for zero-initialized
+    regression heads: ``torch.sign(y) * ...`` has zero gradient at ``y == 0``.
+
     Args:
         y: Input tensor
 
     Returns:
         Transformed tensor
     """
-    return torch.sign(y) * (torch.expm1(torch.abs(y)))
+    return torch.where(y >= 0, torch.expm1(y), -torch.expm1(-y))
 
 
 def log_transform(x):
     # x -> y
-    return torch.sign(x) * torch.log1p(torch.abs(x))
+    return torch.where(
+        x >= 0,
+        torch.log1p(x.clamp_min(0)),
+        -torch.log1p((-x).clamp_min(0)),
+    )

@@ -124,16 +124,17 @@ with torch.no_grad():
     )
 ``` 
 
-## Geometry training on RoboTwin
+## Geometry and TCP training on RoboTwin
 
-The repository includes a geometry-only training path adapted from
-Depth-Anything-Next. It trains the ViT backbone and the complete `DualDPT`
-geometry head with the 4RC depth and ray objectives; the camera decoder,
-motion decoder, and tracking head are frozen and skipped during forward.
+The training path jointly optimizes metric geometry and conditional dual-arm TCP
+tracking. RGB clips use `head_view`, while `[xyz, rpy, gripper]` supervision is
+loaded from the matching `TCP_head` directory. The shared motion decoder, TCP
+query encoder, and TCP head train alongside the backbone and `DualDPT` head.
 
 RoboTwin is sampled as a video: each clip contains 2-18 frames with a random
 interval of 1-5 frames, then is kept forward or reversed with equal probability.
-Only `head_view` is used.
+Frame times come from each episode's metadata (15 Hz in the current export), and
+clips do not cross implausible source trajectory discontinuities.
 The native 320x240 images are not resized or cropped. They are reflect-padded
 to 322x252 for patch-size-14 compatibility, and the padding is excluded from
 all losses.
@@ -159,15 +160,15 @@ model.configure_trainable_modules(
     backbone=True,
     geometry_head=True,
     camera_decoder=False,
-    motion_decoder=False,  # also freezes track_head
+    motion_decoder=False,  # keeps the unused dense track head frozen
+    tcp_tracker=True,         # trains shared motion + TCP modules
 )
 ```
 
 RoboTwin's `head_view` calibration is fixed. Depth supervision remains useful,
 but the ray branch can learn a camera-specific spatial template rather than a
-general camera model. Furthermore, frozen camera and motion weights still see
-a changing backbone feature distribution; fine-tune those decoders before
-re-enabling them in a later motion-training stage.
+general camera model. The camera decoder and dense track head remain frozen;
+the TCP tracker still trains the shared motion decoder.
 
 ## :zap: Demo
 

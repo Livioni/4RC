@@ -1,14 +1,13 @@
-# 4RC 在 RoboTwin 上的 Geometry 训练说明
+# 4RC 在 RoboTwin 上的 Geometry + TCP 训练说明
 
-本文档说明如何使用从 Depth-Anything-Next 移植的训练框架，训练 4RC 的 ViT backbone 和完整 DualDPT geometry head。
+本文档说明如何联合训练 4RC geometry 分支和双臂 TCP 轨迹分支。
 
 当前训练范围：
 
-- 数据集仅使用 RoboTwin `head_view`；
-- 训练 backbone、DualDPT depth 分支和 ray 分支；
-- camera decoder、motion decoder、track head 默认冻结并跳过计算；
-- 损失为 `Ldepth + Lray`；
-- 暂不包含 point、camera、motion loss。
+- RGB 使用 RoboTwin `head_view`，TCP 标签读取 `TCP_head`；
+- 训练 backbone、DualDPT、共享 motion decoder、TCP query encoder 和 TCP head；
+- camera decoder 与 dense track head 默认冻结；
+- 损失由 depth、ray、TCP pose、temporal velocity 和 gripper 组成。
 
 ## 1. 代码布局
 
@@ -19,10 +18,12 @@
 │   │   ├── robotwin.py          # RoboTwin dataloader、时序采样、collate
 │   │   └── utils/geometry.py    # 尺度归一化、相对外参、ray GT
 │   └── loss/
-│       └── geometry.py          # depth、gradient、ray loss
+│       ├── geometry.py          # depth、gradient、ray loss
+│       └── tcp_tracking.py      # TCP pose、temporal、gripper loss
 ├── configs/
 │   └── train/
-│       └── 4rc-giant-train.py   # 默认训练参数
+│       ├── 4rc-giant-train.py   # 默认联合训练参数
+│       └── 4rc-tcp-recovery.py  # 修复后恢复 TCP position 的微调参数
 └── train_4rc.py                 # Accelerate 训练入口
 ```
 
@@ -46,16 +47,23 @@ pip install -e .
 datasets/RoboTwin/
 └── <task>/
     └── <episode>/
+        ├── metadata.json
         ├── images/head_view/000000.png
         ├── depths/head_view/000000.png
         ├── intrinsics/head_view.npy
-        └── extrinsics/head_view.npy
+        ├── extrinsics/head_view.npy
+        └── TCP_head/
+            ├── metadata.json
+            ├── left_state.npy
+            └── right_state.npy
 ```
 
 - RGB 必须是 `320×240`。
 - depth 是 uint16 毫米值，读取后转换为米；0 表示无效。
 - extrinsics 是逐帧 OpenCV world-to-camera，形状为 `[T,3,4]`。
 - intrinsics 形状为 `[3,3]`。
+- episode `metadata.json` 提供真实 `frequency_hz`（当前数据均为 15 Hz）。
+- TCP state 为 `[T,7] = xyz(m), rpy(rad), gripper_open(0/1)`。
 
 原图不会 resize 或 crop。为满足 patch size 14，dataloader 会左右各反射填充 1 像素、上下各反射填充 6 像素，模型实际输入为 `322×252`；填充区不参与损失。
 
@@ -77,6 +85,9 @@ max_views = 18
 min_interval = 1
 max_interval = 5
 reverse_probability = 0.5
+frame_rate = None  # 默认读取每个 episode 的 metadata.json
+max_tcp_linear_speed = 3.0
+max_tcp_angular_speed = 4.0 * 3.141592653589793
 max_episodes = None
 augment = True
 num_workers = 8
@@ -127,9 +138,12 @@ train_backbone = True
 train_geometry_head = True
 train_camera_decoder = False
 train_motion_decoder = False
+train_tcp_tracker = True
 ```
 
-`train_motion_decoder=False` 会同时冻结 motion decoder 和 track head。训练前向还会跳过 camera/motion decoder，因此不只是关闭梯度，也能节省计算和显存。
+`train_tcp_tracker=True` 会训练共享 motion decoder、TCP query encoder 和 TCP
+head；`train_motion_decoder=False` 仅避免启用未使用的 dense track head。训练前向
+会跳过 camera decoder 和 dense tracking 分支。
 
 `find_unused_parameters=True` 必须保持开启：DualDPT 为兼容预训练权重保留了
 ray 金字塔各层的预测模块，而当前几何目标只监督最终 ray 层。关闭该选项会让
@@ -143,6 +157,7 @@ model.configure_trainable_modules(
     geometry_head=True,
     camera_decoder=False,
     motion_decoder=False,
+    tcp_tracker=True,
 )
 ```
 
@@ -156,12 +171,14 @@ max_grad_norm = 1.0
 
 lr_backbone = 1e-5
 lr_head = 2e-5
+lr_motion_decoder = 1e-5
+lr_tcp = 1e-4
 weight_decay = 0.01
 warmup_steps = 1000
 eta_min_factor = 0.1
 ```
 
-backbone 和 DualDPT 使用不同学习率。scheduler 在 warmup 后使用 cosine decay，最低降至初始学习率乘以 `eta_min_factor`。
+backbone、DualDPT、共享 motion decoder 和 TCP 模块分别使用配置中的学习率。scheduler 在 warmup 后使用 cosine decay，最低降至初始学习率乘以 `eta_min_factor`。
 
 ### 损失权重
 
@@ -172,21 +189,25 @@ loss_gamma = 1.0
 loss_alpha = 0.2
 depth_valid_range = 0.98
 gradient_scales = 4
+
+tcp_loss_weight = 1.0
+tcp_point_scale = 0.1
+tcp_virtual_point_radius = 0.03
+tcp_rotation_weight = 0.5
+tcp_temporal_weight = 0.2
+tcp_gripper_weight = 0.2
+tcp_velocity_scale = 1.0
 ```
 
-总损失为：
+总损失为 geometry objective 加权 TCP pose、temporal velocity 与 gripper
+objective。`tcp_point_scale` 只归一化 loss 中的米制误差，推理时不需要乘回。
 
-```text
-objective = depth_loss_weight × (depth uncertainty loss + spatial gradient loss)
-          + ray_loss_weight × ray uncertainty loss
-```
-
-raw depth/ray L1 只用于日志，不会再次加入 objective。
+raw depth/ray L1 和 TCP metrics 只用于日志，不会再次加入 objective。
 
 ### 日志和 checkpoint
 
 ```python
-output_dir = "outputs/4rc-robotwin-geometry"
+output_dir = "outputs/4rc-robotwin-tcp-debug"
 log_every_steps = 10
 visualize_every_steps = 1000
 checkpointing_steps = 5000
@@ -239,15 +260,24 @@ accelerate launch --num_processes 1 train_4rc.py \
 也可以运行单元测试：
 
 ```bash
-pytest -q tests/test_4rc_training.py
+pytest -q tests/test_tcp_pipeline.py
 ```
 
 ## 7. 恢复训练
 
+从完整 Accelerate 状态继续训练：
+
 ```bash
 accelerate launch train_4rc.py \
   --config configs/train/4rc-giant-train.py \
-  --resume outputs/4rc-robotwin-geometry/checkpoint-5000
+  --resume outputs/4rc-robotwin-tcp-debug/checkpoint-5000
+```
+
+使用已修复的 position 梯度从旧模型权重开始恢复微调：
+
+```bash
+accelerate launch train_4rc.py \
+  --config configs/train/4rc-tcp-recovery.py
 ```
 
 命令行中的 `--data-root`、`--pretrained-model`、`--resume`、`--output-dir`、`--max-episodes`、`--num-train-epochs` 和 `--max-train-steps` 会覆盖配置文件。其他参数直接修改配置文件。

@@ -263,7 +263,9 @@ def main() -> None:
         min_interval=config["min_interval"],
         max_interval=config["max_interval"],
         reverse_probability=config.get("reverse_probability", 0.5),
-        frame_rate=config.get("frame_rate", 1.0 / (0.004 * 14)),
+        frame_rate=config.get("frame_rate"),
+        max_tcp_linear_speed=config.get("max_tcp_linear_speed", 3.0),
+        max_tcp_angular_speed=config.get("max_tcp_angular_speed", 4.0 * math.pi),
         seed=config["seed"],
         augment=config["augment"],
         max_episodes=config.get("max_episodes"),
@@ -345,6 +347,11 @@ def main() -> None:
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     LOGGER.info("Dataset: %d episodes; trainable modules: %s", len(dataset), trainable)
+    LOGGER.info(
+        "TCP trajectory filtering: %d invalid transitions across %d episodes",
+        dataset.invalid_transition_count,
+        dataset.segmented_episode_count,
+    )
     LOGGER.info(
         "Per-device dynamic batches: %s (%d images)",
         batch_sampler.active_combinations,

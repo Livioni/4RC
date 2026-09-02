@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +23,13 @@ class RoboTwinEpisode:
     name: str
     path: Path
     num_frames: int
+    frame_rate: float
+    valid_segments: tuple[tuple[int, int], ...]
+    invalid_transition_count: int
+
+    @property
+    def max_valid_segment_frames(self) -> int:
+        return max(end - start for start, end in self.valid_segments)
 
 
 class RoboTwin4RC(Dataset[dict[str, Any]]):
@@ -41,6 +50,12 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
     PAD_BOTTOM = 6
     PADDED_HEIGHT = 252
     PADDED_WIDTH = 322
+    TCP_DIRECTORIES = {
+        "head_view": "TCP_head",
+        "third_views": "TCP_third",
+    }
+    RPY_CONVENTION = "fixed-axis XYZ (R = Rz(yaw) @ Ry(pitch) @ Rx(roll))"
+    CAMERA_SUFFIX = "OpenCV camera (+x right, +y down, +z forward)"
 
     def __init__(
         self,
@@ -52,7 +67,9 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         min_interval: int = 1,
         max_interval: int = 5,
         reverse_probability: float = 0.5,
-        frame_rate: float = 1.0 / (0.004 * 14),
+        frame_rate: float | None = None,
+        max_tcp_linear_speed: float | None = 3.0,
+        max_tcp_angular_speed: float | None = 4.0 * math.pi,
         seed: int = 42,
         augment: bool = True,
         max_episodes: int | None = None,
@@ -64,11 +81,23 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         self.min_interval = min_interval
         self.max_interval = max_interval
         self.reverse_probability = float(reverse_probability)
-        self.frame_rate = float(frame_rate)
+        self.frame_rate = None if frame_rate is None else float(frame_rate)
+        self.max_tcp_linear_speed = (
+            None if max_tcp_linear_speed is None else float(max_tcp_linear_speed)
+        )
+        self.max_tcp_angular_speed = (
+            None if max_tcp_angular_speed is None else float(max_tcp_angular_speed)
+        )
         self.seed = seed
         self.augment = augment
         self.epoch = 0
 
+        if view not in self.TCP_DIRECTORIES:
+            supported = ", ".join(sorted(self.TCP_DIRECTORIES))
+            raise ValueError(
+                f"Unsupported RoboTwin view {view!r}; expected one of: {supported}"
+            )
+        self.tcp_directory = self.TCP_DIRECTORIES[view]
         if not self.root.is_dir():
             raise FileNotFoundError(f"RoboTwin root does not exist: {self.root}")
         if min_views < 2 or max_views < min_views:
@@ -77,8 +106,20 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             raise ValueError("Expected 1 <= min_interval <= max_interval")
         if not 0.0 <= self.reverse_probability <= 1.0:
             raise ValueError("reverse_probability must be between 0 and 1")
-        if self.frame_rate <= 0:
-            raise ValueError("frame_rate must be positive")
+        if self.frame_rate is not None and self.frame_rate <= 0:
+            raise ValueError("frame_rate must be positive when provided")
+        if (
+            self.max_tcp_linear_speed is not None
+            and self.max_tcp_linear_speed <= 0
+        ):
+            raise ValueError("max_tcp_linear_speed must be positive when provided")
+        if (
+            self.max_tcp_angular_speed is not None
+            and self.max_tcp_angular_speed <= 0
+        ):
+            raise ValueError("max_tcp_angular_speed must be positive when provided")
+        if max_episodes is not None and max_episodes < 1:
+            raise ValueError("max_episodes must be positive when provided")
 
         episodes: list[RoboTwinEpisode] = []
         for episode_path in sorted(self.root.glob("*/*")):
@@ -88,18 +129,24 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             depth_dir = episode_path / "depths" / view
             intrinsics_file = episode_path / "intrinsics" / f"{view}.npy"
             extrinsics_file = episode_path / "extrinsics" / f"{view}.npy"
-            left_tcp_file = episode_path / "TCP" / "left_state.npy"
-            right_tcp_file = episode_path / "TCP" / "right_state.npy"
+            episode_metadata_file = episode_path / "metadata.json"
+            tcp_dir = episode_path / self.tcp_directory
+            tcp_metadata_file = tcp_dir / "metadata.json"
+            left_tcp_file = tcp_dir / "left_state.npy"
+            right_tcp_file = tcp_dir / "right_state.npy"
             if not (
                 rgb_dir.is_dir()
                 and depth_dir.is_dir()
                 and intrinsics_file.is_file()
                 and extrinsics_file.is_file()
+                and episode_metadata_file.is_file()
+                and tcp_metadata_file.is_file()
                 and left_tcp_file.is_file()
                 and right_tcp_file.is_file()
             ):
                 continue
-            extrinsics = np.load(extrinsics_file, mmap_mode="r")
+
+            extrinsics = np.load(extrinsics_file, mmap_mode="r", allow_pickle=False)
             num_frames = int(extrinsics.shape[0]) if extrinsics.ndim == 3 else 0
             if num_frames < min_views:
                 continue
@@ -107,13 +154,55 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             last_rgb = rgb_dir / f"{num_frames - 1:06d}.png"
             first_depth = depth_dir / "000000.png"
             last_depth = depth_dir / f"{num_frames - 1:06d}.png"
-            if not all(path.is_file() for path in (first_rgb, last_rgb, first_depth, last_depth)):
+            if not all(
+                path.is_file()
+                for path in (first_rgb, last_rgb, first_depth, last_depth)
+            ):
                 continue
-            left_tcp = np.load(left_tcp_file, mmap_mode="r")
-            right_tcp = np.load(right_tcp_file, mmap_mode="r")
-            if left_tcp.shape != right_tcp.shape or left_tcp.ndim != 2:
-                continue
-            if left_tcp.shape[0] < num_frames or left_tcp.shape[1] != 7:
+
+            left_tcp = np.load(left_tcp_file, mmap_mode="r", allow_pickle=False)
+            right_tcp = np.load(right_tcp_file, mmap_mode="r", allow_pickle=False)
+            if (
+                left_tcp.shape != (num_frames, 7)
+                or right_tcp.shape != (num_frames, 7)
+            ):
+                raise ValueError(
+                    f"Expected TCP arrays [{num_frames},7] in {tcp_dir}, "
+                    f"got {left_tcp.shape} and {right_tcp.shape}"
+                )
+            if not np.isfinite(left_tcp).all() or not np.isfinite(right_tcp).all():
+                raise ValueError(f"TCP arrays contain NaN/Inf in {tcp_dir}")
+            if not (
+                np.isin(left_tcp[:, 6], (0.0, 1.0)).all()
+                and np.isin(right_tcp[:, 6], (0.0, 1.0)).all()
+            ):
+                raise ValueError(f"Expected binary gripper labels in {tcp_dir}")
+
+            episode_metadata = self._read_json(episode_metadata_file)
+            metadata_rate = episode_metadata.get("frequency_hz")
+            episode_frame_rate = (
+                self.frame_rate
+                if self.frame_rate is not None
+                else metadata_rate
+            )
+            if not isinstance(episode_frame_rate, (int, float)) or not math.isfinite(
+                float(episode_frame_rate)
+            ) or float(episode_frame_rate) <= 0:
+                raise ValueError(
+                    f"Invalid frequency_hz in {episode_metadata_file}: {metadata_rate!r}"
+                )
+            episode_frame_rate = float(episode_frame_rate)
+            self._validate_tcp_metadata(
+                self._read_json(tcp_metadata_file),
+                tcp_metadata_file,
+                num_frames,
+            )
+            valid_segments, invalid_count = self._build_valid_segments(
+                np.asarray(left_tcp),
+                np.asarray(right_tcp),
+                episode_frame_rate,
+            )
+            if not valid_segments:
                 continue
             episodes.append(
                 RoboTwinEpisode(
@@ -121,20 +210,142 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
                     name=episode_path.name,
                     path=episode_path,
                     num_frames=num_frames,
+                    frame_rate=episode_frame_rate,
+                    valid_segments=valid_segments,
+                    invalid_transition_count=invalid_count,
                 )
             )
+            if max_episodes is not None and len(episodes) >= max_episodes:
+                break
 
-        if max_episodes is not None:
-            episodes = episodes[:max_episodes]
         if not episodes:
             raise RuntimeError(f"No valid RoboTwin episodes found below {self.root}")
         self.episodes = episodes
+        self.invalid_transition_count = sum(
+            episode.invalid_transition_count for episode in episodes
+        )
+        self.segmented_episode_count = sum(
+            episode.invalid_transition_count > 0 for episode in episodes
+        )
 
     def __len__(self) -> int:
         return len(self.episodes)
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+
+    @staticmethod
+    def _read_json(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"Could not read metadata {path}: {error}") from error
+        if not isinstance(payload, dict):
+            raise ValueError(f"Expected a JSON object in {path}")
+        return payload
+
+    def _validate_tcp_metadata(
+        self,
+        metadata: dict[str, Any],
+        path: Path,
+        num_frames: int,
+    ) -> None:
+        expected = {
+            "shape": [num_frames, 7],
+            "columns": [
+                "x",
+                "y",
+                "z",
+                "roll",
+                "pitch",
+                "yaw",
+                "gripper_open",
+            ],
+            "position_unit": "meter",
+            "rotation_unit": "radian",
+            "rpy_convention": self.RPY_CONVENTION,
+            "coordinate_frame": f"{self.view} {self.CAMERA_SUFFIX}",
+            "camera": self.view,
+        }
+        mismatches = {
+            key: (metadata.get(key), value)
+            for key, value in expected.items()
+            if metadata.get(key) != value
+        }
+        gripper = metadata.get("gripper")
+        expected_gripper = {
+            "type": "binary",
+            "open": 1,
+            "closed": 0,
+            "source_threshold": 0.5,
+        }
+        if gripper != expected_gripper:
+            mismatches["gripper"] = (gripper, expected_gripper)
+        if mismatches:
+            details = "; ".join(
+                f"{key}={actual!r}, expected {wanted!r}"
+                for key, (actual, wanted) in mismatches.items()
+            )
+            raise ValueError(f"Incompatible TCP metadata {path}: {details}")
+
+    @staticmethod
+    def _rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
+        roll, pitch, yaw = np.moveaxis(rpy, -1, 0)
+        cr, sr = np.cos(roll), np.sin(roll)
+        cp, sp = np.cos(pitch), np.sin(pitch)
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        values = np.stack(
+            (
+                cy * cp,
+                cy * sp * sr - sy * cr,
+                cy * sp * cr + sy * sr,
+                sy * cp,
+                sy * sp * sr + cy * cr,
+                sy * sp * cr - cy * sr,
+                -sp,
+                cp * sr,
+                cp * cr,
+            ),
+            axis=-1,
+        )
+        return values.reshape(*rpy.shape[:-1], 3, 3)
+
+    def _build_valid_segments(
+        self,
+        left_tcp: np.ndarray,
+        right_tcp: np.ndarray,
+        frame_rate: float,
+    ) -> tuple[tuple[tuple[int, int], ...], int]:
+        invalid = np.zeros(left_tcp.shape[0] - 1, dtype=bool)
+        for state in (left_tcp, right_tcp):
+            if self.max_tcp_linear_speed is not None:
+                linear_speed = np.linalg.norm(
+                    np.diff(state[:, :3], axis=0), axis=-1
+                ) * frame_rate
+                invalid |= linear_speed > self.max_tcp_linear_speed
+            if self.max_tcp_angular_speed is not None:
+                rotation = self._rpy_to_matrix(state[:, 3:6].astype(np.float64))
+                relative = np.einsum(
+                    "tji,tjk->tik", rotation[:-1], rotation[1:]
+                )
+                cosine = np.clip(
+                    (np.trace(relative, axis1=-2, axis2=-1) - 1.0) * 0.5,
+                    -1.0,
+                    1.0,
+                )
+                angular_speed = np.arccos(cosine) * frame_rate
+                invalid |= angular_speed > self.max_tcp_angular_speed
+
+        boundaries = (np.flatnonzero(invalid) + 1).tolist()
+        starts = [0, *boundaries]
+        ends = [*boundaries, left_tcp.shape[0]]
+        minimum_frames = 1 + (self.min_views - 1) * self.min_interval
+        segments = tuple(
+            (start, end)
+            for start, end in zip(starts, ends)
+            if end - start >= minimum_frames
+        )
+        return segments, len(boundaries)
 
     def _rng(self, index: int, sample_seed: int | None = None) -> np.random.Generator:
         seed_parts = [self.seed, self.epoch, int(index)]
@@ -143,39 +354,84 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         seed_sequence = np.random.SeedSequence(seed_parts)
         return np.random.default_rng(seed_sequence)
 
+    def _segments_for(
+        self, episode_or_frames: RoboTwinEpisode | int
+    ) -> tuple[int, tuple[tuple[int, int], ...]]:
+        if isinstance(episode_or_frames, RoboTwinEpisode):
+            return episode_or_frames.num_frames, episode_or_frames.valid_segments
+        num_frames = int(episode_or_frames)
+        return num_frames, ((0, num_frames),)
+
+    def _feasible_intervals(
+        self,
+        segments: tuple[tuple[int, int], ...],
+        num_views: int,
+    ) -> list[int]:
+        return [
+            interval
+            for interval in range(self.min_interval, self.max_interval + 1)
+            if any(
+                end - start >= 1 + (num_views - 1) * interval
+                for start, end in segments
+            )
+        ]
+
+    def can_sample_num_views(
+        self, episode_or_frames: RoboTwinEpisode | int, num_views: int
+    ) -> bool:
+        _, segments = self._segments_for(episode_or_frames)
+        return bool(self._feasible_intervals(segments, int(num_views)))
+
     def sample_frame_indices(
         self,
-        num_frames: int,
+        episode_or_frames: RoboTwinEpisode | int,
         rng: np.random.Generator,
         num_views: int | None = None,
     ) -> tuple[np.ndarray, int]:
-        max_views = min(self.max_views, num_frames)
-        min_views = min(self.min_views, max_views)
+        num_frames, segments = self._segments_for(episode_or_frames)
         fixed_num_views = num_views is not None
-        if not fixed_num_views:
-            num_views = int(rng.integers(min_views, max_views + 1))
-        else:
+        if fixed_num_views:
             num_views = int(num_views)
-            if not min_views <= num_views <= max_views:
+            if not self.min_views <= num_views <= self.max_views:
                 raise ValueError(
-                    f"Cannot sample {num_views} views from {num_frames} frames "
-                    f"with configured range [{self.min_views}, {self.max_views}]"
+                    f"Requested {num_views} views outside configured range "
+                    f"[{self.min_views}, {self.max_views}]"
                 )
-        max_interval = min(self.max_interval, (num_frames - 1) // (num_views - 1))
-        if max_interval < self.min_interval:
-            if fixed_num_views:
+            if not self.can_sample_num_views(episode_or_frames, num_views):
                 raise ValueError(
-                    f"No valid interval for {num_views} views from {num_frames} frames"
+                    f"No valid segment can provide {num_views} views from "
+                    f"{num_frames} frames"
                 )
-            num_views = min_views
-            max_interval = min(self.max_interval, (num_frames - 1) // (num_views - 1))
-        if max_interval < self.min_interval:
-            raise ValueError(
-                f"No valid interval for {num_views} views from {num_frames} frames"
-            )
-        interval = int(rng.integers(self.min_interval, max_interval + 1))
+        else:
+            candidates = [
+                count
+                for count in range(self.min_views, self.max_views + 1)
+                if self.can_sample_num_views(episode_or_frames, count)
+            ]
+            if not candidates:
+                raise ValueError(
+                    f"No valid clip can be sampled from {num_frames} frames"
+                )
+            num_views = int(candidates[int(rng.integers(len(candidates)))])
+
+        intervals = self._feasible_intervals(segments, num_views)
+        interval = int(intervals[int(rng.integers(len(intervals)))])
         last_offset = (num_views - 1) * interval
-        start = int(rng.integers(0, num_frames - last_offset))
+        start_ranges = [
+            (start, end - last_offset)
+            for start, end in segments
+            if end - start > last_offset
+        ]
+        start_count = sum(stop - start for start, stop in start_ranges)
+        selected = int(rng.integers(start_count))
+        start = 0
+        for range_start, range_stop in start_ranges:
+            count = range_stop - range_start
+            if selected < count:
+                start = range_start + selected
+                break
+            selected -= count
+
         frame_indices = start + np.arange(num_views, dtype=np.int64) * interval
         reverse = self.reverse_probability >= 1.0 or (
             self.reverse_probability > 0.0
@@ -232,7 +488,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         episode = self.episodes[index]
         rng = self._rng(index, sample_seed)
         frame_indices, interval = self.sample_frame_indices(
-            episode.num_frames, rng, requested_views
+            episode, rng, requested_views
         )
         augmentation = self._sample_augmentation(rng) if self.augment else None
 
@@ -247,10 +503,10 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r"
         )
         left_tcp_all = np.load(
-            episode.path / "TCP" / "left_state.npy", mmap_mode="r"
+            episode.path / self.tcp_directory / "left_state.npy", mmap_mode="r"
         )
         right_tcp_all = np.load(
-            episode.path / "TCP" / "right_state.npy", mmap_mode="r"
+            episode.path / self.tcp_directory / "right_state.npy", mmap_mode="r"
         )
         tcp_state = np.stack(
             (left_tcp_all[frame_indices], right_tcp_all[frame_indices]), axis=1
@@ -315,7 +571,10 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             "intrinsics": torch.from_numpy(intrinsics).expand(len(images), -1, -1).clone(),
             "extrinsics": torch.from_numpy(np.asarray(extrinsics_all[frame_indices]).copy()),
             "frame_indices": torch.from_numpy(frame_indices),
-            "frame_times": torch.from_numpy(frame_indices.astype(np.float32) / self.frame_rate),
+            "frame_times": torch.from_numpy(
+                frame_indices.astype(np.float32) / episode.frame_rate
+            ),
+            "frame_rate": episode.frame_rate,
             "tcp_state": torch.from_numpy(tcp_state.copy()),
             "interval": interval,
             "task": episode.task,
@@ -426,7 +685,7 @@ class FixedImageBatchSampler(Sampler[list[tuple[int, int, int]]]):
                 [
                     index
                     for index, episode in enumerate(dataset.episodes)
-                    if episode.num_frames >= views_per_scene
+                    if dataset.can_sample_num_views(episode, views_per_scene)
                 ],
                 dtype=np.int64,
             )

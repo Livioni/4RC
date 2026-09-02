@@ -20,9 +20,13 @@ max_interval = 5
 # Each clip's first sampled frame is its query. Random starts and reversal make
 # both forward and reverse queries arbitrary episode frames.
 reverse_probability = 0.5
-# One saved frame spans 14 simulator steps at 0.004 seconds per step:
-# dt = 0.004 * 14 = 0.056 s, frame rate = 1 / dt ~= 17.857 Hz.
-frame_rate = 1.0 / (0.004 * 14)
+# Read the saved frequency from each episode's metadata.json (15 Hz in the
+# current RoboTwin export). Set a positive number only to override metadata.
+frame_rate = None
+# Split trajectories at physically implausible source discontinuities. Set
+# either threshold to None to disable that check.
+max_tcp_linear_speed = 3.0  # metres per second
+max_tcp_angular_speed = 4.0 * 3.141592653589793  # radians per second
 max_episodes = None
 augment = True
 # Keep RoboTwin depth and camera translations in meters. Set to True to use

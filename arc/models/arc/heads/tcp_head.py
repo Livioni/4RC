@@ -78,16 +78,25 @@ class TCPTrackHead(nn.Module):
         fused = sum(weight * value for weight, value in zip(weights, tcp_levels))
         raw = self.mlp(self.norm(fused))
 
-        delta_position = inverse_log_transform(raw[..., :3])
-        relative_rotation = rotation_6d_to_matrix(raw[..., 3:9])
-        query_state = query_state.to(device=raw.device, dtype=raw.dtype)
-        query_position = query_state[:, None, :, :3]
-        query_rotation = rpy_to_matrix(query_state[:, None, :, 3:6])
+        # TCP is a tiny output compared with the image backbone. Decode it in
+        # FP32 so BF16 autocast cannot quantize the known query pose by
+        # millimetres or fractions of a degree.
+        with torch.autocast(device_type=raw.device.type, enabled=False):
+            raw_float = raw.float()
+            query_float = query_state.to(device=raw.device, dtype=torch.float32)
+            delta_position = inverse_log_transform(raw_float[..., :3])
+            relative_rotation = rotation_6d_to_matrix(raw_float[..., 3:9])
+            query_position = query_float[:, None, :, :3]
+            query_rotation = rpy_to_matrix(query_float[:, None, :, 3:6])
+            position = query_position + delta_position
+            rotation = relative_rotation @ query_rotation
+            gripper_logit = raw_float[..., 9]
+            confidence = 1.0 + torch.exp(raw_float[..., 10].clamp(max=10.0))
         return {
             "tcp_delta_position": delta_position,
-            "tcp_position": query_position + delta_position,
+            "tcp_position": position,
             "tcp_relative_rotation": relative_rotation,
-            "tcp_rotation": relative_rotation @ query_rotation,
-            "tcp_gripper_logit": raw[..., 9],
-            "tcp_confidence": 1.0 + torch.exp(raw[..., 10].clamp(max=10.0)),
+            "tcp_rotation": rotation,
+            "tcp_gripper_logit": gripper_logit,
+            "tcp_confidence": confidence,
         }
