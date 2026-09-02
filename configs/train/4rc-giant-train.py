@@ -12,7 +12,7 @@ resume = None
 
 # == Dataset Configuration ==
 data_root = "datasets/RoboTwin"
-view = "head_view"
+view = "third_views"
 min_views = 2
 max_views = 18
 min_interval = 1
@@ -23,6 +23,8 @@ reverse_probability = 0.5
 # Read the saved frequency from each episode's metadata.json (15 Hz in the
 # current RoboTwin export). Set a positive number only to override metadata.
 frame_rate = None
+# Ignore dense depth targets beyond this metric z-depth. None disables the cap.
+max_depth = 3.0
 # Split trajectories at physically implausible source discontinuities. Set
 # either threshold to None to disable that check.
 max_tcp_linear_speed = 3.0  # metres per second
@@ -33,8 +35,8 @@ augment = True
 # the legacy per-scene unit-mean-distance normalization.
 normalize_geometry = False
 num_workers = 8
-train_batch_images = 18
-scene_counts = (1, 2, 3, 6, 9)
+train_batch_images = 4
+scene_counts = (1, 2)
 batches_per_epoch = None
 recent_buffer_size = 10_000
 
@@ -44,6 +46,8 @@ train_geometry_head = True
 train_camera_decoder = False
 train_motion_decoder = False
 train_tcp_tracker = True
+# Sample a 3x3 local patch neighborhood around each projected TCP point.
+tcp_query_window_size = 3
 
 # == Training Configuration ==
 seed = 42
@@ -85,6 +89,13 @@ tcp_rotation_weight = 0.5
 tcp_temporal_weight = 0.2
 tcp_gripper_weight = 0.2
 tcp_velocity_scale = 1.0
+
+# == TCP visual-query curriculum ==
+tcp_query_initial_exact_ratio = 0.80
+tcp_query_exact_ratio = 0.25
+tcp_query_max_jitter_patches = 1.0
+tcp_query_curriculum_warmup_ratio = 0.10
+tcp_query_curriculum_transition_ratio = 0.20
 
 # == Logging and Checkpoint Configuration ==
 log_every_steps = 10

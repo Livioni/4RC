@@ -187,7 +187,7 @@ def _remove_training_prefix(key: str) -> str:
 
 
 def _is_allowed_missing_key(key: str) -> bool:
-    if key.startswith(("tcp_query_encoder.", "tcp_track_head.")):
+    if key.startswith(("tcp_visual_query_encoder.", "tcp_track_head.")):
         return True
     # DualDPT reuses one LayerNorm instance in all four auxiliary projection
     # levels. safetensors stores the shared tensor once (under level 0), so
@@ -225,6 +225,10 @@ def load_geometry_model(model_path: Path, device: torch.device):
     normalized_state_dict: dict[str, torch.Tensor] = {}
     for key, value in state_dict.items():
         normalized_key = _remove_training_prefix(key)
+        if normalized_key.startswith(
+            ("tcp_query_encoder.", "tcp_visual_query_encoder.", "tcp_track_head.")
+        ):
+            continue
         if normalized_key in normalized_state_dict:
             raise ValueError(
                 f"Checkpoint contains duplicate parameter after prefix removal: {normalized_key}"

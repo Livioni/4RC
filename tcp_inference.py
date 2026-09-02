@@ -1,27 +1,15 @@
 #!/usr/bin/env python3
-"""Infer and visualize a RoboTwin TCP trajectory with per-frame geometry.
+"""Infer and visualize image-conditioned RoboTwin TCP trajectories.
 
-``RoboTwin-TCP`` is a conditional tracker: it requires the two first-frame TCP
-states as a query and predicts their trajectory from an RGB clip.  It does not
-contain an RGB-to-initial-pose head.  Pointing ``--input`` at a RoboTwin episode
-uses ``images/head_view`` and automatically reads the matching first-frame query
-from ``TCP_head`` (or legacy ``TCP``).  For copied images, preserve their numeric
-filenames and pass the original episode with ``--tcp-dir``.
+The model takes a RoboTwin RGB clip plus left/right TCP image points in the
+first frame. Query points use the original 320x240 pixel coordinate system and
+are converted to the padded 4RC input coordinate system internally.
 
-Example (standard RoboTwin episode layout):
+Example:
 
     conda run -n 4rc python tcp_inference.py \
         --input datasets/RoboTwin/<task>/<episode> \
-        --frame-indices 10 15 20 25
-
-Example (plain image directory and an explicit [2, 7] query):
-
-    conda run -n 4rc python tcp_inference.py \
-        --input demo/rgb \
-        --tcp-query-file demo/first_tcp_state.npy
-
-Each arm uses ``[x, y, z, roll, pitch, yaw, gripper]``.  Position is in metres,
-RPY is in radians, and RoboTwin uses ``Rz(yaw) @ Ry(pitch) @ Rx(roll)``.
+        --tcp-query-points 120 140 205 138
 """
 
 from __future__ import annotations
@@ -79,7 +67,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--view",
-        default="head_view",
+        default="third_views",
         help="Image view below an episode's images directory",
     )
     parser.add_argument(
@@ -88,32 +76,18 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MODEL,
         help="RoboTwin-TCP model.safetensors checkpoint",
     )
-    query_group = parser.add_mutually_exclusive_group()
+    query_group = parser.add_mutually_exclusive_group(required=True)
     query_group.add_argument(
-        "--tcp-query-file",
-        type=Path,
-        help=(
-            "First-frame TCP query as .npy/.npz/.json with shape [2,7]. "
-            "If omitted, the script auto-discovers RoboTwin episode TCP files"
-        ),
-    )
-    query_group.add_argument(
-        "--tcp-query",
+        "--tcp-query-points",
         type=float,
-        nargs=14,
-        metavar=(
-            "LX", "LY", "LZ", "LR", "LP", "LYAW", "LG",
-            "RX", "RY", "RZ", "RR", "RP", "RYAW", "RG",
-        ),
-        help="Explicit left state followed by right state (14 scalars)",
+        nargs=4,
+        metavar=("LEFT_X", "LEFT_Y", "RIGHT_X", "RIGHT_Y"),
+        help="First-frame left/right TCP points in original 320x240 pixels",
     )
     query_group.add_argument(
-        "--tcp-dir",
+        "--tcp-query-points-file",
         type=Path,
-        help=(
-            "Original episode root or TCP directory containing left_state.npy "
-            "and right_state.npy, useful when --input contains copied images"
-        ),
+        help=".npy/.npz/.json query points with shape [2,2]",
     )
     frame_group = parser.add_mutually_exclusive_group()
     frame_group.add_argument(
@@ -309,138 +283,75 @@ def _frame_index(path: Path) -> int:
     if match is None:
         raise ValueError(
             f"Cannot infer the RoboTwin frame index from image name {path.name!r}; "
-            "pass --tcp-query-file or --tcp-query explicitly"
+            "pass --tcp-query-points or --tcp-query-points-file explicitly"
         )
     return int(match.group(1))
 
 
-def _validate_query(state: Any, source: str) -> np.ndarray:
-    state_array = np.asarray(state, dtype=np.float32)
-    if state_array.shape != (2, 7):
+def _validate_query_points(points: Any, source: str) -> np.ndarray:
+    points_array = np.asarray(points, dtype=np.float32)
+    if points_array.shape != (2, 2):
         raise ValueError(
-            f"First-frame TCP query from {source} must have shape [2,7] "
-            f"(left/right x xyz/rpy/gripper), got {state_array.shape}"
+            f"TCP query points from {source} must have shape [2,2] "
+            f"(left/right x/y), got {points_array.shape}"
         )
-    if not np.isfinite(state_array).all():
-        raise ValueError(f"First-frame TCP query from {source} contains NaN/Inf")
-    return state_array
+    if not np.isfinite(points_array).all():
+        raise ValueError(f"TCP query points from {source} contain NaN/Inf")
+    inside = (
+        (points_array[:, 0] >= 0)
+        & (points_array[:, 0] < SOURCE_WIDTH)
+        & (points_array[:, 1] >= 0)
+        & (points_array[:, 1] < SOURCE_HEIGHT)
+    )
+    if not inside.all():
+        raise ValueError(
+            f"TCP query points from {source} must lie inside "
+            f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}: {points_array.tolist()}"
+        )
+    return points_array
 
 
-def _load_query_file(path: Path) -> np.ndarray:
+def _load_query_points_file(path: Path) -> np.ndarray:
     path = path.expanduser()
     if not path.is_file():
-        raise FileNotFoundError(f"TCP query file does not exist: {path}")
+        raise FileNotFoundError(f"TCP query-points file does not exist: {path}")
     suffix = path.suffix.lower()
     if suffix == ".npy":
-        state = np.load(path, allow_pickle=False)
+        points = np.load(path, allow_pickle=False)
     elif suffix == ".npz":
         with np.load(path, allow_pickle=False) as archive:
-            if "tcp_state" in archive:
-                state = archive["tcp_state"]
+            if "tcp_query_points" in archive:
+                points = archive["tcp_query_points"]
             elif len(archive.files) == 1:
-                state = archive[archive.files[0]]
+                points = archive[archive.files[0]]
             else:
                 raise ValueError(
-                    f"{path} must contain a 'tcp_state' array when it has multiple keys"
+                    f"{path} must contain 'tcp_query_points' when it has multiple keys"
                 )
     elif suffix == ".json":
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, dict) and "tcp_state" in payload:
-            state = payload["tcp_state"]
+        if isinstance(payload, dict) and "tcp_query_points" in payload:
+            points = payload["tcp_query_points"]
         elif isinstance(payload, dict) and all(name in payload for name in ARM_NAMES):
-            state = [payload[name] for name in ARM_NAMES]
+            points = [payload[name] for name in ARM_NAMES]
         else:
-            state = payload
+            points = payload
     else:
-        raise ValueError("--tcp-query-file must be .npy, .npz, or .json")
-
-    state_array = np.asarray(state)
-    if state_array.ndim == 3:
-        state_array = state_array[0]
-    return _validate_query(state_array, str(path))
-
-
-def _tcp_dir_names(view: str) -> tuple[str, ...]:
-    view_to_tcp = {
-        "head_view": "TCP_head",
-        "third_views": "TCP_third",
-    }
-    preferred = view_to_tcp.get(view)
-    return (preferred, "TCP") if preferred is not None else ("TCP",)
+        raise ValueError("--tcp-query-points-file must be .npy, .npz, or .json")
+    points_array = np.asarray(points)
+    if points_array.ndim == 3:
+        points_array = points_array[0]
+    return _validate_query_points(points_array, str(path))
 
 
-def _has_tcp_states(path: Path) -> bool:
+def resolve_tcp_query_points(args: argparse.Namespace) -> tuple[np.ndarray, str]:
+    if args.tcp_query_points is not None:
+        points = np.asarray(args.tcp_query_points, dtype=np.float32).reshape(2, 2)
+        return _validate_query_points(points, "--tcp-query-points"), "explicit CLI"
+    assert args.tcp_query_points_file is not None
     return (
-        (path / "left_state.npy").is_file()
-        and (path / "right_state.npy").is_file()
-    )
-
-
-def _find_episode_tcp_dir(input_dir: Path, view: str) -> Path | None:
-    """Find the view-matched TCP directory above an episode/image directory."""
-    resolved = input_dir.expanduser().resolve()
-    for candidate_root in (resolved, *resolved.parents[:4]):
-        if _has_tcp_states(candidate_root):
-            return candidate_root
-        for name in _tcp_dir_names(view):
-            tcp_dir = candidate_root / name
-            if _has_tcp_states(tcp_dir):
-                return tcp_dir
-    return None
-
-
-def resolve_tcp_query(
-    args: argparse.Namespace, first_image: Path
-) -> tuple[np.ndarray, str]:
-    if args.tcp_query is not None:
-        return (
-            _validate_query(np.asarray(args.tcp_query).reshape(2, 7), "--tcp-query"),
-            "explicit --tcp-query",
-        )
-    if args.tcp_query_file is not None:
-        return _load_query_file(args.tcp_query_file), str(args.tcp_query_file)
-
-    if args.tcp_dir is not None:
-        tcp_dir = _find_episode_tcp_dir(args.tcp_dir, args.view)
-        if tcp_dir is None:
-            raise FileNotFoundError(
-                "Could not find left_state.npy/right_state.npy from "
-                f"--tcp-dir {args.tcp_dir}"
-            )
-    else:
-        tcp_dir = _find_episode_tcp_dir(args.input, args.view)
-    if tcp_dir is not None:
-        index = _frame_index(first_image)
-        left = np.load(tcp_dir / "left_state.npy", mmap_mode="r", allow_pickle=False)
-        right = np.load(tcp_dir / "right_state.npy", mmap_mode="r", allow_pickle=False)
-        valid_shapes = (
-            left.ndim == 2
-            and right.ndim == 2
-            and left.shape[1:] == (7,)
-            and right.shape[1:] == (7,)
-        )
-        if not valid_shapes:
-            raise ValueError(
-                f"Expected left/right TCP arrays [T,7] below {tcp_dir}; "
-                f"got {left.shape} and {right.shape}"
-            )
-        if index >= len(left) or index >= len(right):
-            raise IndexError(
-                f"Frame {index} is outside TCP arrays with lengths "
-                f"{len(left)} and {len(right)}"
-            )
-        state = np.stack((left[index], right[index]), axis=0)
-        return _validate_query(state, str(tcp_dir)), f"{tcp_dir} (frame {index})"
-
-    for name in ("tcp_state.npy", "first_tcp_state.npy", "tcp_state.json"):
-        candidate = args.input / name
-        if candidate.is_file():
-            return _load_query_file(candidate), str(candidate)
-
-    raise ValueError(
-        "RoboTwin-TCP cannot infer an initial TCP pose from RGB alone. No matching "
-        "episode TCP_head/TCP state files were found. Point --input at the original "
-        "episode, pass --tcp-dir for copied images, or supply --tcp-query-file."
+        _load_query_points_file(args.tcp_query_points_file),
+        str(args.tcp_query_points_file),
     )
 
 
@@ -484,13 +395,18 @@ def load_tcp_model(model_path: Path, device: torch.device):
         state_dict[normalized_key] = value
     del saved_state
 
-    tcp_prefixes = ("tcp_query_encoder.", "tcp_track_head.")
+    tcp_prefixes = ("tcp_visual_query_encoder.", "tcp_track_head.")
     if not all(any(key.startswith(prefix) for key in state_dict) for prefix in tcp_prefixes):
         raise ValueError(
-            f"{model_path} does not contain both TCP query encoder and tracking head"
+            f"{model_path} is not an image-conditioned TCP checkpoint"
         )
+    offset_key = "tcp_visual_query_encoder.offset_embedding"
+    window_tokens = int(state_dict[offset_key].shape[0])
+    window_size = math.isqrt(window_tokens)
+    if window_size * window_size != window_tokens:
+        raise ValueError(f"Invalid TCP query window token count: {window_tokens}")
 
-    model = Arc()
+    model = Arc(tcp_query_window_size=window_size)
     try:
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
     except RuntimeError as error:
@@ -529,14 +445,15 @@ def matrix_to_rpy(rotation: np.ndarray) -> np.ndarray:
 def infer_tcp_and_geometry(
     model,
     views: list[dict[str, torch.Tensor]],
-    query_state: np.ndarray,
+    query_points: np.ndarray,
     device: torch.device,
     dtype: torch.dtype,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, Any]]:
     device_views = [
         {**view, "img": view["img"].to(device, non_blocking=True)} for view in views
     ]
-    query_tensor = torch.from_numpy(query_state).unsqueeze(0).to(device)
+    padded_points = query_points + np.asarray([PAD_LEFT, PAD_TOP], dtype=np.float32)
+    query_tensor = torch.from_numpy(padded_points).unsqueeze(0).to(device)
     autocast_context = (
         contextlib.nullcontext()
         if dtype == torch.float32
@@ -553,7 +470,7 @@ def infer_tcp_and_geometry(
                     inference_track=False,
                     decode_camera=False,
                     decode_motion=False,
-                    tcp_query_state=query_tensor,
+                    tcp_query_points=query_tensor,
                     decode_tcp=True,
                     return_aux_pyramid=False,
                     ref_view_strategy="first",
@@ -659,7 +576,7 @@ def prepare_frame_point_clouds(
 def build_first_frame_result(
     tcp: dict[str, np.ndarray],
     *,
-    query_state: np.ndarray,
+    query_points: np.ndarray,
     query_source: str,
     image_path: Path,
     inference_seconds: float,
@@ -683,8 +600,8 @@ def build_first_frame_result(
     result = {
         "frame": str(image_path),
         "query_source": query_source,
-        "note": "Conditional prediction: the initial TCP query is an input to RoboTwin-TCP.",
-        "query_tcp_state": query_state.tolist(),
+        "note": "Image-conditioned prediction from first-frame TCP pixel queries.",
+        "tcp_query_points": query_points.tolist(),
         "predicted_first_frame": arms,
         "inference_seconds": inference_seconds,
     }
@@ -1065,23 +982,21 @@ def main() -> None:
         frame_interval=args.frame_interval,
     )
     warn_if_out_of_training_distribution(paths)
-    query_state, query_source = resolve_tcp_query(args, paths[0])
+    query_points, query_source = resolve_tcp_query_points(args)
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)
 
-    if args.view != "head_view":
-        print("Warning: RoboTwin-TCP was trained on head_view images.")
-    if not np.all((0.0 <= query_state[:, 6]) & (query_state[:, 6] <= 1.0)):
-        print("Warning: query gripper values are outside the training range [0,1].")
+    if args.view != "third_views":
+        print("Warning: the visual-query TCP model was trained on third_views images.")
     selected_indices = [_frame_index(path) for path in paths]
     print(f"Processing {len(paths)} frames on {device} ({dtype}).")
     print(f"Selected frame indices: {selected_indices}")
-    print(f"Initial TCP query source: {query_source}")
+    print(f"Initial TCP query points ({query_source}): {query_points.tolist()}")
 
     views, colors = load_robotwin_views(paths)
     model = load_tcp_model(args.model, device)
     depth, world_points, confidence, tcp, profiling = infer_tcp_and_geometry(
-        model, views, query_state, device, dtype
+        model, views, query_points, device, dtype
     )
 
     frame_clouds = prepare_frame_point_clouds(
@@ -1095,7 +1010,7 @@ def main() -> None:
     elapsed = float(profiling.get("total_time", math.nan))
     result, _, _ = build_first_frame_result(
         tcp,
-        query_state=query_state,
+        query_points=query_points,
         query_source=query_source,
         image_path=paths[0],
         inference_seconds=elapsed,

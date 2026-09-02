@@ -51,6 +51,11 @@ class TCPTrackingLoss(nn.Module):
         rotated = torch.einsum("...ij,kj->...ki", rotation, offsets)
         return position.unsqueeze(-2) + rotated
 
+    @staticmethod
+    def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        masked = torch.where(mask, values, torch.zeros_like(values))
+        return masked.sum() / mask.sum().clamp_min(1)
+
     def forward(self, predictions: dict, batch: dict) -> dict[str, torch.Tensor]:
         target_state = batch["tcp_state"].float()
         frame_times = batch["frame_times"].float()
@@ -60,6 +65,9 @@ class TCPTrackingLoss(nn.Module):
 
         pred_position = predictions["tcp_position"].float()
         pred_rotation = predictions["tcp_rotation"].float()
+        query_mask = batch["tcp_query_valid"].bool()
+        trajectory_mask = query_mask[:, None].expand_as(target_gripper)
+
         confidence = predictions["tcp_confidence"].float().clamp(
             min=1e-6, max=self.confidence_max
         )
@@ -76,80 +84,75 @@ class TCPTrackingLoss(nn.Module):
         ).mean(dim=(-1, -2))
         rotation_error = so3_geodesic_angle(pred_rotation, target_rotation) / math.pi
         pose_error = point_error + self.rotation_weight * rotation_error
-        pose_loss = (
+        pose_terms = (
             self.gamma * pose_error * confidence - self.alpha * confidence.log()
-        ).mean()
+        )
+        pose_loss = self._masked_mean(pose_terms, trajectory_mask)
 
         if target_state.shape[1] > 1:
             dt = frame_times[:, 1:] - frame_times[:, :-1]
-            # Reversed clips have decreasing timestamps. Preserve the sign so
-            # velocity remains expressed in the episode's physical time axis.
             direction = torch.where(dt < 0, -torch.ones_like(dt), torch.ones_like(dt))
             dt = direction * dt.abs().clamp_min(1e-6)
-            pred_velocity = (pred_points[:, 1:] - pred_points[:, :-1]) / dt[..., None, None, None]
-            target_velocity = (target_points[:, 1:] - target_points[:, :-1]) / dt[..., None, None, None]
+            pred_velocity = (
+                pred_points[:, 1:] - pred_points[:, :-1]
+            ) / dt[..., None, None, None]
+            target_velocity = (
+                target_points[:, 1:] - target_points[:, :-1]
+            ) / dt[..., None, None, None]
             velocity_error = F.smooth_l1_loss(
                 pred_velocity / self.velocity_scale,
                 target_velocity / self.velocity_scale,
                 reduction="none",
             ).mean(dim=(-1, -2))
             pair_confidence = torch.minimum(confidence[:, 1:], confidence[:, :-1])
-            temporal_loss = (
+            temporal_terms = (
                 self.gamma * velocity_error * pair_confidence
                 - self.alpha * pair_confidence.log()
-            ).mean()
+            )
+            temporal_mask = query_mask[:, None].expand_as(velocity_error)
+            temporal_loss = self._masked_mean(temporal_terms, temporal_mask)
         else:
             temporal_loss = pred_position.sum() * 0.0
 
-        positive = target_gripper.sum()
-        negative = target_gripper.new_tensor(target_gripper.numel()) - positive
+        valid_gripper = target_gripper[trajectory_mask]
+        positive = valid_gripper.sum()
+        negative = valid_gripper.new_tensor(valid_gripper.numel()) - positive
         pos_weight = torch.where(
             (positive > 0) & (negative > 0),
             negative / positive.clamp_min(1.0),
             torch.ones_like(positive),
         )
-        gripper_loss = F.binary_cross_entropy_with_logits(
+        gripper_terms = F.binary_cross_entropy_with_logits(
             predictions["tcp_gripper_logit"].float(),
             target_gripper,
             pos_weight=pos_weight,
+            reduction="none",
         )
+        gripper_loss = self._masked_mean(gripper_terms, trajectory_mask)
         objective = (
             pose_loss
             + self.temporal_weight * temporal_loss
             + self.gripper_weight * gripper_loss
         )
+
         position_error = torch.linalg.vector_norm(
             pred_position - target_position, dim=-1
         )
-        if target_state.shape[1] > 1:
-            nonquery_position_error = position_error[:, 1:].mean()
-            predicted_displacement = torch.linalg.vector_norm(
-                pred_position[:, 1:] - pred_position[:, :1], dim=-1
-            ).mean()
-            static_baseline = torch.linalg.vector_norm(
-                target_position[:, 1:] - target_position[:, :1], dim=-1
-            ).mean()
-        else:
-            nonquery_position_error = position_error.new_zeros(())
-            predicted_displacement = position_error.new_zeros(())
-            static_baseline = position_error.new_zeros(())
-
+        position_metric = self._masked_mean(position_error, trajectory_mask)
+        rotation_metric = self._masked_mean(
+            so3_geodesic_angle(pred_rotation, target_rotation), trajectory_mask
+        )
+        gripper_accuracy = (
+            (predictions["tcp_gripper_logit"] >= 0)
+            == (target_gripper >= 0.5)
+        ).float()
+        gripper_metric = self._masked_mean(gripper_accuracy, trajectory_mask)
         return {
             "objective": objective,
             "loss_tcp_pose": pose_loss.detach(),
             "loss_tcp_temporal": temporal_loss.detach(),
             "loss_tcp_gripper": gripper_loss.detach(),
-            "metric_tcp_position_m": position_error.mean().detach(),
-            "metric_tcp_position_nonquery_m": nonquery_position_error.detach(),
-            "metric_tcp_predicted_displacement_m": predicted_displacement.detach(),
-            "metric_tcp_static_baseline_m": static_baseline.detach(),
-            "metric_tcp_rotation_deg": (
-                so3_geodesic_angle(pred_rotation, target_rotation).mean()
-                * (180.0 / math.pi)
-            ).detach(),
-            "metric_tcp_gripper_accuracy": (
-                (predictions["tcp_gripper_logit"] >= 0)
-                == (target_gripper >= 0.5)
-            ).float().mean().detach(),
-            "metric_tcp_confidence": confidence.mean().detach(),
+            "metric_tcp_position_m": position_metric.detach(),
+            "metric_tcp_rotation_deg": (rotation_metric * (180.0 / math.pi)).detach(),
+            "metric_tcp_gripper_accuracy": gripper_metric.detach(),
         }

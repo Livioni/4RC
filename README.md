@@ -126,10 +126,12 @@ with torch.no_grad():
 
 ## Geometry and TCP training on RoboTwin
 
-The training path jointly optimizes metric geometry and conditional dual-arm TCP
-tracking. RGB clips use `head_view`, while `[xyz, rpy, gripper]` supervision is
-loaded from the matching `TCP_head` directory. The shared motion decoder, TCP
-query encoder, and TCP head train alongside the backbone and `DualDPT` head.
+The training path jointly optimizes metric geometry and image-conditioned
+dual-arm TCP tracking. RGB clips use `third_views`, while `[xyz, rpy, gripper]`
+supervision is loaded from `TCP_third`. First-frame TCP positions are projected
+to image points; local 3x3 4RC patch neighborhoods become motion queries, so the
+model never receives the first-frame 7D TCP state. Depth beyond 3 metres is
+masked from dense depth supervision.
 
 RoboTwin is sampled as a video: each clip contains 2-18 frames with a random
 interval of 1-5 frames, then is kept forward or reversed with equal probability.
@@ -165,10 +167,10 @@ model.configure_trainable_modules(
 )
 ```
 
-RoboTwin's `head_view` calibration is fixed. Depth supervision remains useful,
-but the ray branch can learn a camera-specific spatial template rather than a
-general camera model. The camera decoder and dense track head remain frozen;
-the TCP tracker still trains the shared motion decoder.
+RoboTwin's `third_views` calibration is used by default. The camera decoder and
+dense track head remain frozen; the TCP tracker still trains the shared motion
+decoder. At inference, pass the two first-frame image points explicitly with
+`tcp_inference.py --tcp-query-points LEFT_X LEFT_Y RIGHT_X RIGHT_Y`.
 
 ## :zap: Demo
 

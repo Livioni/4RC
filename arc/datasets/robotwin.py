@@ -33,7 +33,7 @@ class RoboTwinEpisode:
 
 
 class RoboTwin4RC(Dataset[dict[str, Any]]):
-    """One forward- or reverse-ordered ``head_view`` clip per episode and epoch.
+    """One forward- or reverse-ordered camera-view clip per episode and epoch.
 
     The first sampled frame is always the TCP query. Random clip starts and
     temporal reversal therefore allow the query to be any valid episode frame.
@@ -61,13 +61,14 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         self,
         root: str | Path,
         *,
-        view: str = "head_view",
+        view: str = "third_views",
         min_views: int = 2,
         max_views: int = 18,
         min_interval: int = 1,
         max_interval: int = 5,
         reverse_probability: float = 0.5,
         frame_rate: float | None = None,
+        max_depth: float | None = 3.0,
         max_tcp_linear_speed: float | None = 3.0,
         max_tcp_angular_speed: float | None = 4.0 * math.pi,
         seed: int = 42,
@@ -82,6 +83,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         self.max_interval = max_interval
         self.reverse_probability = float(reverse_probability)
         self.frame_rate = None if frame_rate is None else float(frame_rate)
+        self.max_depth = None if max_depth is None else float(max_depth)
         self.max_tcp_linear_speed = (
             None if max_tcp_linear_speed is None else float(max_tcp_linear_speed)
         )
@@ -108,6 +110,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             raise ValueError("reverse_probability must be between 0 and 1")
         if self.frame_rate is not None and self.frame_rate <= 0:
             raise ValueError("frame_rate must be positive when provided")
+        if self.max_depth is not None and self.max_depth <= 0:
+            raise ValueError("max_depth must be positive when provided")
         if (
             self.max_tcp_linear_speed is not None
             and self.max_tcp_linear_speed <= 0
@@ -122,6 +126,9 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             raise ValueError("max_episodes must be positive when provided")
 
         episodes: list[RoboTwinEpisode] = []
+        tcp_position_sum = np.zeros((2, 3), dtype=np.float64)
+        tcp_position_square_sum = np.zeros((2, 3), dtype=np.float64)
+        tcp_position_count = 0
         for episode_path in sorted(self.root.glob("*/*")):
             if not episode_path.is_dir():
                 continue
@@ -215,6 +222,13 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
                     invalid_transition_count=invalid_count,
                 )
             )
+            positions = np.stack(
+                (np.asarray(left_tcp[:, :3]), np.asarray(right_tcp[:, :3])),
+                axis=1,
+            ).astype(np.float64, copy=False)
+            tcp_position_sum += positions.sum(axis=0)
+            tcp_position_square_sum += np.square(positions).sum(axis=0)
+            tcp_position_count += positions.shape[0]
             if max_episodes is not None and len(episodes) >= max_episodes:
                 break
 
@@ -226,6 +240,17 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         )
         self.segmented_episode_count = sum(
             episode.invalid_transition_count > 0 for episode in episodes
+        )
+        tcp_position_mean = tcp_position_sum / tcp_position_count
+        tcp_position_variance = (
+            tcp_position_square_sum / tcp_position_count
+            - np.square(tcp_position_mean)
+        )
+        self.tcp_position_mean = torch.from_numpy(
+            tcp_position_mean.astype(np.float32)
+        )
+        self.tcp_position_std = torch.from_numpy(
+            np.sqrt(np.maximum(tcp_position_variance, 1e-6)).astype(np.float32)
         )
 
     def __len__(self) -> int:
@@ -535,6 +560,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
                 )
             depth_tensor = torch.from_numpy(depth_array / 1000.0)
             valid_mask = torch.isfinite(depth_tensor) & (depth_tensor > 0)
+            if self.max_depth is not None:
+                valid_mask &= depth_tensor <= self.max_depth
             depth_tensor = torch.where(valid_mask, depth_tensor, torch.zeros_like(depth_tensor))
 
             image_tensor = F.pad(
@@ -563,6 +590,40 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             valid_masks.append(valid_mask)
             original_masks.append(original_mask)
 
+        query_xyz = tcp_state[0, :, :3]
+        query_z = query_xyz[:, 2]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            query_u = (
+                intrinsics[0, 0] * query_xyz[:, 0] / query_z
+                + intrinsics[0, 2]
+            )
+            query_v = (
+                intrinsics[1, 1] * query_xyz[:, 1] / query_z
+                + intrinsics[1, 2]
+            )
+        tcp_query_points = np.stack((query_u, query_v), axis=-1).astype(
+            np.float32, copy=False
+        )
+        tcp_query_valid = (
+            np.isfinite(tcp_query_points).all(axis=-1)
+            & np.isfinite(query_z)
+            & (query_z > 0)
+            & (tcp_query_points[:, 0] >= self.PAD_LEFT)
+            & (tcp_query_points[:, 0] < self.PAD_LEFT + self.SOURCE_WIDTH)
+            & (tcp_query_points[:, 1] >= self.PAD_TOP)
+            & (tcp_query_points[:, 1] < self.PAD_TOP + self.SOURCE_HEIGHT)
+        )
+        tcp_query_points[:, 0] = np.clip(
+            np.nan_to_num(tcp_query_points[:, 0], nan=float(self.PAD_LEFT)),
+            self.PAD_LEFT,
+            self.PAD_LEFT + self.SOURCE_WIDTH - 1,
+        )
+        tcp_query_points[:, 1] = np.clip(
+            np.nan_to_num(tcp_query_points[:, 1], nan=float(self.PAD_TOP)),
+            self.PAD_TOP,
+            self.PAD_TOP + self.SOURCE_HEIGHT - 1,
+        )
+
         return {
             "images": torch.stack(images),
             "depth": torch.stack(depths),
@@ -576,6 +637,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             ),
             "frame_rate": episode.frame_rate,
             "tcp_state": torch.from_numpy(tcp_state.copy()),
+            "tcp_query_points": torch.from_numpy(tcp_query_points.copy()),
+            "tcp_query_valid": torch.from_numpy(tcp_query_valid.copy()),
             "interval": interval,
             "task": episode.task,
             "episode": episode.name,

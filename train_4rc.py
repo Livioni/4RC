@@ -80,12 +80,14 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
     return config
 
 
-def load_model(pretrained_model: str | None) -> Arc:
+def load_model(
+    pretrained_model: str | None, *, tcp_query_window_size: int = 3
+) -> Arc:
     if not pretrained_model:
-        return Arc()
+        return Arc(tcp_query_window_size=tcp_query_window_size)
     path = Path(pretrained_model).expanduser()
     if path.is_file():
-        model = Arc()
+        model = Arc(tcp_query_window_size=tcp_query_window_size)
         if path.suffix == ".safetensors":
             from safetensors.torch import load_file
 
@@ -97,10 +99,21 @@ def load_model(pretrained_model: str | None) -> Arc:
         state_dict = {
             key.removeprefix("model."): value for key, value in state_dict.items()
         }
+        has_visual_query = any(
+            key.startswith("tcp_visual_query_encoder.") for key in state_dict
+        )
+        if not has_visual_query:
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if not key.startswith(("tcp_query_encoder.", "tcp_track_head."))
+            }
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         LOGGER.info("Loaded local weights (%d missing, %d unexpected)", len(missing), len(unexpected))
         return model
-    return Arc.from_pretrained(pretrained_model)
+    return Arc.from_pretrained(
+        pretrained_model, tcp_query_window_size=tcp_query_window_size
+    )
 
 
 def cosine_warmup_scheduler(
@@ -120,13 +133,29 @@ def cosine_warmup_scheduler(
     return LambdaLR(optimizer, scale)
 
 
+def distributed_scheduler_steps(
+    warmup_steps: int,
+    total_steps: int,
+    *,
+    num_processes: int,
+    split_batches: bool,
+) -> tuple[int, int]:
+    """Match AcceleratedScheduler's internal stepping convention."""
+    multiplier = 1 if split_batches else num_processes
+    return warmup_steps * multiplier, total_steps * multiplier
+
+
 def build_optimizer(model: Arc, config: dict[str, Any]) -> torch.optim.AdamW:
     groups = []
     for name, module, learning_rate in (
         ("backbone", model.backbone, config["lr_backbone"]),
         ("geometry_head", model.head, config["lr_head"]),
         ("motion_decoder", model.motion_decoder, config["lr_motion_decoder"]),
-        ("tcp_query_encoder", model.tcp_query_encoder, config["lr_tcp"]),
+        (
+            "tcp_visual_query_encoder",
+            model.tcp_visual_query_encoder,
+            config["lr_tcp"],
+        ),
         ("tcp_track_head", model.tcp_track_head, config["lr_tcp"]),
     ):
         parameters = [parameter for parameter in module.parameters() if parameter.requires_grad]
@@ -140,6 +169,53 @@ def build_optimizer(model: Arc, config: dict[str, Any]) -> torch.optim.AdamW:
         eps=config["adam_epsilon"],
         weight_decay=config["weight_decay"],
     )
+
+
+def prepare_tcp_query_points(
+    batch: dict[str, Any],
+    *,
+    global_step: int,
+    total_steps: int,
+    config: dict[str, Any],
+) -> torch.Tensor:
+    """Apply the resumable GT-to-jitter curriculum in padded pixel space."""
+    points = batch["tcp_query_points"].float()
+    valid = batch["tcp_query_valid"].bool()
+    progress = min(max(global_step / max(total_steps - 1, 1), 0.0), 1.0)
+    warmup = float(config.get("tcp_query_curriculum_warmup_ratio", 0.10))
+    transition = float(config.get("tcp_query_curriculum_transition_ratio", 0.20))
+    initial_exact = float(config.get("tcp_query_initial_exact_ratio", 0.80))
+    final_exact = float(config.get("tcp_query_exact_ratio", 0.25))
+    if progress < warmup:
+        exact_ratio = initial_exact
+    elif transition > 0 and progress < warmup + transition:
+        blend = (progress - warmup) / transition
+        exact_ratio = initial_exact + blend * (final_exact - initial_exact)
+    else:
+        exact_ratio = final_exact
+
+    jittered = (torch.rand(valid.shape, device=points.device) >= exact_ratio) & valid
+    max_jitter_patches = float(config.get("tcp_query_max_jitter_patches", 1.0))
+    ramp_end = max(warmup + transition, 1e-6)
+    radius_scale = 0.25 + 0.75 * min(progress / ramp_end, 1.0)
+    max_radius = Arc.PATCH_SIZE * max_jitter_patches * radius_scale
+
+    padding = batch["padding"].to(device=points.device, dtype=points.dtype)
+    source_size = batch["source_size"].to(device=points.device, dtype=points.dtype)
+    lower = torch.stack((padding[:, 0], padding[:, 2]), dim=-1)[:, None]
+    upper = lower + torch.stack((source_size[:, 1], source_size[:, 0]), dim=-1)[:, None] - 1
+    output = points.clone()
+    pending = jittered.clone()
+    for _ in range(8):
+        angle = torch.rand(valid.shape, device=points.device) * (2.0 * math.pi)
+        radius = torch.rand(valid.shape, device=points.device).sqrt() * max_radius
+        offset = torch.stack((radius * angle.cos(), radius * angle.sin()), dim=-1)
+        candidate = points + offset
+        inside = ((candidate >= lower) & (candidate <= upper)).all(dim=-1)
+        accepted = pending & inside
+        output[accepted] = candidate[accepted]
+        pending &= ~inside
+    return output
 
 
 def prepare_geometry_batch(
@@ -264,6 +340,7 @@ def main() -> None:
         max_interval=config["max_interval"],
         reverse_probability=config.get("reverse_probability", 0.5),
         frame_rate=config.get("frame_rate"),
+        max_depth=config.get("max_depth", 3.0),
         max_tcp_linear_speed=config.get("max_tcp_linear_speed", 3.0),
         max_tcp_angular_speed=config.get("max_tcp_angular_speed", 4.0 * math.pi),
         seed=config["seed"],
@@ -283,11 +360,17 @@ def main() -> None:
         batch_sampler=batch_sampler,
         num_workers=config["num_workers"],
         pin_memory=True,
-        persistent_workers=False,
+        persistent_workers=config["num_workers"] > 0,
         collate_fn=collate_clips,
     )
 
-    model = load_model(config.get("pretrained_model"))
+    model = load_model(
+        config.get("pretrained_model"),
+        tcp_query_window_size=config.get("tcp_query_window_size", 3),
+    )
+    model.set_tcp_position_stats(
+        dataset.tcp_position_mean, dataset.tcp_position_std
+    )
     trainable = model.configure_trainable_modules(
         backbone=config["train_backbone"],
         geometry_head=config["train_geometry_head"],
@@ -321,10 +404,16 @@ def main() -> None:
     steps_per_epoch = math.ceil(len(dataloader) / config["gradient_accumulation_steps"])
     planned_steps = steps_per_epoch * config["num_train_epochs"]
     total_steps = config.get("max_train_steps") or planned_steps
-    scheduler = cosine_warmup_scheduler(
-        optimizer,
+    scheduler_warmup_steps, scheduler_total_steps = distributed_scheduler_steps(
         config["warmup_steps"],
         total_steps,
+        num_processes=accelerator.num_processes,
+        split_batches=accelerator.split_batches,
+    )
+    scheduler = cosine_warmup_scheduler(
+        optimizer,
+        scheduler_warmup_steps,
+        scheduler_total_steps,
         config["eta_min_factor"],
     )
     scheduler = accelerator.prepare_scheduler(scheduler)
@@ -385,13 +474,19 @@ def main() -> None:
         for local_batch_index, batch in enumerate(epoch_dataloader):
             batch_index = batch_offset + local_batch_index
             with accelerator.accumulate(model):
+                tcp_query_points = prepare_tcp_query_points(
+                    batch,
+                    global_step=global_step,
+                    total_steps=total_steps,
+                    config=config,
+                )
                 with accelerator.autocast():
                     predictions = model(
                         views_from_batch(batch),
                         inference_track=False,
                         decode_camera=False,
                         decode_motion=False,
-                        tcp_query_state=batch["tcp_state"][:, 0],
+                        tcp_query_points=tcp_query_points,
                         decode_tcp=True,
                         return_aux_pyramid=False,
                         ref_view_strategy="first",

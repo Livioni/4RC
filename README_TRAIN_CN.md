@@ -4,8 +4,9 @@
 
 当前训练范围：
 
-- RGB 使用 RoboTwin `head_view`，TCP 标签读取 `TCP_head`；
-- 训练 backbone、DualDPT、共享 motion decoder、TCP query encoder 和 TCP head；
+- RGB 默认使用 RoboTwin `third_views`，TCP 标签读取 `TCP_third`；
+- 首帧 TCP 只用于生成二维投影与 loss 标签，不会作为 7D query 输入模型；
+- 训练 backbone、DualDPT、共享 motion decoder、视觉 query encoder 和 absolute TCP head；
 - camera decoder 与 dense track head 默认冻结；
 - 损失由 depth、ray、TCP pose、temporal velocity 和 gripper 组成。
 
@@ -48,18 +49,18 @@ datasets/RoboTwin/
 └── <task>/
     └── <episode>/
         ├── metadata.json
-        ├── images/head_view/000000.png
-        ├── depths/head_view/000000.png
-        ├── intrinsics/head_view.npy
-        ├── extrinsics/head_view.npy
-        └── TCP_head/
+        ├── images/third_views/000000.png
+        ├── depths/third_views/000000.png
+        ├── intrinsics/third_views.npy
+        ├── extrinsics/third_views.npy
+        └── TCP_third/
             ├── metadata.json
             ├── left_state.npy
             └── right_state.npy
 ```
 
 - RGB 必须是 `320×240`。
-- depth 是 uint16 毫米值，读取后转换为米；0 表示无效。
+- depth 是 uint16 毫米值，读取后转换为米；0 或超过默认 `3m` 的像素无效并置零。
 - extrinsics 是逐帧 OpenCV world-to-camera，形状为 `[T,3,4]`。
 - intrinsics 形状为 `[3,3]`。
 - episode `metadata.json` 提供真实 `frequency_hz`（当前数据均为 15 Hz）。
@@ -79,7 +80,8 @@ configs/train/4rc-giant-train.py
 
 ```python
 data_root = "datasets/RoboTwin"
-view = "head_view"
+view = "third_views"
+max_depth = 3.0  # 设为 None 可关闭最远深度过滤
 min_views = 2
 max_views = 18
 min_interval = 1
@@ -96,6 +98,11 @@ scene_counts = (1, 2, 3, 6, 9)
 batches_per_epoch = None
 recent_buffer_size = 10_000
 ```
+
+`TCP_third` 的首帧相机坐标会通过内参投影到 padded 图像。模型从每只手臂
+投影点周围采样 `3×3` 4RC patch tokens，并用真实 patch 坐标作为 MotionDecoder
+的二维 RoPE。训练前 10% step 以 80% 精确投影、20% jitter 开始，随后过渡到
+25% 精确投影、75% 最大一 patch jitter。
 
 默认参考 Depth-Anything-Next 的固定图像预算 sampler：每张 GPU 每个
 DataLoader batch 始终输入 18 张图。每步从 `scene_counts` 均匀选择场景数
@@ -141,9 +148,9 @@ train_motion_decoder = False
 train_tcp_tracker = True
 ```
 
-`train_tcp_tracker=True` 会训练共享 motion decoder、TCP query encoder 和 TCP
-head；`train_motion_decoder=False` 仅避免启用未使用的 dense track head。训练前向
-会跳过 camera decoder 和 dense tracking 分支。
+`train_tcp_tracker=True` 会训练共享 motion decoder、视觉 query encoder 和 absolute
+TCP head；`train_motion_decoder=False` 仅避免启用未使用的 dense track head。训练
+前向会跳过 camera decoder 和 dense tracking 分支。
 
 `find_unused_parameters=True` 必须保持开启：DualDPT 为兼容预训练权重保留了
 ray 金字塔各层的预测模块，而当前几何目标只监督最终 ray 层。关闭该选项会让
@@ -197,10 +204,19 @@ tcp_rotation_weight = 0.5
 tcp_temporal_weight = 0.2
 tcp_gripper_weight = 0.2
 tcp_velocity_scale = 1.0
+
+# 首帧视觉 query
+tcp_query_window_size = 3
+tcp_query_initial_exact_ratio = 0.80
+tcp_query_exact_ratio = 0.25
+tcp_query_max_jitter_patches = 1.0
+tcp_query_curriculum_warmup_ratio = 0.10
+tcp_query_curriculum_transition_ratio = 0.20
 ```
 
 总损失为 geometry objective 加权 TCP pose、temporal velocity 与 gripper
-objective。`tcp_point_scale` 只归一化 loss 中的米制误差，推理时不需要乘回。
+objective。TCP head 直接预测每帧相机坐标系的绝对位置与绝对旋转；position 使用
+训练集左右臂 mean/std 标准化。`tcp_point_scale` 只归一化 loss 中的米制误差。
 
 raw depth/ray L1 和 TCP metrics 只用于日志，不会再次加入 objective。
 
@@ -273,7 +289,7 @@ accelerate launch train_4rc.py \
   --resume outputs/4rc-robotwin-tcp-debug/checkpoint-5000
 ```
 
-使用已修复的 position 梯度从旧模型权重开始恢复微调：
+从旧模型复用 backbone/geometry/motion 权重并重新训练视觉 TCP 模块：
 
 ```bash
 accelerate launch train_4rc.py \
@@ -284,9 +300,9 @@ accelerate launch train_4rc.py \
 
 ## 8. 固定外参和显存注意事项
 
-RoboTwin `head_view` 的内外参固定，因此 depth 分支仍能从变化的 RGB 和深度监督中学习，但 ray 分支可能收敛为固定相机的空间模板。日志中的 `metric_ray_temporal_std` 可用于观察这种特化。该训练结果适合相同 head camera，不应直接当作通用变相机模型。
+RoboTwin 默认使用 `third_views` 标定。超过 3 米的像素只会退出 depth 与 gradient 监督；ray 仍在完整非 padding 区域学习相机模型。日志中的 `metric_ray_temporal_std` 可用于观察 ray 的时序变化。
 
-虽然 camera/motion decoder 权重被冻结，但 backbone 会更新；以后重新启用这些 decoder 时，仍建议联合微调以适配新的 backbone 特征分布。
+camera decoder 与 dense track head 默认冻结；共享 motion decoder 会随视觉 TCP tracker 一起训练。
 
 真实 `N=2` backward 已验证可运行，但 AdamW 首次 step 会额外创建 optimizer states，长序列也会增加激活显存。如果单卡显存不足，应降低调试配置的 `max_views`，正式复现则使用 Accelerate FSDP/多卡，不要静默改变最终的 `2～18` 采样范围。
 

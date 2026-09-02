@@ -1,4 +1,4 @@
-"""Recover TCP position learning from the existing RoboTwin-TCP checkpoint."""
+"""Train the visual-query TCP modules from an existing shared checkpoint."""
 
 from pathlib import Path
 import runpy
@@ -17,8 +17,8 @@ config.update(
     train_backbone=False,
     train_geometry_head=False,
     train_camera_decoder=False,
-    # tcp_tracker still trains the shared motion decoder, without enabling the
-    # unused dense tracking head.
+    # Legacy state-conditioned TCP modules are ignored; the shared motion
+    # decoder is reused while the visual-query modules start from scratch.
     train_motion_decoder=False,
     train_tcp_tracker=True,
     depth_loss_weight=0.0,

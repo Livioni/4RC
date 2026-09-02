@@ -98,6 +98,7 @@ class MotionDecoder(nn.Module):
         patch_start_idx: int,
         track_query_idx = 0,
         query_tokens: Optional[torch.Tensor] = None,
+        query_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -115,11 +116,6 @@ class MotionDecoder(nn.Module):
             query_patches = query_patches.expand(B, S, P, C)
             query_count = P
         else:
-            if query_tokens.ndim != 3 or query_tokens.shape[0] != B or query_tokens.shape[2] != C:
-                raise ValueError(
-                    f"Expected query_tokens [B,Q,C] with B={B}, C={C}, "
-                    f"got {tuple(query_tokens.shape)}"
-                )
             query_count = query_tokens.shape[1]
             query_patches = query_tokens[:, None].expand(B, S, query_count, C)
         
@@ -149,12 +145,19 @@ class MotionDecoder(nn.Module):
             if query_tokens is None:
                 pos_q = torch.cat([pos_time, pos_patches], dim=1)
             else:
-                pos_tcp = torch.zeros(
-                    B * S, query_count, 2,
-                    device=tokens.device,
-                    dtype=pos_patches.dtype,
-                )
-                pos_q = torch.cat([pos_time, pos_tcp], dim=1)
+                if query_positions is None:
+                    pos_query = torch.zeros(
+                        B, query_count, 2,
+                        device=tokens.device,
+                        dtype=pos_patches.dtype,
+                    )
+                else:
+                    pos_query = query_positions.to(
+                        device=tokens.device, dtype=pos_patches.dtype
+                    )
+                pos_query = pos_query[:, None].expand(B, S, query_count, 2)
+                pos_query = pos_query.reshape(B * S, query_count, 2) + 1
+                pos_q = torch.cat([pos_time, pos_query], dim=1)
 
             pos_k = pos_patches
 

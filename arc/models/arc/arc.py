@@ -15,7 +15,7 @@ from arc.models.arc.heads.dualdpt import DualDPT
 from arc.models.arc.heads.cam_dec import CameraDec
 from arc.models.arc.heads.motiondecoder import MotionDecoder
 from arc.models.arc.heads.dpt_head import DPTHead
-from arc.models.arc.heads.tcp_head import TCPQueryEncoder, TCPTrackHead
+from arc.models.arc.heads.tcp_head import TCPTrackHead, TCPVisualQueryEncoder
 
 from arc.dust3r.utils.image import ImgRenormalize
 from arc.dust3r.utils.misc import freeze_all_params
@@ -30,7 +30,7 @@ class Arc(
 ):
     PATCH_SIZE = 14
 
-    def __init__(self, freeze="none", motion_decoder_depth=4, motion_decoder_has_self_attention=True, motion_decoder_has_cross_attention=True, motion_decoder_use_adaln=True, track_head_activation="inv_log"):
+    def __init__(self, freeze="none", motion_decoder_depth=4, motion_decoder_has_self_attention=True, motion_decoder_has_cross_attention=True, motion_decoder_use_adaln=True, track_head_activation="inv_log", tcp_query_window_size=3):
         super().__init__()
 
         self.backbone = DinoV2(
@@ -68,8 +68,14 @@ class Arc(
             intermediate_layer_idx=[0, 1, 2, 3],
         )
 
-        self.tcp_query_encoder = TCPQueryEncoder(embed_dim=1536)
-        self.tcp_track_head = TCPTrackHead(embed_dim=1536)
+        self.tcp_visual_query_encoder = TCPVisualQueryEncoder(
+            embed_dim=1536,
+            patch_size=self.PATCH_SIZE,
+            window_size=tcp_query_window_size,
+        )
+        self.tcp_track_head = TCPTrackHead(
+            embed_dim=1536, window_size=tcp_query_window_size
+        )
 
         self.set_freeze(freeze)
 
@@ -184,9 +190,7 @@ class Arc(
             }
             if "tcp_position" in preds:
                 for key in (
-                    "tcp_delta_position",
                     "tcp_position",
-                    "tcp_relative_rotation",
                     "tcp_rotation",
                     "tcp_gripper_logit",
                     "tcp_confidence",
@@ -198,6 +202,11 @@ class Arc(
             output_list.append(frame_output)
 
         return output_list
+
+    def set_tcp_position_stats(
+        self, mean: torch.Tensor, std: torch.Tensor
+    ) -> None:
+        self.tcp_track_head.set_position_stats(mean, std)
 
     def set_freeze(self, freeze):
         self.freeze = freeze
@@ -229,7 +238,7 @@ class Arc(
             "camera_decoder": (self.cam_dec, camera_decoder),
             "motion_decoder": (self.motion_decoder, train_shared_motion),
             "track_head": (self.track_head, motion_decoder),
-            "tcp_query_encoder": (self.tcp_query_encoder, tcp_tracker),
+            "tcp_visual_query_encoder": (self.tcp_visual_query_encoder, tcp_tracker),
             "tcp_track_head": (self.tcp_track_head, tcp_tracker),
         }
         for module, trainable in modules.values():
@@ -245,7 +254,7 @@ class Arc(
         inference_track = True,
         decode_camera: bool = True,
         decode_motion: bool = True,
-        tcp_query_state: torch.Tensor | None = None,
+        tcp_query_points: torch.Tensor | None = None,
         decode_tcp: bool = False,
         **kwargs
     ):
@@ -261,7 +270,7 @@ class Arc(
             inference_track=inference_track,
             decode_camera=decode_camera,
             decode_motion=decode_motion,
-            tcp_query_state=tcp_query_state,
+            tcp_query_points=tcp_query_points,
             decode_tcp=decode_tcp,
             **kwargs,
         )
@@ -283,7 +292,7 @@ class Arc(
         inference_track: bool = True,
         decode_camera: bool = True,
         decode_motion: bool = True,
-        tcp_query_state: torch.Tensor | None = None,
+        tcp_query_points: torch.Tensor | None = None,
         decode_tcp: bool = False,
         return_aux_pyramid: bool = True,
     ) -> Dict[str, torch.Tensor]:
@@ -334,24 +343,36 @@ class Arc(
             output["conf_track_multi"] = torch.stack(conf_list, dim=1)
 
         if decode_tcp:
-            if tcp_query_state is None:
-                raise ValueError("tcp_query_state is required when decode_tcp=True")
-            query_tokens = self.tcp_query_encoder(tcp_query_state)
+            if tcp_query_points is None:
+                raise ValueError("tcp_query_points is required when decode_tcp=True")
+            if tcp_query_points.shape != (x.shape[0], 2, 2):
+                raise ValueError(
+                    "tcp_query_points must have shape [B,2,2], got "
+                    f"{tuple(tcp_query_points.shape)}"
+                )
             sparse_motion_levels = []
             for feature in feats:
-                feature = torch.cat(
+                patch_tokens = feature[0][:, 0, :, 1536:]
+                query_tokens, query_positions = self.tcp_visual_query_encoder(
+                    patch_tokens,
+                    tcp_query_points,
+                    image_height=H,
+                    image_width=W,
+                )
+                motion_feature = torch.cat(
                     [feature[1].unsqueeze(2), feature[2].unsqueeze(2), feature[0]],
                     dim=2,
                 )[..., 1536:]
                 sparse_motion_levels.append(
                     self.motion_decoder(
-                        feature,
+                        motion_feature,
                         images=x,
                         patch_start_idx=2,
                         query_tokens=query_tokens,
+                        query_positions=query_positions,
                     )
                 )
-            output.update(self.tcp_track_head(sparse_motion_levels, tcp_query_state))
+            output.update(self.tcp_track_head(sparse_motion_levels))
 
         output['track_query_idx'] = output_track_query_idx
 
