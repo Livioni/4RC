@@ -239,7 +239,7 @@ checkpoint 保存模型、AdamW、scheduler、随机数状态、epoch、batch �
 
 ```bash
 conda activate 4rc
-accelerate launch --num_processes 1 train_4rc.py \
+accelerate launch --num_processes 5 train_4rc.py \
   --config configs/train/4rc-giant-train.py \
   --data-root datasets/RoboTwin
 ```

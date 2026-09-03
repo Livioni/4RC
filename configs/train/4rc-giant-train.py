@@ -5,7 +5,7 @@
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-robotwin-tcp-debug"
+output_dir = "outputs/4rc-robotwin-tcp-point-query"
 logging_dir = "logs"
 pretrained_model = "Luo-Yihang/4RC"
 resume = None
@@ -35,8 +35,8 @@ augment = True
 # the legacy per-scene unit-mean-distance normalization.
 normalize_geometry = False
 num_workers = 8
-train_batch_images = 4
-scene_counts = (1, 2)
+train_batch_images = 18
+scene_counts = (1, 2, 3, 6, 9)
 batches_per_epoch = None
 recent_buffer_size = 10_000
 
@@ -51,7 +51,7 @@ tcp_query_window_size = 3
 
 # == Training Configuration ==
 seed = 42
-num_train_epochs = 50
+num_train_epochs = 80
 max_train_steps = 50_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"

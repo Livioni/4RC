@@ -182,3 +182,4 @@ configs/local/default.yaml
 /outputs/
 /checkpoints/
 /glb_outputs/
+/new_datasets/
