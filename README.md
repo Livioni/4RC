@@ -172,6 +172,20 @@ dense track head remain frozen; the TCP tracker still trains the shared motion
 decoder. At inference, pass the two first-frame image points explicitly with
 `tcp_inference.py --tcp-query-points LEFT_X LEFT_Y RIGHT_X RIGHT_Y`.
 
+For click-to-query inference, launch the selection page and click the left TCP
+followed by the right TCP in the displayed first frame. The resulting geometry
+and dual-arm trajectory are shown in an embedded Viser player.
+
+When the input is a complete RoboTwin episode, the page also offers a
+**Use first-frame ground-truth TCP** button that projects `TCP_third`/`TCP_head`
+states into the image and overlays the left/right query markers automatically:
+
+```bash
+conda run -n 4rc python tcp_inference.py \
+  --input datasets/RoboTwin/<task>/<episode> \
+  --interactive
+```
+
 ## :zap: Demo
 
 Launch the interactive Gradio demo:

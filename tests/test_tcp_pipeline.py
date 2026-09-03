@@ -21,7 +21,11 @@ from arc.models.arc.heads.tcp_head import TCPTrackHead, TCPVisualQueryEncoder
 from arc.rotation import rpy_to_matrix
 from tcp_inference import (
     _validate_query_points,
+    add_interactive_query_point,
     collect_rgb_paths,
+    compute_default_third_camera_view,
+    load_ground_truth_query_points,
+    render_query_overlay,
     warn_if_out_of_training_distribution,
 )
 from train_4rc import distributed_scheduler_steps, prepare_tcp_query_points
@@ -348,6 +352,55 @@ def test_inference_query_points_are_original_image_coordinates():
     assert points.shape == (2, 2)
     with pytest.raises(ValueError, match="must lie inside"):
         _validate_query_points([[0, 0], [320, 239]], "test")
+
+
+def test_ground_truth_query_points_project_into_original_first_frame(tmp_path):
+    episode = _write_episode(tmp_path)
+    expected = np.array([[160.0, 120.0], [160.0, 120.0]], dtype=np.float32)
+
+    from_episode = load_ground_truth_query_points(episode, "third_views", 0)
+    from_rgb_dir = load_ground_truth_query_points(
+        episode / "images" / "third_views", "third_views", 0
+    )
+
+    np.testing.assert_allclose(from_episode, expected)
+    np.testing.assert_allclose(from_rgb_dir, expected)
+
+
+def test_ground_truth_query_points_require_episode_metadata(tmp_path):
+    rgb_dir = tmp_path / "rgb"
+    rgb_dir.mkdir()
+    with pytest.raises(FileNotFoundError, match="requires a RoboTwin episode"):
+        load_ground_truth_query_points(rgb_dir, "third_views", 0)
+
+
+def test_interactive_query_selection_is_left_then_right_and_stops_at_two():
+    points = add_interactive_query_point([], (12, 34))
+    points = add_interactive_query_point(points, (210, 123))
+    assert points == [[12.0, 34.0], [210.0, 123.0]]
+    assert add_interactive_query_point(points, (1, 2)) == points
+
+
+def test_default_viser_view_sits_behind_third_camera():
+    extrinsic_w2c = np.eye(4, dtype=np.float32)[:3]
+    position, look_at, up = compute_default_third_camera_view(
+        extrinsic_w2c,
+        scene_center=np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        scene_extent=1.0,
+    )
+
+    np.testing.assert_allclose(position, [0.0, 0.0, -0.15])
+    np.testing.assert_allclose(look_at, [0.0, 0.0, 1.0])
+    np.testing.assert_allclose(up, [0.0, -1.0, 0.0])
+
+
+def test_interactive_query_overlay_preserves_native_image():
+    image = np.zeros((240, 320, 3), dtype=np.uint8)
+    overlay = render_query_overlay(image, [[12.0, 34.0], [210.0, 123.0]])
+    assert overlay.shape == image.shape
+    assert overlay.dtype == np.uint8
+    assert np.any(overlay != image)
+    assert not np.any(image)
 
 
 def test_distributed_scheduler_steps_match_accelerate_convention():
