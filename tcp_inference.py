@@ -12,7 +12,7 @@ Example:
         --tcp-query-points 120 140 205 138
 
     python tcp_inference.py \
-        --input datasets/RoboTwin_random_subset/beat_block_hammer/episode_0000005 \
+        --input datasets/RoboTwin_random/beat_block_hammer/episode_0000004 \
         --interactive \
         --frame-indices 15 20 25 30 35 40 45 50 55
 
@@ -271,18 +271,10 @@ def load_ground_truth_query_points(
                 f"{states.shape[0]} frames"
             )
         positions.append(np.asarray(states[frame_index, :3], dtype=np.float32))
-    xyz = np.stack(positions, axis=0)
-    z = xyz[:, 2]
-    if not np.isfinite(xyz).all() or np.any(z <= 0):
-        raise ValueError(
-            f"Ground-truth TCP must be finite and in front of the camera: {xyz.tolist()}"
-        )
-
-    u = intrinsics[0, 0] * xyz[:, 0] / z + intrinsics[0, 2]
-    v = intrinsics[1, 1] * xyz[:, 1] / z + intrinsics[1, 2]
-    return _validate_query_points(
-        np.stack((u, v), axis=-1),
-        f"projected ground truth for frame {frame_index}",
+    return project_tcp_positions_to_query_points(
+        np.stack(positions, axis=0),
+        intrinsics,
+        source=f"ground-truth TCP at frame {frame_index}",
     )
 
 
@@ -415,6 +407,73 @@ def _validate_query_points(points: Any, source: str) -> np.ndarray:
             f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}: {points_array.tolist()}"
         )
     return points_array
+
+
+def project_tcp_positions_to_query_points(
+    positions: Any,
+    intrinsics: Any,
+    *,
+    source: str,
+) -> np.ndarray:
+    """Project left/right camera-frame TCP xyz to original-image pixels.
+
+    The visual TCP query encoder consumes two image points, while the TCP head
+    predicts metric positions. Sliding-window inference uses this conversion on
+    the shared boundary frame to feed one window's final prediction into the
+    next window.
+    """
+    xyz = np.asarray(positions, dtype=np.float32)
+    camera_matrix = np.asarray(intrinsics, dtype=np.float32)
+    if xyz.shape != (len(ARM_NAMES), 3):
+        raise ValueError(
+            f"TCP positions from {source} must have shape [2,3], got {xyz.shape}"
+        )
+    if camera_matrix.shape != (3, 3):
+        raise ValueError(
+            f"Camera intrinsics for {source} must have shape [3,3], "
+            f"got {camera_matrix.shape}"
+        )
+    if not np.isfinite(camera_matrix).all():
+        raise ValueError(f"Camera intrinsics for {source} contain NaN/Inf")
+    if not np.isfinite(xyz).all():
+        raise ValueError(f"TCP positions from {source} contain NaN/Inf: {xyz.tolist()}")
+
+    z = xyz[:, 2]
+    invalid_depth = np.flatnonzero(z <= 0)
+    if len(invalid_depth):
+        arm_index = int(invalid_depth[0])
+        raise ValueError(
+            f"Cannot project {ARM_NAMES[arm_index]} TCP from {source}: "
+            f"expected z > 0, got xyz={xyz[arm_index].tolist()}"
+        )
+
+    homogeneous = xyz @ camera_matrix.T
+    projection_depth = homogeneous[:, 2]
+    invalid_projection_depth = np.flatnonzero(
+        ~np.isfinite(projection_depth) | (np.abs(projection_depth) < 1e-8)
+    )
+    if len(invalid_projection_depth):
+        arm_index = int(invalid_projection_depth[0])
+        raise ValueError(
+            f"Cannot project {ARM_NAMES[arm_index]} TCP from {source}: invalid "
+            f"homogeneous depth {float(projection_depth[arm_index])}"
+        )
+    pixels = homogeneous[:, :2] / projection_depth[:, None]
+
+    for arm_index, arm_name in enumerate(ARM_NAMES):
+        u, v = (float(value) for value in pixels[arm_index])
+        if not (math.isfinite(u) and math.isfinite(v)):
+            raise ValueError(
+                f"Cannot project {arm_name} TCP from {source}: projected pixel "
+                f"is not finite: {[u, v]}"
+            )
+        if not (0.0 <= u < SOURCE_WIDTH and 0.0 <= v < SOURCE_HEIGHT):
+            raise ValueError(
+                f"Cannot project {arm_name} TCP from {source}: xyz="
+                f"{xyz[arm_index].tolist()} projects outside "
+                f"{SOURCE_WIDTH}x{SOURCE_HEIGHT} at pixel={[u, v]}"
+            )
+    return _validate_query_points(pixels, f"projection of {source}")
 
 
 def _load_query_points_file(path: Path) -> np.ndarray:
@@ -631,20 +690,14 @@ def matrix_to_rpy(rotation: np.ndarray) -> np.ndarray:
     return np.stack((roll, pitch, yaw), axis=-1).astype(np.float32)
 
 
-def infer_tcp_and_geometry(
+def _run_tcp_model(
     model,
     views: list[dict[str, torch.Tensor]],
     query_points: np.ndarray,
     device: torch.device,
     dtype: torch.dtype,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    dict[str, np.ndarray],
-    np.ndarray,
-    dict[str, Any],
-]:
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Run the shared model forward used by TCP-only and geometry inference."""
     device_views = [
         {**view, "img": view["img"].to(device, non_blocking=True)} for view in views
     ]
@@ -671,35 +724,78 @@ def infer_tcp_and_geometry(
                     return_aux_pyramid=False,
                     ref_view_strategy="first",
                 )
-
-            height, width = predictions["depth"].shape[-2:]
-            model._process_ray_pose_estimation(predictions, height, width)
-            depth = predictions["depth"][0].detach().float().cpu().numpy()
-            confidence = predictions["depth_conf"][0].detach().float().cpu().numpy()
-            extrinsics = predictions["extrinsics"][0].detach().float().cpu().numpy()
-            intrinsics = predictions["intrinsics"][0].detach().float().cpu().numpy()
-            tcp = {
-                "position": predictions["tcp_position"][0].detach().float().cpu().numpy(),
-                "rotation": predictions["tcp_rotation"][0].detach().float().cpu().numpy(),
-                "gripper": predictions["tcp_gripper_logit"][0]
-                .sigmoid()
-                .detach()
-                .float()
-                .cpu()
-                .numpy(),
-                "confidence": predictions["tcp_confidence"][0]
-                .detach()
-                .float()
-                .cpu()
-                .numpy(),
-            }
     except torch.cuda.OutOfMemoryError as error:
         if device.type == "cuda":
             torch.cuda.empty_cache()
         raise RuntimeError(
             f"CUDA ran out of memory while processing {len(views)} frames; "
-            "reduce --max-frames"
+            "reduce the clip or sliding-window length"
         ) from error
+    return predictions, profiling
+
+
+def _extract_tcp_predictions(
+    predictions: dict[str, torch.Tensor],
+) -> dict[str, np.ndarray]:
+    return {
+        "position": predictions["tcp_position"][0].detach().float().cpu().numpy(),
+        "rotation": predictions["tcp_rotation"][0].detach().float().cpu().numpy(),
+        "gripper": predictions["tcp_gripper_logit"][0]
+        .sigmoid()
+        .detach()
+        .float()
+        .cpu()
+        .numpy(),
+        "confidence": predictions["tcp_confidence"][0]
+        .detach()
+        .float()
+        .cpu()
+        .numpy(),
+    }
+
+
+def infer_tcp_trajectory(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Infer TCP state without camera recovery or point-cloud materialization."""
+    predictions, profiling = _run_tcp_model(
+        model, views, query_points, device, dtype
+    )
+    tcp = _extract_tcp_predictions(predictions)
+    del predictions
+    return tcp, profiling
+
+
+def infer_tcp_and_geometry(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray,
+    dict[str, Any],
+]:
+    predictions, profiling = _run_tcp_model(
+        model, views, query_points, device, dtype
+    )
+    with torch.inference_mode():
+        height, width = predictions["depth"].shape[-2:]
+        model._process_ray_pose_estimation(predictions, height, width)
+        depth = predictions["depth"][0].detach().float().cpu().numpy()
+        confidence = predictions["depth_conf"][0].detach().float().cpu().numpy()
+        extrinsics = predictions["extrinsics"][0].detach().float().cpu().numpy()
+        intrinsics = predictions["intrinsics"][0].detach().float().cpu().numpy()
+        tcp = _extract_tcp_predictions(predictions)
+    del predictions
 
     from arc.models.arc.utils.geometry import unproject_depth_map_to_point_map
 
@@ -955,7 +1051,10 @@ def start_visualization(
     bounds_max = np.percentile(bounds_points, 99.0, axis=0)
     center = (bounds_min + bounds_max) * 0.5
     extent = max(float(np.max(bounds_max - bounds_min)), 0.1)
-    axes_length = float(np.clip(extent * 0.08, 0.025, 0.12))
+    marker_scale = float(np.clip(extent * 0.08, 0.025, 0.12))
+    tcp_axes_length = marker_scale * 0.55
+    axes_radius = marker_scale * 0.018
+    origin_radius = marker_scale * 0.05
 
     default_camera_position = center + extent * np.array(
         [0.0, 0.0, -1.2], dtype=np.float32
@@ -983,7 +1082,11 @@ def start_visualization(
         control_layout="floating", control_width="large", show_logo=False
     )
     server.scene.set_up_direction(tuple(default_camera_up.tolist()))
-    server.scene.world_axes.visible = True
+    world_axes = server.scene.world_axes
+    world_axes.axes_length = tcp_axes_length * 2.0
+    world_axes.axes_radius = axes_radius
+    world_axes.origin_radius = origin_radius
+    world_axes.visible = True
 
     with server.gui.add_folder("Playback", expand_by_default=True):
         gui_frame = server.gui.add_slider(
@@ -1067,15 +1170,15 @@ def start_visualization(
                 f"/frames/t{frame_slot}/tcp/{arm_name}",
                 wxyz=quaternion,
                 position=tcp["position"][frame_slot, arm_index],
-                axes_length=axes_length,
-                axes_radius=axes_length * 0.035,
-                origin_radius=axes_length * 0.075,
+                axes_length=tcp_axes_length,
+                axes_radius=axes_radius,
+                origin_radius=origin_radius,
                 origin_color=arm_color,
                 visible=frame_slot == 0,
             )
             tcp_sphere = server.scene.add_icosphere(
                 f"/frames/t{frame_slot}/tcp/{arm_name}/xyz",
-                radius=axes_length * 0.11,
+                radius=marker_scale * 0.11,
                 color=arm_color,
                 position=(0.0, 0.0, 0.0),
                 visible=frame_slot == 0,
@@ -1086,7 +1189,7 @@ def start_visualization(
                     f"{arm_name}: "
                     f"gripper={tcp['gripper'][frame_slot, arm_index]:.3f}"
                 ),
-                position=(0.0, 0.0, axes_length * 1.25),
+                position=(0.0, 0.0, marker_scale * 1.25),
                 anchor="bottom-center",
                 visible=frame_slot == 0,
             )

@@ -26,9 +26,9 @@ from tqdm.auto import tqdm
 
 from arc.models.arc.arc import Arc
 from arc.datasets import (
-    FixedImageBatchSampler,
-    RoboTwin4RC,
-    collate_clips,
+    WeightedMultiSourceBatchSampler,
+    build_training_dataset,
+    collate_training_samples,
     views_from_batch,
 )
 from arc.datasets.utils import (
@@ -67,6 +67,11 @@ def load_config(args: argparse.Namespace) -> dict[str, Any]:
         }
     if not config:
         raise ValueError(f"No public configuration values found in {args.config}")
+    if args.data_root is not None and "data_sources" in config:
+        raise ValueError(
+            "--data-root cannot be combined with a config that defines "
+            "data_sources; edit the source options instead"
+        )
     overrides = {
         "data_root": args.data_root,
         "pretrained_model": args.pretrained_model,
@@ -331,23 +336,8 @@ def main() -> None:
     }
     accelerator.init_trackers("4RC-RoboTwin-TCP", config=tracker_config)
 
-    dataset = RoboTwin4RC(
-        config["data_root"],
-        view=config["view"],
-        min_views=config["min_views"],
-        max_views=config["max_views"],
-        min_interval=config["min_interval"],
-        max_interval=config["max_interval"],
-        reverse_probability=config.get("reverse_probability", 0.5),
-        frame_rate=config.get("frame_rate"),
-        max_depth=config.get("max_depth", 3.0),
-        max_tcp_linear_speed=config.get("max_tcp_linear_speed", 3.0),
-        max_tcp_angular_speed=config.get("max_tcp_angular_speed", 4.0 * math.pi),
-        seed=config["seed"],
-        augment=config["augment"],
-        max_episodes=config.get("max_episodes"),
-    )
-    batch_sampler = FixedImageBatchSampler(
+    dataset = build_training_dataset(config)
+    batch_sampler = WeightedMultiSourceBatchSampler(
         dataset,
         images_per_batch=config["train_batch_images"],
         scene_counts=config["scene_counts"],
@@ -361,7 +351,7 @@ def main() -> None:
         num_workers=config["num_workers"],
         pin_memory=True,
         persistent_workers=config["num_workers"] > 0,
-        collate_fn=collate_clips,
+        collate_fn=collate_training_samples,
     )
 
     model = load_model(
@@ -436,6 +426,14 @@ def main() -> None:
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
     )
     LOGGER.info("Dataset: %d episodes; trainable modules: %s", len(dataset), trainable)
+    for source in dataset.source_summaries:
+        LOGGER.info(
+            "Dataset source %s (type=%s): %d episodes, sampling weight=%.4f",
+            source["name"],
+            source["type"],
+            source["episodes"],
+            source["weight"],
+        )
     LOGGER.info(
         "TCP trajectory filtering: %d invalid transitions across %d episodes",
         dataset.invalid_transition_count,
@@ -447,6 +445,10 @@ def main() -> None:
         batch_sampler.images_per_batch,
     )
     LOGGER.info("Trainable parameters: %s / %s", f"{trainable_parameters:,}", f"{total_parameters:,}")
+
+    source_batch_counts = {
+        source_name: 0 for source_name in dataset.source_names
+    }
 
     stop_training = global_step >= total_steps
     next_epoch_state = initial_epoch
@@ -473,6 +475,8 @@ def main() -> None:
         )
         for local_batch_index, batch in enumerate(epoch_dataloader):
             batch_index = batch_offset + local_batch_index
+            source_name = batch["dataset_source"][0]
+            source_batch_counts[source_name] += 1
             with accelerator.accumulate(model):
                 tcp_query_points = prepare_tcp_query_points(
                     batch,
@@ -523,6 +527,12 @@ def main() -> None:
                 metrics = {
                     key: value.detach().float().item() for key, value in losses.items()
                 }
+                metrics.update(
+                    {
+                        f"data/source_batches/{name}": count
+                        for name, count in source_batch_counts.items()
+                    }
+                )
                 for group in optimizer.param_groups:
                     metrics[f"lr/{group.get('name', 'group')}"] = group["lr"]
                 accelerator.log(metrics, step=global_step)

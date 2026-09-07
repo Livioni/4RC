@@ -186,6 +186,37 @@ conda run -n 4rc python tcp_inference.py \
   --interactive
 ```
 
+### Full-episode TCP sliding-window inference
+
+Use `tcp_sliding_window_inference.py` to infer every consecutive frame in a
+complete RoboTwin episode and export one JSON trajectory. The default nine-frame
+windows overlap by one frame. Each window's final predicted TCP xyz is projected
+with the episode camera intrinsics to become the next window's first-frame image
+query; TCP ground truth is used only to bootstrap the initial query when no
+manual query is supplied.
+
+```bash
+conda run -n 4rc python tcp_sliding_window_inference.py \
+  --input datasets/RoboTwin/<task>/<episode> \
+  --output outputs/tcp_episode.json \
+  --frame-indices 15 20 25 30 35 40 45 50 55
+```
+
+The initial query can instead be supplied with `--tcp-query-points`, loaded with
+`--tcp-query-points-file`, or selected in a browser with `--interactive`. The
+interactive path also embeds the complete Viser playback; use `--visualize` to
+enable Viser after a non-interactive run.
+
+Shared boundary frames are emitted once. Select their TCP result with
+`--boundary-merge previous` (default), `next`, or `average`; average mode uses
+equal scalar weights and an SO(3) midpoint for rotation. Projection is strict:
+non-finite positions, non-positive depth, or a query outside the 320x240 image
+stop inference instead of silently clipping the query.
+
+The JSON contains per-frame left/right `xyz_m`, `rpy_rad`, `rpy_deg`, gripper
+probability and binary state, confidence, source-window indices, plus the query
+and timing metadata for every inference window.
+
 ## :zap: Demo
 
 Launch the interactive Gradio demo:

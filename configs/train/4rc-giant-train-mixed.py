@@ -1,17 +1,30 @@
-"""Train the visual-query TCP modules from an existing shared checkpoint."""
+"""Balanced geometry and TCP training on standard and randomized RoboTwin datasets."""
 
 # ======================================================
 # 4RC Geometry + TCP Tracking Configuration
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-robotwin-tcp-recovery"
+output_dir = "outputs/4rc-robotwin-mixed-tcp-point-query"
 logging_dir = "logs"
-pretrained_model = "checkpoints/RoboTwin-TCP/model.safetensors"
+pretrained_model = "Luo-Yihang/4RC"
 resume = None
 
 # == Dataset Configuration ==
-data_root = "datasets/RoboTwin"
+data_sources = (
+    {
+        "name": "robotwin",
+        "type": "robotwin",
+        "weight": 0.5,
+        "options": {"root": "datasets/RoboTwin"},
+    },
+    {
+        "name": "robotwin_random",
+        "type": "robotwin",
+        "weight": 0.5,
+        "options": {"root": "datasets/RoboTwin_random"},
+    },
+)
 view = "third_views"
 min_views = 2
 max_views = 18
@@ -41,11 +54,9 @@ batches_per_epoch = None
 recent_buffer_size = 10_000
 
 # == Model Configuration ==
-train_backbone = False
-train_geometry_head = False
+train_backbone = True
+train_geometry_head = True
 train_camera_decoder = False
-# Legacy state-conditioned TCP modules are ignored; the shared motion
-# decoder is reused while the visual-query modules start from scratch.
 train_motion_decoder = False
 train_tcp_tracker = True
 # Sample a 3x3 local patch neighborhood around each projected TCP point.
@@ -54,7 +65,7 @@ tcp_query_window_size = 3
 # == Training Configuration ==
 seed = 42
 num_train_epochs = 80
-max_train_steps = 10_000
+max_train_steps = 50_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"
 max_grad_norm = 1.0
@@ -73,12 +84,12 @@ adam_epsilon = 1e-8
 weight_decay = 0.01
 
 # == Learning Rate Scheduler Configuration ==
-warmup_steps = 500
+warmup_steps = 1000
 eta_min_factor = 0.1
 
 # == Loss Configuration ==
-depth_loss_weight = 0.0
-ray_loss_weight = 0.0
+depth_loss_weight = 1.0
+ray_loss_weight = 1.0
 loss_gamma = 1.0
 loss_alpha = 0.2
 depth_valid_range = 0.98

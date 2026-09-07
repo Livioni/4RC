@@ -259,6 +259,23 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
+    def eligible_indices(self, num_views: int) -> np.ndarray:
+        """Return episode indices compatible with the generic mixture sampler."""
+        return np.asarray(
+            [
+                index
+                for index, episode in enumerate(self.episodes)
+                if self.can_sample_num_views(episode, num_views)
+            ],
+            dtype=np.int64,
+        )
+
+    def get_sample(
+        self, index: int, num_views: int, sample_seed: int
+    ) -> dict[str, Any]:
+        """Load one deterministic clip through the dataset-adapter contract."""
+        return self[(int(index), int(num_views), int(sample_seed))]
+
     @staticmethod
     def _read_json(path: Path) -> dict[str, Any]:
         try:
