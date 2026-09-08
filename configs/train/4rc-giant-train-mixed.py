@@ -15,13 +15,13 @@ data_sources = (
     {
         "name": "robotwin",
         "type": "robotwin",
-        "weight": 0.5,
+        "weight": 0.33,
         "options": {"root": "datasets/RoboTwin"},
     },
     {
         "name": "robotwin_random",
         "type": "robotwin",
-        "weight": 0.5,
+        "weight": 0.66,
         "options": {"root": "datasets/RoboTwin_random"},
     },
 )
@@ -64,8 +64,8 @@ tcp_query_window_size = 3
 
 # == Training Configuration ==
 seed = 42
-num_train_epochs = 80
-max_train_steps = 50_000
+num_train_epochs = 50
+max_train_steps = 100_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"
 max_grad_norm = 1.0
@@ -89,7 +89,7 @@ eta_min_factor = 0.1
 
 # == Loss Configuration ==
 depth_loss_weight = 1.0
-ray_loss_weight = 1.0
+ray_loss_weight = 1.0 
 loss_gamma = 1.0
 loss_alpha = 0.2
 depth_valid_range = 0.98
@@ -113,6 +113,6 @@ tcp_query_curriculum_transition_ratio = 0.20
 # == Logging and Checkpoint Configuration ==
 log_every_steps = 10
 visualize_every_steps = 1000
-checkpointing_steps = 5000
+checkpointing_steps = 10_000
 save_each_epoch = False
 report_to = "tensorboard"

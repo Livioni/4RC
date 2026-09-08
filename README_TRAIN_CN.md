@@ -239,7 +239,7 @@ checkpoint 保存模型、AdamW、scheduler、随机数状态、epoch、batch �
 
 ```bash
 conda activate 4rc
-accelerate launch --num_processes 5 train_4rc.py \
+accelerate launch --num_processes 4 train_4rc.py \
   --config configs/train/4rc-giant-train.py \
   --data-root datasets/RoboTwin
 ```
@@ -314,14 +314,14 @@ camera decoder 与 dense track head 默认冻结；共享 motion decoder 会随�
 
 在仓库根目录运行：
 
-~~~bash
+```bash
 python arc/datasets/robotwin.py \
   --data-root datasets/RoboTwin \
   --index 0 \
   --num-views 4 \
   --max-points-per-view 50000 \
   --output outputs/robotwin-sample.glb
-~~~
+```
 
 参数说明：
 
@@ -334,7 +334,7 @@ python arc/datasets/robotwin.py \
 
 也可以在 Python 中直接调用：
 
-~~~python
+```python
 from arc.datasets import RoboTwin4RC, visualize_scene
 
 dataset = RoboTwin4RC(
@@ -349,7 +349,7 @@ visualize_scene(
     output_path="outputs/robotwin-sample.glb",
     max_points_per_view=50_000,
 )
-~~~
+```
 
 数据仍使用原生 320×240 图像，并按训练数据流反射 padding 到 322×252。
 可视化使用同步平移后的主点 “(cx+1, cy+6)”，不会对图像或深度另行缩放。
@@ -361,45 +361,45 @@ visualize_scene(
 小文件，脚本不会把这些文件直接提交到 Hub，而是为每个 task 创建一个未压缩
 tar，上传到：
 
-~~~text
+```text
 RoboTwin/<task>.tar
-~~~
+```
 
-每个 tar 内保留 “<task>/<episode>/...” 原始路径。归档逐个生成和上传；
+每个 tar 内保留 “<task></task>/<episode></episode>/...” 原始路径。归档逐个生成和上传；
 上传成功后默认删除对应临时 tar，因此只需要容纳最大单个 task 的临时空间。
 
 先检查任务列表，不创建归档也不连接 Hub：
 
-~~~bash
+```bash
 python scripts/upload_robotwin_to_hf.py --dry-run
-~~~
+```
 
 安全地输入并显式传递具有 dataset 写权限的 token：
 
-~~~bash
+```bash
 read -rsp "HF token: " HF_TOKEN
 export HF_TOKEN
 python scripts/upload_robotwin_to_hf.py --token "$HF_TOKEN"
 unset HF_TOKEN
-~~~
+```
 
 只上传一个 task：
 
-~~~bash
+```bash
 python scripts/upload_robotwin_to_hf.py \
   --token "$HF_TOKEN" \
   --task adjust_bottle
-~~~
+```
 
 如果仓库尚不存在，脚本会创建 dataset repo；添加 “--private” 可将新仓库
 设为私有。中断后直接重新执行即可：远端已经存在的 task 会跳过，上传失败时
 完整的本地 tar 会保留并在下次复用。若默认 staging 磁盘空间不足，可指定：
 
-~~~bash
+```bash
 python scripts/upload_robotwin_to_hf.py \
   --token "$HF_TOKEN" \
   --staging-dir /path/to/large/disk/hf-upload-robotwin
-~~~
+```
 
 “--keep-archives” 会保留上传成功的 tar；“--overwrite” 会重新上传远端已存在
 的 task；“--rebuild-archives” 会重新创建 staging 中已有的 tar。
