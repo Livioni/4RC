@@ -281,6 +281,35 @@ pytest -q tests/test_tcp_pipeline.py
 
 ## 7. 恢复训练
 
+混合数据训练配置支持取消 epoch 上限，只按累计 optimizer step 结束：
+
+```python
+resume = "outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint"
+num_train_epochs = None
+max_train_steps = 100_000
+```
+
+在已激活的 `4rc` 环境中，保持与原训练相同的四卡配置：
+
+```bash
+accelerate launch --multi_gpu --num_processes 4 train_4rc.py \
+  --config configs/train/4rc-giant-train-mixed.py
+```
+
+`max_train_steps` 是包含已完成步数的累计目标，不是额外训练步数。例如从
+`global_step=42050, epoch=50, batch_in_epoch=0` 恢复，会从第 51 个 epoch
+继续，最多再进行 57,950 次 optimizer 更新。`num_train_epochs=None` 时必须设置
+正整数 `max_train_steps`；两个上限均为整数时，仍然在任一上限达到时停止。
+恢复会加载模型、optimizer、scheduler 和随机数状态，不需要先下载基础预训练模型。
+输出目录维持配置中的路径；结束时会更新该目录下的 `final_checkpoint`。
+
+恢复后会以 `trainer_state.json` 的 `global_step` 显式校准 scheduler 计数和
+optimizer 的实际 LR（包含 Accelerate 的多进程步数倍率）。`warmup_steps=1000`
+仍表示整个训练最初的 1,000 步；从 42,050 步恢复直接进入 cosine 阶段，
+不会重新 warmup。启动日志会打印 `Resume LR aligned`、warmup 剩余步数及每组 LR。
+保持当前 100,000 步总目标时，42,050 步对应 backbone LR 约 `6.69225e-6`、
+geometry head LR 约 `1.33845e-5`、TCP LR 约 `6.69225e-5`。
+
 从完整 Accelerate 状态继续训练：
 
 ```bash

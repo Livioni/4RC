@@ -44,6 +44,7 @@ from tcp_inference import (
     _validate_query_points,
     add_interactive_query_point,
     collect_rgb_paths,
+    infer_tcp_and_depth,
     infer_tcp_and_geometry,
     infer_tcp_trajectory,
     load_ground_truth_query_points,
@@ -372,8 +373,14 @@ def infer_episode_sliding_windows(
     keep_geometry: bool,
     max_points_per_frame: int,
     progress_callback: Callable[[float, str], None] | None = None,
+    depth_frame_callback: Callable[[int, np.ndarray], None] | None = None,
 ) -> SlidingWindowPrediction:
-    """Run all windows and return one merged prediction per episode frame."""
+    """Run all windows and return one merged prediction per episode frame.
+
+    If supplied, depth_frame_callback receives each original frame index and
+    its finalized, padded metric depth exactly once, in timeline order. It
+    shares the TCP boundary policy and must not mutate the provided array.
+    """
     windows = build_sliding_windows(len(episode.image_paths), window_size)
     query_points = _validate_query_points(
         initial_query_points, initial_query_source
@@ -389,6 +396,7 @@ def infer_episode_sliding_windows(
     window_records: list[dict[str, Any]] = []
     frame_clouds: list[dict[str, np.ndarray]] | None = [] if keep_geometry else None
     reference_extrinsic: np.ndarray | None = None
+    pending_depth: np.ndarray | None = None
 
     for window_index, (start, end) in enumerate(windows):
         window_paths = episode.image_paths[start:end]
@@ -422,6 +430,10 @@ def infer_episode_sliding_windows(
             frame_clouds.extend(clouds if window_index == 0 else clouds[1:])
             if reference_extrinsic is None:
                 reference_extrinsic = extrinsics[0].copy()
+        elif depth_frame_callback is not None:
+            tcp, depth, profiling = infer_tcp_and_depth(
+                model, views, query_points, device, dtype
+            )
         else:
             tcp, profiling = infer_tcp_trajectory(
                 model, views, query_points, device, dtype
@@ -459,6 +471,27 @@ def infer_episode_sliding_windows(
             source_windows.extend(
                 [[window_index] for _ in range(1, end - start)]
             )
+
+        if depth_frame_callback is not None:
+            if depth.ndim != 3 or depth.shape[0] != end - start:
+                raise ValueError(f"Invalid window depth shape: {depth.shape}")
+            first_new = 0
+            if pending_depth is not None:
+                if pending_depth.shape != depth[0].shape:
+                    raise ValueError("Depth dimensions changed between windows")
+                boundary_depth = pending_depth
+                if boundary_merge == "next":
+                    boundary_depth = depth[0]
+                elif boundary_merge == "average":
+                    boundary_depth = 0.5 * (pending_depth + depth[0])
+                depth_frame_callback(window_frame_indices[0], boundary_depth)
+                first_new = 1
+            final_window = end == len(episode.image_paths)
+            finalized_end = len(depth) if final_window else len(depth) - 1
+            for local_index in range(first_new, finalized_end):
+                depth_frame_callback(window_frame_indices[local_index], depth[local_index])
+            pending_depth = None if final_window else depth[-1].copy()
+            del depth
 
         if end < len(episode.image_paths):
             boundary_frame = window_frame_indices[-1]

@@ -805,6 +805,23 @@ def infer_tcp_and_geometry(
     return depth, world_points, confidence, tcp, extrinsics, profiling
 
 
+def infer_tcp_and_depth(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, Any]]:
+    """Extract TCP and padded metric depth from one forward, without pose recovery."""
+    predictions, profiling = _run_tcp_model(
+        model, views, query_points, device, dtype
+    )
+    tcp = _extract_tcp_predictions(predictions)
+    depth = predictions["depth"][0].detach().float().cpu().numpy()
+    del predictions
+    return tcp, depth, profiling
+
+
 def prepare_frame_point_clouds(
     depth: np.ndarray,
     world_points: np.ndarray,

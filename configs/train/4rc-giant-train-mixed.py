@@ -8,7 +8,7 @@
 output_dir = "outputs/4rc-robotwin-mixed-tcp-point-query"
 logging_dir = "logs"
 pretrained_model = "Luo-Yihang/4RC"
-resume = None
+resume = "outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint"
 
 # == Dataset Configuration ==
 data_sources = (
@@ -64,7 +64,7 @@ tcp_query_window_size = 3
 
 # == Training Configuration ==
 seed = 42
-num_train_epochs = 50
+num_train_epochs = None  # No epoch limit; stop at the cumulative max_train_steps.
 max_train_steps = 100_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"

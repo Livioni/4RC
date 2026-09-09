@@ -8,6 +8,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+from itertools import count
 import json
 import logging
 import math
@@ -148,6 +149,60 @@ def distributed_scheduler_steps(
     """Match AcceleratedScheduler's internal stepping convention."""
     multiplier = 1 if split_batches else num_processes
     return warmup_steps * multiplier, total_steps * multiplier
+
+
+def training_total_steps(
+    steps_per_epoch: int,
+    num_train_epochs: int | None,
+    max_train_steps: int | None,
+) -> int:
+    """Resolve the cumulative optimizer-step target, allowing an unlimited epoch loop."""
+    for name, value in (("num_train_epochs", num_train_epochs), ("max_train_steps", max_train_steps)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value <= 0):
+            raise ValueError(f"{name} must be a positive integer or None, got {value!r}")
+    if num_train_epochs is None and max_train_steps is None:
+        raise ValueError("max_train_steps is required when num_train_epochs is None")
+    if steps_per_epoch <= 0:
+        raise ValueError("Training dataloader must provide at least one optimizer step per epoch")
+    if max_train_steps is not None:
+        return max_train_steps
+    assert num_train_epochs is not None
+    return steps_per_epoch * num_train_epochs
+
+
+def align_resumed_scheduler(
+    scheduler: LambdaLR,
+    global_step: int,
+    *,
+    num_processes: int,
+    split_batches: bool,
+) -> list[float]:
+    """Set the resumed LR before the first optimizer update, using cumulative steps.
+
+    LambdaLR restores counters but not its Python lambda closure. Recompute with
+    the current schedule and process count rather than trusting a stale saved LR.
+    The original global warmup remains part of the curve, not a new resume warmup.
+    """
+    if global_step < 0 or num_processes < 1:
+        raise ValueError("Resume step must be nonnegative and num_processes positive")
+    multiplier = 1 if split_batches else num_processes
+    scheduler_step = global_step * multiplier
+    if not (len(scheduler.base_lrs) == len(scheduler.lr_lambdas) == len(scheduler.optimizer.param_groups)):
+        raise ValueError("Scheduler and optimizer parameter groups do not match")
+    learning_rates = [
+        base_lr * scale(scheduler_step)
+        for base_lr, scale in zip(scheduler.base_lrs, scheduler.lr_lambdas)
+    ]
+    scheduler.last_epoch = scheduler_step
+    scheduler._step_count = scheduler_step + 1
+    for group, base_lr, lr in zip(scheduler.optimizer.param_groups, scheduler.base_lrs, learning_rates):
+        group["initial_lr"] = base_lr
+        if isinstance(group["lr"], torch.Tensor):
+            group["lr"].fill_(lr)
+        else:
+            group["lr"] = lr
+    scheduler._last_lr = [group["lr"] for group in scheduler.optimizer.param_groups]
+    return [float(lr) for lr in learning_rates]
 
 
 def build_optimizer(model: Arc, config: dict[str, Any]) -> torch.optim.AdamW:
@@ -304,6 +359,13 @@ def save_checkpoint(
 def main() -> None:
     args = parse_args()
     config = load_config(args)
+    # Validate limits and the resume target before creating logs or loading data.
+    training_total_steps(1, config.get("num_train_epochs"), config.get("max_train_steps"))
+    if config.get("resume"):
+        resume_dir = Path(config["resume"]).expanduser()
+        for filename in ("trainer_state.json", "model.safetensors", "optimizer.bin", "scheduler.bin"):
+            if not (resume_dir / filename).is_file():
+                raise FileNotFoundError(f"Resume checkpoint is missing {filename}: {resume_dir}")
     output_dir = Path(config["output_dir"]).expanduser()
     project_config = ProjectConfiguration(
         project_dir=str(output_dir), logging_dir=str(output_dir / config["logging_dir"])
@@ -355,7 +417,8 @@ def main() -> None:
     )
 
     model = load_model(
-        config.get("pretrained_model"),
+        # load_state below restores the complete model; a base-model download is unnecessary.
+        None if config.get("resume") else config.get("pretrained_model"),
         tcp_query_window_size=config.get("tcp_query_window_size", 3),
     )
     model.set_tcp_position_stats(
@@ -392,21 +455,23 @@ def main() -> None:
     tcp_criterion = tcp_criterion.to(accelerator.device)
 
     steps_per_epoch = math.ceil(len(dataloader) / config["gradient_accumulation_steps"])
-    planned_steps = steps_per_epoch * config["num_train_epochs"]
-    total_steps = config.get("max_train_steps") or planned_steps
+    num_train_epochs = config.get("num_train_epochs")
+    total_steps = training_total_steps(
+        steps_per_epoch, num_train_epochs, config.get("max_train_steps")
+    )
     scheduler_warmup_steps, scheduler_total_steps = distributed_scheduler_steps(
         config["warmup_steps"],
         total_steps,
         num_processes=accelerator.num_processes,
         split_batches=accelerator.split_batches,
     )
-    scheduler = cosine_warmup_scheduler(
+    raw_scheduler = cosine_warmup_scheduler(
         optimizer,
         scheduler_warmup_steps,
         scheduler_total_steps,
         config["eta_min_factor"],
     )
-    scheduler = accelerator.prepare_scheduler(scheduler)
+    scheduler = accelerator.prepare_scheduler(raw_scheduler)
 
     initial_epoch = 0
     initial_batch = 0
@@ -420,6 +485,27 @@ def main() -> None:
         initial_batch = int(trainer_state["batch_in_epoch"])
         global_step = int(trainer_state["global_step"])
         LOGGER.info("Resumed epoch=%d batch=%d step=%d", initial_epoch, initial_batch, global_step)
+        saved_scheduler_step = raw_scheduler.last_epoch
+        learning_rates = align_resumed_scheduler(
+            raw_scheduler,
+            global_step,
+            num_processes=accelerator.num_processes,
+            split_batches=accelerator.split_batches,
+        )
+        LOGGER.info(
+            "Resume LR aligned: global_step=%d scheduler_step=%d (saved=%d); "
+            "phase=%s; warmup remaining=%d optimizer steps",
+            global_step, raw_scheduler.last_epoch, saved_scheduler_step,
+            "cosine" if global_step >= config["warmup_steps"] else "initial warmup",
+            max(0, config["warmup_steps"] - global_step),
+        )
+        for group, lr in zip(optimizer.param_groups, learning_rates):
+            LOGGER.info("Resume lr/%s = %.10g", group.get("name", "group"), lr)
+
+    LOGGER.info(
+        "Training target: %d cumulative optimizer steps; %d remaining; epoch limit=%s",
+        total_steps, max(0, total_steps - global_step), num_train_epochs,
+    )
 
     total_parameters = sum(parameter.numel() for parameter in model.parameters())
     trainable_parameters = sum(
@@ -453,7 +539,8 @@ def main() -> None:
     stop_training = global_step >= total_steps
     next_epoch_state = initial_epoch
     next_batch_state = initial_batch
-    for epoch in range(initial_epoch, config["num_train_epochs"]):
+    epochs = count(initial_epoch) if num_train_epochs is None else range(initial_epoch, num_train_epochs)
+    for epoch in epochs:
         if stop_training:
             break
         dataset.set_epoch(epoch)
