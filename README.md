@@ -143,11 +143,19 @@ all losses.
 
 ```bash
 conda activate 4rc
-accelerate launch train_4rc.py \
+accelerate launch train_4rc_stage1.py \
   --config configs/train/4rc-giant-train.py \
   --data-root datasets/RoboTwin
 ```
 
+
+Stage-two joint reconstruction and TCP action generation (8 historical frames, 16 future actions):
+
+```bash
+accelerate launch train_4rc_stage2.py --stage1-checkpoint /path/to/stage1/checkpoint --batch-size 1
+```
+
+Configure `configs/train/4rc-stage2-action.py` for component learning rates, frozen T5-base text conditioning, and pooled TCP history tokens.
 
 See [README_TRAIN_CN.md](README_TRAIN_CN.md) for the complete Chinese guide to configuration, launch, resume, losses, and memory usage.
 Use `--pretrained-model /path/to/checkpoint-or-hf-directory` for a local

@@ -102,8 +102,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         self.tcp_directory = self.TCP_DIRECTORIES[view]
         if not self.root.is_dir():
             raise FileNotFoundError(f"RoboTwin root does not exist: {self.root}")
-        if min_views < 2 or max_views < min_views:
-            raise ValueError("Expected 2 <= min_views <= max_views")
+        if min_views < 1 or max_views < min_views:
+            raise ValueError("Expected 1 <= min_views <= max_views")
         if min_interval < 1 or max_interval < min_interval:
             raise ValueError("Expected 1 <= min_interval <= max_interval")
         if not 0.0 <= self.reverse_probability <= 1.0:

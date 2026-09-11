@@ -120,7 +120,7 @@ def _validate_adapter(source: DatasetSource) -> None:
         )
     if len(dataset) < 1:
         raise ValueError(f"Dataset source {source.name!r} has no valid samples")
-    if dataset.min_views < 2 or dataset.max_views < dataset.min_views:
+    if dataset.min_views < 1 or dataset.max_views < dataset.min_views:
         raise ValueError(
             f"Dataset source {source.name!r} has invalid view range "
             f"[{dataset.min_views}, {dataset.max_views}]"
@@ -329,8 +329,8 @@ class WeightedMultiSourceBatchSampler(
         recent_buffer_size: int = 10_000,
         seed: int = 42,
     ) -> None:
-        if images_per_batch < 2:
-            raise ValueError("images_per_batch must be at least 2")
+        if images_per_batch < 1:
+            raise ValueError("images_per_batch must be at least 1")
         if not scene_counts:
             raise ValueError("scene_counts cannot be empty")
         if recent_buffer_size < 1:

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Single-stage geometry and sparse TCP tracking training on RoboTwin.
+"""Stage-one geometry and sparse TCP recovery training on RoboTwin.
 
 Example:
-    accelerate launch train_4rc.py --config configs/train/4rc-giant-train.py
+    accelerate launch train_4rc_stage1.py --config configs/train/4rc-giant-train-mixed.py
 """
 
 from __future__ import annotations
@@ -379,7 +379,7 @@ def main() -> None:
     accelerator = Accelerator(
         mixed_precision=config["mixed_precision"],
         gradient_accumulation_steps=config["gradient_accumulation_steps"],
-        log_with=config.get("report_to"),
+        log_with=config.get("report_to", ["tensorboard", "wandb"]),
         project_config=project_config,
         kwargs_handlers=[ddp],
     )
@@ -622,6 +622,7 @@ def main() -> None:
                 )
                 for group in optimizer.param_groups:
                     metrics[f"lr/{group.get('name', 'group')}"] = group["lr"]
+                # Send identical metrics and update steps to every enabled tracker.
                 accelerator.log(metrics, step=global_step)
                 if global_step % config["log_every_steps"] == 0:
                     progress.set_postfix(objective=f"{metrics['objective']:.4f}")

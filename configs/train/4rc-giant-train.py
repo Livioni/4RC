@@ -102,4 +102,4 @@ log_every_steps = 10
 visualize_every_steps = 1000
 checkpointing_steps = 5000
 save_each_epoch = False
-report_to = "tensorboard"
+report_to = ["tensorboard", "wandb"]

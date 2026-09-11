@@ -2,6 +2,38 @@
 
 在项目根目录、已经激活的 `4rc` 环境中运行。入口 `eval_tcp.py` 默认同时评测 TCP 和深度。
 
+## 两阶段训练与评测入口
+
+- `train_4rc_stage1.py` 保存原生 `Arc` 权重，与旧版单阶段训练的权重格式一致，
+  可直接使用本文的 `eval_tcp.py` 进行完整 episode TCP/Depth 滑窗评测。
+- `train_4rc_stage2.py` 保存完整 `TCPActionPolicy`，包含 `arc.*` 重建模块和动作、语言模块。
+  该权重不能直接传给当前 `eval_tcp.py --model`；动作验证使用第二阶段的 `--eval-only`。
+
+两个训练入口均支持 `num_train_epochs = None` 配合正整数 `max_train_steps`。
+`max_train_steps` 是累计 optimizer 更新目标（包含已完成的步数），不是恢复后追加的步数。
+恢复训练会校验模型、optimizer、scheduler 和 `trainer_state.json`，并在第一次更新前
+按累计 `global_step`、当前调度目标和 GPU 数量对齐学习率；不会重新开始 warmup。
+如果恢复点仍处于原始 warmup 内，则继续剩余 warmup。达到累计目标后不再执行训练更新。
+训练参数及数据划分详见 [训练说明](README_TRAIN_CN.md)。
+
+```bash
+# 第一阶段：从完整训练状态继续，配置可设置 num_train_epochs = None
+accelerate launch train_4rc_stage1.py \
+  --config configs/train/4rc-giant-train-mixed.py \
+  --resume outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint \
+  --max-train-steps 100000
+
+# 第二阶段：自动读取 checkpoint/config.json，累计训练到 100000 步
+accelerate launch train_4rc_stage2.py \
+  --resume outputs/4rc-stage2-action/checkpoint-1000 \
+  --max-train-steps 100000
+```
+
+若保存配置含有限 `num_train_epochs`，仍会受该上限约束；要取消上限，使用
+`--config` 指定设置了 `num_train_epochs = None` 的配置。第二阶段不会在恢复时重载
+第一阶段权重；其语言编码器仍需要配置中的 T5 资源可用。
+
+
 ## 运行
 
 ```bash
@@ -162,17 +194,33 @@ NPZ 中 `pred_*` 保留 TCP 原始预测（位置单位为米，姿态为旋转�
 权重同样使用文件标识，相关评测代码使用 SHA-256。代码、配置、权重或已缓存 episode
 输入变化时拒绝复用，需换一个输出目录。NPZ 和 JSON 各自原子写入，并以指纹匹配防止混用。
 
+## 第二阶段动作验证
+
+```bash
+python train_4rc_stage2.py \
+  --resume outputs/4rc-stage2-action/final_checkpoint \
+  --output-dir outputs/4rc-stage2-action/eval_action \
+  --eval-only --validation-batches 16
+```
+
+默认读取 checkpoint 内的 `config.json`，验证数据按训练配置的 episode 留出规则构建。
+`--eval-only` 仅加载权重，不要求 optimizer/scheduler 状态，也不执行训练更新；
+需要有可用的验证 episode。结果写入指定目录的 `validation/step-00000000.json`。
+
+- `recovered`：使用首帧查询点初始化并从恢复结果投影历史 TCP，作为主要动作预测结果。
+- `teacher_forced`：使用历史真值投影，衡量历史定位误差对动作预测的影响。
+- `shuffled_instruction`：替换为其他任务指令，保持相同动作初始噪声；只有一个任务时不报告。
+- 报告未来动作位置 ADE/FDE、旋转误差、夹爪指标、恢复失败率、重建损失及耗时。
+
+这是历史片段条件下的未来动作验证，与本文完整 episode 的 TCP/Depth 滑窗指标口径不同。
+其中重建项是训练损失，不是上表中独立累计的 Depth 指标；也不代表闭环机器人执行成功率。
+`stage1_validation_overlap` 默认 `unknown`，需核查第一阶段数据重叠后再解释为未见 episode 泛化。
+
 ## 测试
 
 ```bash
-python -m pytest tests/test_tcp_depth_eval.py -q
-
-# 已有小规模 GPU 评测结果时，对照原始 TCP-only 滑窗分支检查预测一致性
-TCP_EVAL_GPU_RESULTS=outputs/tcp_depth_smoke \
-  python -m pytest tests/test_tcp_depth_eval.py::test_actual_checkpoint_tcp_reference -q
+python -m pytest tests/test_training_resume.py tests/test_action_policy.py tests/test_action_dataset.py -q
 ```
 
-测试涵盖指标手算结果、旋转跨 ±π、3 米边界、无效深度、非正预测、整体 RMSE、
-三个滑窗合并策略、短末窗、深度 padding 裁剪、clean/random 筛选、缺失 episode、
-任务分片、TCP/depth 失败隔离，以及结果文件与恢复校验。
-未设置 `TCP_EVAL_GPU_RESULTS` 时，实际权重对照测试自动跳过。
+覆盖累计训练步数、恢复学习率对齐、第二阶段 checkpoint 恢复与动作验证，以及动作模型和数据处理。
+这些测试使用小模型和合成数据，不替代真实权重的完整 episode TCP/Depth GPU 评测。

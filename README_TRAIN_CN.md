@@ -25,7 +25,7 @@
 │   └── train/
 │       ├── 4rc-giant-train.py   # 默认联合训练参数
 │       └── 4rc-tcp-recovery.py  # 修复后恢复 TCP position 的微调参数
-└── train_4rc.py                 # Accelerate 训练入口
+└── train_4rc_stage1.py                 # Accelerate 训练入口
 ```
 
 配置目录和参数写法参考 Depth-Anything-Next：训练配置放在 `configs/train/`，每个参数直接定义为 Python 顶层变量。
@@ -38,7 +38,7 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-训练入口依赖 `torch`、`torchvision`、`accelerate` 和 `tensorboard`。如需使用 WandB，可另外把配置中的 `report_to` 改为 `wandb` 并登录 WandB。
+训练入口依赖 `torch`、`torchvision`、`accelerate`、`tensorboard` 和 `wandb`（已列入 `requirements.txt`）。默认同时记录 TensorBoard 和 W&B，首次在线训练前运行 `wandb login`。离线记录可在启动命令前设置 `WANDB_MODE=offline`；仅使用 TensorBoard 时将配置中的 `report_to` 改为 `"tensorboard"`。
 
 ## 3. RoboTwin 数据目录
 
@@ -228,8 +228,10 @@ log_every_steps = 10
 visualize_every_steps = 1000
 checkpointing_steps = 5000
 save_each_epoch = False
-report_to = "tensorboard"
+report_to = ["tensorboard", "wandb"]
 ```
+
+两个日志后端使用相同的 `global_step`，在每次梯度累积完成后记录相同的 geometry/TCP loss 与指标、各参数组学习率以及各数据源累计 batch 数。W&B 项目名为 `4RC-RoboTwin-TCP`，同时记录训练配置。`log_every_steps` 控制终端进度条刷新频率；深度预览图仍按 `visualize_every_steps` 保存在本地 `visuals/` 目录。
 
 checkpoint 保存模型、AdamW、scheduler、随机数状态、epoch、batch 位置和 global step，可以精确恢复到下一个 batch。
 
@@ -239,7 +241,7 @@ checkpoint 保存模型、AdamW、scheduler、随机数状态、epoch、batch �
 
 ```bash
 conda activate 4rc
-accelerate launch --num_processes 4 train_4rc.py \
+accelerate launch --num_processes 4 train_4rc_stage1.py \
   --config configs/train/4rc-giant-train.py \
   --data-root datasets/RoboTwin
 ```
@@ -248,14 +250,14 @@ accelerate launch --num_processes 4 train_4rc.py \
 
 ```bash
 accelerate config
-accelerate launch train_4rc.py \
+accelerate launch train_4rc_stage1.py \
   --config configs/train/4rc-giant-train.py
 ```
 
 本地预训练权重：
 
 ```bash
-accelerate launch train_4rc.py \
+accelerate launch train_4rc_stage1.py \
   --config configs/train/4rc-giant-train.py \
   --pretrained-model /path/to/model.safetensors
 ```
@@ -267,7 +269,7 @@ accelerate launch train_4rc.py \
 先用一条 episode 和一个 optimizer step 检查完整流水线：
 
 ```bash
-accelerate launch --num_processes 1 train_4rc.py \
+accelerate launch --num_processes 1 train_4rc_stage1.py \
   --config configs/train/4rc-giant-train.py \
   --max-episodes 1 \
   --max-train-steps 1
@@ -292,7 +294,7 @@ max_train_steps = 100_000
 在已激活的 `4rc` 环境中，保持与原训练相同的四卡配置：
 
 ```bash
-accelerate launch --multi_gpu --num_processes 4 train_4rc.py \
+accelerate launch --multi_gpu --num_processes 4 train_4rc_stage1.py \
   --config configs/train/4rc-giant-train-mixed.py
 ```
 
@@ -313,7 +315,7 @@ geometry head LR 约 `1.33845e-5`、TCP LR 约 `6.69225e-5`。
 从完整 Accelerate 状态继续训练：
 
 ```bash
-accelerate launch train_4rc.py \
+accelerate launch train_4rc_stage1.py \
   --config configs/train/4rc-giant-train.py \
   --resume outputs/4rc-robotwin-tcp-debug/checkpoint-5000
 ```
@@ -321,7 +323,7 @@ accelerate launch train_4rc.py \
 从旧模型复用 backbone/geometry/motion 权重并重新训练视觉 TCP 模块：
 
 ```bash
-accelerate launch train_4rc.py \
+accelerate launch train_4rc_stage1.py \
   --config configs/train/4rc-tcp-recovery.py
 ```
 
@@ -432,3 +434,145 @@ python scripts/upload_robotwin_to_hf.py \
 
 “--keep-archives” 会保留上传成功的 tar；“--overwrite” 会重新上传远端已存在
 的 task；“--rebuild-archives” 会重新创建 staging 中已有的 tar。
+
+
+## 11. 第二阶段：重建条件下的 TCP 动作生成
+
+训练入口分为 train_4rc_stage1.py 和 train_4rc_stage2.py。第一阶段继续使用
+现有 geometry + TCP recovery 配置；第二阶段使用
+configs/train/4rc-stage2-action.py，联合优化历史重建与未来动作生成。
+
+### 启动、初始化与恢复
+
+~~~bash
+# 第一阶段
+accelerate launch train_4rc_stage1.py \
+  --config configs/train/4rc-giant-train-mixed.py
+
+# 使用第一阶段 checkpoint 初始化第二阶段
+accelerate launch train_4rc_stage2.py \
+  --stage1-checkpoint outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint \
+  --batch-size 1
+
+# 恢复第二阶段
+accelerate launch train_4rc_stage2.py \
+  --resume outputs/4rc-stage2-action/checkpoint-1000
+~~~
+
+stage1_checkpoint 在新训练时必须提供，支持权重文件或 Accelerate checkpoint
+目录。也可直接使用本地 checkpoints/RoboTwin-TCP-Tracking/model.safetensors。
+阶段切换只加载模型，重新创建优化器和 scheduler；恢复第二阶段则恢复完整
+训练状态，未指定 --config 时默认读取 checkpoint 内保存的配置。
+
+已有 TCP recovery head 的 position mean/std 保留 checkpoint 的值，新
+action head 使用单独的训练集统计量。Safetensors 加载会正确恢复 DualDPT
+共享 LayerNorm 的别名，真实缺失或形状不匹配的参数仍会报错。
+
+### 历史长度与每卡 batch size
+
+~~~python
+history_frames = 8
+prediction_horizon = 16
+batch_size = 1
+~~~
+
+batch_size 是每张 GPU 的 clip 数。脚本自动计算
+train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch_size,)。
+
+| 每卡 batch size | RGB batch | 历史图像数 |
+|---|---|---|
+| 1 | [1,8,3,252,322] | 8 |
+| 2 | [2,8,3,252,322] | 16 |
+
+有效 batch size 为每卡 clip 数 × GPU 数 × gradient accumulation steps。
+历史窗口固定为配置长度；未来只读取 TCP 标签和坐标转换所需外参，不读取
+未来 RGB/depth。窗口正序、连续且不跨异常轨迹分段，默认需要至少 24 个连续
+有效帧。--history-frames 和 --prediction-horizon 可用于配置新实验。
+
+### 历史 token、编码与 DiT
+
+每次前向先恢复历史 geometry/TCP，再从各历史帧的最后一层 backbone 全局
+特征中，在左右 TCP 中心分别采样 3×3 patch，复用现有 visual query encoder。
+
+邻域特征投影到 512 维后，以中心 patch 为 query、9 个 patch 为 key/value，
+做 attention pooling，再加中心残差和 LayerNorm。每帧保留左右臂各一个
+token，8 帧共 16 个历史 tokens。
+
+池化结果加入 TCP 中心的二维位置、左右臂身份、历史/未来类型、投影有效性
+及相对当前帧的物理时间编码。二维位置使用归一化 padded 图像坐标的
+sin/cos 编码加 MLP；物理时间使用独立 sin/cos 编码加 MLP，以 1/15 秒为
+单位。连续 15 Hz 数据的历史编码为 [-7,...,0]，未来为 [1,...,16]。
+
+DiT 默认 8 层、512 维、8 heads。主序列为 16 个历史 tokens 加 16 个未来
+动作 tokens。历史只能读取历史；未来能读取全部历史和未来。仅未来动作
+加噪、接受生成时间 tau 的 AdaLN-Zero 调制，并计算 flow matching loss。
+物理时间和生成时间使用独立编码模块。
+
+T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→512
+投影进入每层 cross-attention，并传递文本 padding mask。
+
+每步每臂输出 xyz（3）+ rotation 6D（6）+ gripper（1），双臂共 20 维。
+位置使用 action 统计量标准化；旋转输出转成矩阵；夹爪训练为关闭 −1、
+打开 +1，推理以零为阈值。未来位姿统一表示在当前观测相机坐标系中。
+
+### Teacher forcing 与学习率
+
+训练历史采样中心使用 100% GT 二维投影，初始恢复 query 与逐帧生成采样点
+分别管理。无效历史投影使用缺失 token；整段历史均无有效投影的窗口不训练。
+
+推理用首帧左右两个二维点启动 TCP 恢复，随后根据恢复位置与标定内参投影。
+所有点和内参使用 padded 图像坐标：原图点增加 (1,6)，内参主点增加同样
+偏移；不要重复添加 padding。
+
+联合损失包括 geometry、TCP recovery 和 action flow matching，三个外部
+权重默认均为 1。生成损失更新池化、共享 query encoder 和 backbone；
+GT 采样中心不提供通向 TCP 位置预测 head 的梯度，该 head 由恢复损失更新。
+
+| 参数组 | 训练开关 | 学习率 |
+|---|---|---|
+| backbone | train_backbone | lr_backbone |
+| geometry head | train_geometry_head | lr_head |
+| sparse motion decoder | train_motion_decoder | lr_motion_decoder |
+| 共享 visual query encoder | train_query_encoder | lr_query_encoder |
+| TCP recovery head | train_tcp_head | lr_tcp_head |
+| 历史池化、位置/时间编码 | train_history_pool | lr_history_pool |
+| DiT | train_action_head | lr_action_head |
+| 文本投影 | train_language_projection | lr_language_projection |
+
+旧模块学习率继承 mixed 配置，新模块默认 1e-4。关闭开关或把该组学习率设为
+0 会冻结参数。camera decoder 和 dense track head 不参与第二阶段训练。
+
+### 验证与推理接口
+
+默认按完整 episode 确定性留出 10% 验证数据，划分写入 data_manifest.json。
+stage1_validation_overlap 默认 unknown；需审计第一阶段是否使用过这些
+episode，才能将结果解释为未见 episode 泛化。
+
+~~~bash
+python train_4rc_stage2.py \
+  --resume outputs/4rc-stage2-action/final_checkpoint \
+  --eval-only --validation-batches 16
+~~~
+
+验证结果写入 validation/step-XXXXXXXX.json，包括：
+
+- recovered：首帧 query 初始化后使用恢复投影，为主要推理结果；
+- teacher_forced：使用全部历史 GT 投影，量化定位误差带来的差距；
+- shuffled_instruction：使用其他任务的 instruction，保持相同动作初始噪声；
+- 位置 ADE/FDE、旋转角误差、夹爪 F1/准确率、恢复失败率、重建指标和耗时。
+
+只有一个任务时不报告跨任务指令打乱结果。小规模调试没有验证 episode 时
+仍可训练，但 --eval-only 要求存在验证数据。sampling_steps 默认 8，可通过
+配置比较 4/8/16 步。
+
+TCPActionPolicy.sample_actions 接收 images、instructions、initial_query_points、
+frame_times、intrinsics。images 为 padded 的 [B,K,3,H,W]、范围 [-1,1]；
+frame_times 为 [B,K]；intrinsics 为 [B,K,3,3]。不接收历史 GT 轨迹。
+
+输出包括 success、action_position [B,16,2,3]、action_rotation [B,16,2,3,3]、
+action_gripper [B,16,2] 和未来时间。失败样本的 success 为 false，
+位置/旋转为 NaN，夹爪为 −1。重建、池化和 T5 编码在一次生成中只执行一次。
+
+~~~bash
+python -m pytest tests/test_action_policy.py tests/test_action_dataset.py -q
+~~~

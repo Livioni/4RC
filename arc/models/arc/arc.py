@@ -295,6 +295,7 @@ class Arc(
         tcp_query_points: torch.Tensor | None = None,
         decode_tcp: bool = False,
         return_aux_pyramid: bool = True,
+        return_backbone_features: bool = False,
     ) -> Dict[str, torch.Tensor]:
         feats, _ = self.backbone(
             x, ref_view_strategy=ref_view_strategy,
@@ -375,6 +376,9 @@ class Arc(
             output.update(self.tcp_track_head(sparse_motion_levels))
 
         output['track_query_idx'] = output_track_query_idx
+
+        if return_backbone_features:
+            output["backbone_features"] = feats
 
         return output
 
