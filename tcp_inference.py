@@ -47,7 +47,7 @@ from geometry_inference import (
 )
 
 
-DEFAULT_MODEL = Path("checkpoints/RoboTwin-TCP-Tracking/model.safetensors")
+DEFAULT_MODEL = Path("outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint/model.safetensors")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 ARM_NAMES = ("left", "right")
 ARM_COLORS = ((255, 96, 64), (45, 180, 255))

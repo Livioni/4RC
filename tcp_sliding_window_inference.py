@@ -12,9 +12,10 @@ Examples:
         --output outputs/tcp_episode.json
 
     python tcp_sliding_window_inference.py \
-        --input datasets/RoboTwin_random_subset/beat_block_hammer/episode_0000000 \
-        --output outputs/tcp_episode.json \
-        --interactive
+        --input datasets/eval_sets/place_dual_shoes/episode_0000007 \
+        --output datasets/eval_sets/place_dual_shoes/episode_0000007/pred_tcp_episode.json \
+        --interactive \
+        --visualize
 """
 
 from __future__ import annotations

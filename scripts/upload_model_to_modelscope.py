@@ -10,9 +10,9 @@ from typing import Any
 
 
 DEFAULT_MODEL_PATH = Path(
-    "outputs/4rc-robotwin-geometry/checkpoint-5000/model.safetensors"
+    "outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint/model.safetensors"
 )
-DEFAULT_REPO_ID = "livion/4RC-Geometry"
+DEFAULT_REPO_ID = "livion/4RC-Action-RoboTwin-Mix"
 DEFAULT_ENDPOINT = "https://modelscope.cn"
 
 
