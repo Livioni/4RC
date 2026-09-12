@@ -12,8 +12,8 @@ Examples:
         --output outputs/tcp_episode.json
 
     python tcp_sliding_window_inference.py \
-        --input datasets/eval_sets/place_dual_shoes/episode_0000007 \
-        --output datasets/eval_sets/place_dual_shoes/episode_0000007/pred_tcp_episode.json \
+        --input datasets/eval_sets/place_dual_shoes/episode_0000092 \
+        --output datasets/eval_sets/place_dual_shoes/episode_0000092/pred_tcp_episode.json \
         --interactive \
         --visualize
 """

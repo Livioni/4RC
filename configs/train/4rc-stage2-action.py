@@ -19,19 +19,19 @@ data_sources = (
     {
         "name": "robotwin",
         "type": "robotwin",
-        "weight": 1.0,
+        "weight": 0.33,
         "options": {"root": "datasets/RoboTwin"},
     },
     {
         "name": "robotwin_random",
         "type": "robotwin",
-        "weight": 0.0,
+        "weight": 0.66,
         "options": {"root": "datasets/RoboTwin_random"},
     },
 )
 view = "third_views"
 history_frames = 8
-prediction_horizon = 16
+prediction_horizon = 16  # Short futures repeat the last valid action; padding is masked.
 batch_size = 1  # Per GPU; each sample contains history_frames input images.
 # The action adapter requires forward, contiguous windows. The runner derives
 # these image budgets and intervals again from batch_size / history_frames.
@@ -76,11 +76,18 @@ tcp_query_window_size = 3
 
 t5_model = "google-t5/t5-base"  # Frozen encoder; a local pretrained directory also works.
 text_max_length = 128
-action_dim = 512
-action_depth = 8
-action_heads = 8
+# About 297M parameters in the Action DiT (excluding conditioning modules).
+action_dim = 768
+action_depth = 20
+action_heads = 12
 time_unit_seconds = 1.0 / 15
 sampling_steps = 8
+
+# == History TCP Condition Curriculum ==
+# Choose GT/recovered history per clip. Linearly interpolate over optimizer
+# updates from 100% GT to 50% GT / 50% recovered; resume uses cumulative steps.
+history_tcp_gt_initial_ratio = 1.0
+history_tcp_gt_final_ratio = 0.5
 
 # == Training Configuration ==
 seed = 42

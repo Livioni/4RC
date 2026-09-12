@@ -76,11 +76,7 @@ class TCPHistoryPool(nn.Module):
         time_embedding: torch.Tensor, history_type: torch.Tensor,
         *, image_height: int, image_width: int,
     ) -> torch.Tensor:
-        batch, frames, arms, window, _ = patches.shape
-        if arms != 2 or window != 9 or centres.shape != (batch, frames, 2, 2):
-            raise ValueError("Expected patches [B,K,2,9,C] and centres [B,K,2,2]")
-        if valid.shape != (batch, frames, 2):
-            raise ValueError("Expected history validity [B,K,2]")
+        batch, frames = patches.shape[:2]
         values = self.projection(patches).reshape(batch * frames * 2, 9, self.dim)
         centre = values[:, 4:5]
         normalized = self.pool_norm(values)
@@ -126,13 +122,13 @@ class ActionDiTBlock(nn.Module):
     def _residual(x, update, count, gate):
         return x + torch.cat((update[:, :count], gate[:, None] * update[:, count:]), 1)
 
-    def forward(self, x, time_condition, history_count, mask, text, text_valid):
+    def forward(self, x, time_condition, history_count, mask, text, text_valid, padding_mask=None):
         modulation = self.modulation(time_condition).chunk(9, dim=-1)
         for i in range(3):
             shift, scale, gate = modulation[3 * i:3 * i + 3]
             q = self._modulate(self.norms[i](x), history_count, shift, scale)
             if i == 0:
-                update, _ = self.self_attention(q, q, q, attn_mask=mask, need_weights=False)
+                update, _ = self.self_attention(q, q, q, attn_mask=mask, key_padding_mask=padding_mask, need_weights=False)
             elif i == 1:
                 update, _ = self.text_attention(
                     q, text, text, key_padding_mask=~text_valid, need_weights=False,
@@ -159,19 +155,23 @@ class TCPActionDiT(nn.Module):
 
     def forward(
         self, noisy_actions, flow_time, history, text, text_valid,
-        future_time_embedding, future_type, *, return_history=False,
+        future_time_embedding, future_type, *, return_history=False, future_valid=None,
     ):
-        if noisy_actions.ndim != 3 or noisy_actions.shape[-1] != 20:
-            raise ValueError("Noisy actions must be [B,N,20]")
         action = self.action_projection(noisy_actions) + future_time_embedding + future_type
         x = torch.cat((history, action), dim=1)
         count = history.shape[1]
         # Historical hidden states cannot read future actions or their noise.
         mask = torch.zeros(x.shape[1], x.shape[1], dtype=torch.bool, device=x.device)
         mask[:count, count:] = True
+        padding_mask = None
+        if future_valid is not None:
+            padding_mask = torch.cat((
+                torch.zeros(x.shape[0], count, dtype=torch.bool, device=x.device),
+                ~future_valid.bool(),
+            ), dim=1)
         condition = self.flow_time(flow_time)
         for block in self.blocks:
-            x = block(x, condition, count, mask, text, text_valid)
+            x = block(x, condition, count, mask, text, text_valid, padding_mask)
         shift, scale = self.output_modulation(condition).chunk(2, dim=-1)
         future = self.output_norm(x[:, count:]) * (1 + scale[:, None]) + shift[:, None]
         velocity = self.output_projection(future)
@@ -299,31 +299,58 @@ class TCPActionPolicy(nn.Module):
         )
         return ActionCondition(history, text, text_valid, future_time, future_frame_times, valid)
 
-    def forward(self, batch, *, noise=None, flow_time=None):
-        """Joint training: historical GT projections are explicit, never inferred."""
+    @torch.no_grad()
+    def training_history_queries(self, batch, reconstruction, gt_ratio):
+        """Choose one coherent GT or recovered trajectory per sample.
+
+        Recovered coordinates are conditioning inputs, not an action-loss path
+        into the TCP recovery head. Invalid predictions retain missing tokens.
+        """
+        gt_centres = batch["history_tcp_query_points"]
+        gt_valid = batch["history_tcp_valid"].bool()
+        batch_size = gt_centres.shape[0]
+        if gt_ratio == 1:
+            return gt_centres, gt_valid, torch.ones(batch_size, dtype=torch.bool, device=gt_centres.device)
+        pred_centres, pred_valid = project_tcp(
+            reconstruction["tcp_position"].detach(), batch["intrinsics"],
+            image_height=batch["images"].shape[-2], image_width=batch["images"].shape[-1],
+            padding=self.padding,
+        )
+        use_gt = (torch.rand(batch_size, device=gt_centres.device) < gt_ratio
+                  if gt_ratio > 0 else torch.zeros(batch_size, dtype=torch.bool, device=gt_centres.device))
+        centres = torch.where(use_gt[:, None, None, None], gt_centres, pred_centres)
+        valid = torch.where(use_gt[:, None, None], gt_valid, pred_valid)
+        return centres, valid, use_gt
+
+    def forward(self, batch, *, noise=None, flow_time=None, history_gt_ratio=1.0):
+        """Joint training with a scheduled mixture of GT/recovered history queries."""
         reconstruction, features = self.reconstruct(batch["images"], batch["tcp_query_points"])
+        centres, valid, use_gt = self.training_history_queries(batch, reconstruction, history_gt_ratio)
         condition = self.make_condition(
             batch["images"], batch["intrinsics"], batch["frame_times"],
             batch["future_frame_times"], batch["instruction"], reconstruction, features,
-            centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
+            centres=centres, valid=valid,
         )
-        if not condition.history_valid.flatten(1).any(1).all():
-            raise ValueError("Training samples require at least one valid historical TCP projection")
         target = self.normalize_actions(batch["future_actions"])
-        if target.shape[1] != self.prediction_horizon:
-            raise ValueError("Future action target length differs from prediction_horizon")
+        future_valid = batch.get("future_action_valid")
+        if future_valid is None:
+            future_valid = torch.ones(target.shape[:2], dtype=torch.bool, device=target.device)
+        target = target.masked_fill(~future_valid.bool()[..., None], 0)
         noise = torch.randn_like(target) if noise is None else noise
         flow_time = torch.rand(target.shape[0], device=target.device) if flow_time is None else flow_time
         tau = flow_time[:, None, None]
-        noisy = (1 - tau) * noise + tau * target
+        noisy = ((1 - tau) * noise + tau * target).masked_fill(~future_valid.bool()[..., None], 0)
         velocity = self.dit(
             noisy, flow_time, condition.history, condition.text, condition.text_valid,
-            condition.future_time_embedding, self.token_type.weight[1],
+            condition.future_time_embedding, self.token_type.weight[1], future_valid=future_valid,
         )
         return {
             "reconstruction": reconstruction,
             "action_velocity": velocity,
             "action_target_velocity": target - noise,
+            "future_action_valid": future_valid,
+            "history_gt_fraction": use_gt.float().mean(),
+            "history_valid_fraction": valid.float().mean(),
         }
 
     @torch.no_grad()

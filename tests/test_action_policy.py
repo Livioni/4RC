@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from arc.action import future_actions_in_current_camera, project_tcp, safe_rotation_6d_to_matrix
-from arc.models.arc.heads.action_head import TCPActionPolicy
+from arc.models.arc.arc_action import TCPActionPolicy
 from arc.loss.action import flow_matching_loss
 from stage2_helpers import TinyArc, TinyLanguage, tiny_batch
 
@@ -151,7 +151,7 @@ class TinyDataset:
 @pytest.mark.parametrize("num_train_epochs", [2, None])
 def test_stage2_checkpoint_resume_and_evaluation(tmp_path, monkeypatch, accumulation, num_train_epochs):
     import train_4rc_stage2 as runner
-    import arc.models.arc.heads.action_head as action_module
+    import arc.models.arc.arc_action as action_module
     from arc.datasets import DatasetSource, WeightedDatasetMixture
     monkeypatch.setenv("ACCELERATE_USE_CPU", "true")
     monkeypatch.setattr(runner, "Arc", TinyArc)
@@ -237,3 +237,115 @@ def test_safetensors_shared_parameters_remain_strict(tmp_path):
     with pytest.raises(RuntimeError):
         load_model_weights(restored, invalid)
 
+
+
+def test_partial_future_loss_and_attention_ignore_padding():
+    model = policy()
+    batch = tiny_batch(batch_size=2)
+    mask = torch.arange(16)[None] < torch.tensor([1, 7])[:, None]
+    batch["future_action_valid"] = mask
+    noise = torch.randn(2, 16, 20)
+    time = torch.tensor([0.3, 0.6])
+    first = model(batch, noise=noise, flow_time=time)
+    first["action_velocity"].retain_grad()
+    loss = flow_matching_loss(first)["objective"]
+    loss.backward()
+    assert first["action_velocity"].grad[~mask].eq(0).all()
+    assert first["action_velocity"].grad[mask].abs().sum() > 0
+    # Changing padded target/noise must not affect any supervised output.
+    batch["future_actions"][~mask] = 12345
+    noise[~mask] = -999
+    second = model(batch, noise=noise, flow_time=time)
+    torch.testing.assert_close(first["action_velocity"][mask], second["action_velocity"][mask])
+    torch.testing.assert_close(loss, flow_matching_loss(second)["objective"])
+    # Each trajectory contributes equally after averaging its valid offsets.
+    velocity = torch.zeros(2, 16, 20, requires_grad=True)
+    target = torch.ones_like(velocity)
+    target[1] = 2
+    result = flow_matching_loss({"action_velocity": velocity, "action_target_velocity": target,
+                                 "future_action_valid": mask})
+    torch.testing.assert_close(result["objective"], torch.tensor(7.5))
+
+
+def test_partial_future_metrics_use_last_valid_step():
+    from arc.loss.action import action_metric_sums, finalize_action_metrics
+    target = tiny_batch(batch_size=2)["future_actions"]
+    mask = torch.arange(16)[None] < torch.tensor([1, 3])[:, None]
+    position = target[..., :3].clone()
+    position[..., 0] += torch.arange(1, 17)[None, :, None]
+    prediction = {
+        "success": torch.ones(2, dtype=torch.bool),
+        "action_position": position,
+        "action_rotation": safe_rotation_6d_to_matrix(target[..., 3:9]),
+        "action_gripper": torch.zeros(2, 16, 2, dtype=torch.long),
+    }
+    sums = action_metric_sums(prediction, target, mask)
+    metrics = finalize_action_metrics(sums)
+    assert metrics["position_ade_m"] == pytest.approx(1.5)
+    assert metrics["position_fde_m"] == pytest.approx(2.0)
+    assert metrics["gripper_accuracy"] == 1
+    prediction["action_position"][~mask] = float('nan')
+    prediction["action_gripper"][~mask] = 1
+    changed = action_metric_sums(prediction, target, mask)
+    for key in sums:
+        torch.testing.assert_close(sums[key], changed[key])
+    prediction["success"][:] = False
+    empty = finalize_action_metrics(action_metric_sums(prediction, target, mask))
+    assert empty["valid_trajectories"] == 0
+
+
+def test_history_gt_schedule_endpoints_and_resume():
+    from train_4rc_stage2 import history_tcp_gt_ratio
+    config = {"history_tcp_gt_initial_ratio": 1.0, "history_tcp_gt_final_ratio": 0.5}
+    assert history_tcp_gt_ratio(config, 0, 101) == 1.0
+    assert history_tcp_gt_ratio(config, 50, 101) == 0.75
+    assert history_tcp_gt_ratio(config, 100, 101) == 0.5
+    assert history_tcp_gt_ratio(config, 150, 101) == 0.5
+    assert history_tcp_gt_ratio(config, 0, 1) == 1.0
+    # Resuming computes the same point on the curve, independent of epoch/batch.
+    resumed = [history_tcp_gt_ratio(config, step, 101) for step in range(60, 101)]
+    uninterrupted = [history_tcp_gt_ratio(config, step, 101) for step in range(101)]
+    assert resumed == uninterrupted[60:]
+
+
+def test_history_query_mixture_is_per_clip_and_detached():
+    model = policy()
+    batch = tiny_batch(batch_size=32)
+    positions = torch.tensor([[-0.1, 0., 1.], [0.1, 0., 1.]]).expand(32, 8, -1, -1).clone().requires_grad_()
+    reconstruction = {"tcp_position": positions}
+    predicted, predicted_valid = project_tcp(positions.detach(), batch["intrinsics"], image_height=42, image_width=42)
+    gt, valid, selected = model.training_history_queries(batch, reconstruction, 1.)
+    torch.testing.assert_close(gt, batch["history_tcp_query_points"])
+    assert selected.all()
+    recovered, valid, selected = model.training_history_queries(batch, reconstruction, 0.)
+    torch.testing.assert_close(recovered, predicted)
+    torch.testing.assert_close(valid, predicted_valid)
+    assert not selected.any() and not recovered.requires_grad
+    torch.manual_seed(42)
+    mixed, valid, selected = model.training_history_queries(batch, reconstruction, 0.5)
+    assert selected.any() and (~selected).any()
+    torch.testing.assert_close(mixed[selected], batch["history_tcp_query_points"][selected])
+    torch.testing.assert_close(mixed[~selected], predicted[~selected])
+    # Invalid predicted history stays missing instead of silently reverting to GT.
+    missing, valid, selected = model.training_history_queries(batch, {"tcp_position": -torch.ones_like(positions)}, 0.)
+    assert not valid.any() and not selected.any() and missing.eq(0).all()
+
+
+def test_predicted_history_forward_supports_missing_queries(monkeypatch):
+    model = policy()
+    batch = tiny_batch()
+    original = model.reconstruct
+    def missing_reconstruction(*args):
+        reconstruction, features = original(*args)
+        reconstruction["tcp_position"] = -torch.ones_like(reconstruction["tcp_position"])
+        return reconstruction, features
+    monkeypatch.setattr(model, "reconstruct", missing_reconstruction)
+    prediction = model(batch, history_gt_ratio=0.)
+    assert prediction["history_gt_fraction"] == 0
+    assert prediction["history_valid_fraction"] == 0
+    objective = flow_matching_loss(prediction)["objective"]
+    assert torch.isfinite(objective)
+    objective.backward()
+    assert model.history_pool.missing_token.grad is not None
+    assert model.history_pool.missing_token.grad.abs().sum() > 0
+    assert all(p.grad is None for p in model.arc.tcp_track_head.parameters())

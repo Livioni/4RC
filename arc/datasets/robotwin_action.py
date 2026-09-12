@@ -46,7 +46,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
             texts = tuple(text.strip() for text in texts if isinstance(text, str) and text.strip())
             if not texts:
                 continue
-            total_frames = history_frames + prediction_horizon
+            total_frames = history_frames + 1  # At least one real future label.
             ranges = [
                 np.arange(start, end - total_frames + 1, dtype=np.int64)
                 for start, end in episode.valid_segments if end - start >= total_frames
@@ -71,7 +71,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
             extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy")
             if not np.isfinite(extrinsics).all():
                 raise ValueError(f"Invalid camera extrinsics in {episode.path}")
-            moments.append(self._action_moments(states, extrinsics, possible))
+            moments.append(self._action_moments(states, extrinsics, possible, episode.valid_segments))
             kept.append(episode)
             starts.append(possible)
             instructions.append(texts)
@@ -102,22 +102,27 @@ class RoboTwinActionDataset(RoboTwin4RC):
             for name in ("left_state.npy", "right_state.npy")
         ], axis=1)
 
-    def _action_moments(self, states, extrinsics, starts):
+    def _action_moments(self, states, extrinsics, starts, segments):
         anchors = starts + self.history_frames - 1
-        current = extrinsics[anchors].astype(np.float64)
-        total = np.zeros((2, 3), dtype=np.float64)
+        ends = np.array([next(end for start, end in segments if start <= anchor < end)
+                         for anchor in anchors])
+        lengths = np.minimum(ends - anchors - 1, self.prediction_horizon)
+        total = np.zeros((len(anchors), 2, 3), dtype=np.float64)
         square = np.zeros_like(total)
         for offset in range(1, self.prediction_horizon + 1):
-            future = extrinsics[anchors + offset].astype(np.float64)
+            valid = offset <= lengths
+            selected = anchors[valid]
+            current = extrinsics[selected].astype(np.float64)
+            future = extrinsics[selected + offset].astype(np.float64)
             rotation = current[:, :3, :3] @ future[:, :3, :3].transpose(0, 2, 1)
             translation = current[:, :3, 3] - np.einsum("nij,nj->ni", rotation, future[:, :3, 3])
             position = np.einsum(
-                "nij,naj->nai", rotation, states[anchors + offset, :, :3],
+                "nij,naj->nai", rotation, states[selected + offset, :, :3],
             ) + translation[:, None]
-            total += position.sum(0)
-            square += np.square(position).sum(0)
-        count = len(anchors) * self.prediction_horizon
-        return total / count, square / count
+            total[valid] += position
+            square[valid] += np.square(position)
+        # Match uniform anchor sampling; each anchor averages only real offsets.
+        return (total / lengths[:, None, None]).mean(0), (square / lengths[:, None, None]).mean(0)
 
     def _rng(self, index, sample_seed=None):
         # Sampler seeds already encode the epoch. Persistent workers must not
@@ -144,10 +149,15 @@ class RoboTwinActionDataset(RoboTwin4RC):
         sample = super().__getitem__(index)
         episode = self.episodes[episode_index]
         future_indices = int(sample["frame_indices"][-1]) + np.arange(1, self.prediction_horizon + 1)
-        future_state = torch.from_numpy(self._read_states(episode)[future_indices].copy()).float()
+        anchor = int(sample["frame_indices"][-1])
+        segment_end = next(end for start, end in episode.valid_segments if start <= anchor < end)
+        future_valid = future_indices < segment_end
+        # Repeat the last valid state only for storage; masked positions carry no supervision.
+        padded_indices = np.minimum(future_indices, segment_end - 1)
+        future_state = torch.from_numpy(self._read_states(episode)[padded_indices].copy()).float()
         extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r")
         targets = future_actions_in_current_camera(
-            future_state, torch.tensor(extrinsics[future_indices]),
+            future_state, torch.tensor(extrinsics[padded_indices]),
             sample["extrinsics"][-1],
         )
         centres, valid = project_tcp(
@@ -165,6 +175,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
         sample.update(
             history_tcp_query_points=centres, history_tcp_valid=valid,
             future_actions=targets,
+            future_action_valid=torch.from_numpy(future_valid.copy()),
             future_frame_times=torch.tensor(future_indices / episode.frame_rate, dtype=torch.float32),
             instruction=instruction, shuffled_instruction=self.shuffled_instructions[episode_index],
         )

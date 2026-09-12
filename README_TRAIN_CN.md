@@ -486,15 +486,18 @@ train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch
 
 有效 batch size 为每卡 clip 数 × GPU 数 × gradient accumulation steps。
 历史窗口固定为配置长度；未来只读取 TCP 标签和坐标转换所需外参，不读取
-未来 RGB/depth。窗口正序、连续且不跨异常轨迹分段，默认需要至少 24 个连续
-有效帧。--history-frames 和 --prediction-horizon 可用于配置新实验。
+未来 RGB/depth。窗口正序、连续且不跨异常轨迹分段，默认需要至少 9 个连续
+有效帧（8 帧历史 + 至少 1 步未来标签）。不足 16 步的未来动作重复最后一个
+有效动作补齐，并通过 future_action_valid 屏蔽 padding 的 attention 和 loss；
+归一化统计及验证指标仅计真实未来标签，FDE 取最后一个有效步。未来时间仍
+按采样频率递增，补齐不会跨越异常轨迹分段。--history-frames 和 --prediction-horizon 可用于配置新实验。
 
 ### 历史 token、编码与 DiT
 
 每次前向先恢复历史 geometry/TCP，再从各历史帧的最后一层 backbone 全局
 特征中，在左右 TCP 中心分别采样 3×3 patch，复用现有 visual query encoder。
 
-邻域特征投影到 512 维后，以中心 patch 为 query、9 个 patch 为 key/value，
+邻域特征投影到 768 维后，以中心 patch 为 query、9 个 patch 为 key/value，
 做 attention pooling，再加中心残差和 LayerNorm。每帧保留左右臂各一个
 token，8 帧共 16 个历史 tokens。
 
@@ -503,12 +506,12 @@ token，8 帧共 16 个历史 tokens。
 sin/cos 编码加 MLP；物理时间使用独立 sin/cos 编码加 MLP，以 1/15 秒为
 单位。连续 15 Hz 数据的历史编码为 [-7,...,0]，未来为 [1,...,16]。
 
-DiT 默认 8 层、512 维、8 heads。主序列为 16 个历史 tokens 加 16 个未来
+Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 297M 参数（不含条件编码模块）。主序列为 16 个历史 tokens 加 16 个未来
 动作 tokens。历史只能读取历史；未来能读取全部历史和未来。仅未来动作
 加噪、接受生成时间 tau 的 AdaLN-Zero 调制，并计算 flow matching loss。
 物理时间和生成时间使用独立编码模块。
 
-T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→512
+T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
 投影进入每层 cross-attention，并传递文本 padding mask。
 
 每步每臂输出 xyz（3）+ rotation 6D（6）+ gripper（1），双臂共 20 维。
@@ -517,8 +520,16 @@ T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→
 
 ### Teacher forcing 与学习率
 
-训练历史采样中心使用 100% GT 二维投影，初始恢复 query 与逐帧生成采样点
-分别管理。无效历史投影使用缺失 token；整段历史均无有效投影的窗口不训练。
+训练历史采样中心按 clip 在 GT 与当前模型预测 TCP 投影之间随机选择，整段
+历史使用同一种来源。GT 概率从 history_tcp_gt_initial_ratio=1.0 线性下降到
+history_tcp_gt_final_ratio=0.5：首个更新 100% GT，最后一个更新 50% GT /
+50% 预测，中途约 75% GT。比例按累计 optimizer step 计算，续训不会重新开始；
+梯度累积期间概率相同，每个 micro-batch 独立选择。单步训练使用初始比例。
+初始恢复 query 与逐帧生成采样点分别管理，此课程不改变初始 query。
+GT 历史完全无效的窗口仍不训练；预测投影无效时使用缺失 token，不回退到 GT。
+日志 condition/history_gt_probability 记录计划概率，history_gt_fraction 记录
+当前 micro-batch 实际 GT 比例，history_valid_fraction 记录混合后的有效投影比例。
+本课程不额外加入位置扰动。
 
 推理用首帧左右两个二维点启动 TCP 恢复，随后根据恢复位置与标定内参投影。
 所有点和内参使用 padded 图像坐标：原图点增加 (1,6)，内参主点增加同样
@@ -526,7 +537,7 @@ T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→
 
 联合损失包括 geometry、TCP recovery 和 action flow matching，三个外部
 权重默认均为 1。生成损失更新池化、共享 query encoder 和 backbone；
-GT 采样中心不提供通向 TCP 位置预测 head 的梯度，该 head 由恢复损失更新。
+GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head 的梯度，该 head 由恢复损失更新。
 
 | 参数组 | 训练开关 | 学习率 |
 |---|---|---|

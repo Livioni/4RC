@@ -26,7 +26,7 @@ from arc.datasets.robotwin_action import build_action_dataset
 from arc.loss import GeometryLoss, TCPTrackingLoss
 from arc.loss.action import flow_matching_loss, action_metric_sums, finalize_action_metrics
 from arc.models.arc.arc import Arc
-from arc.models.arc.heads.action_head import TCPActionPolicy
+from arc.models.arc.arc_action import TCPActionPolicy
 from train_4rc_stage1 import (
     cosine_warmup_scheduler, distributed_scheduler_steps, prepare_geometry_batch,
     save_checkpoint, save_depth_preview, training_total_steps, align_resumed_scheduler,
@@ -78,6 +78,13 @@ def validate_config(config, *, eval_only=False):
     for key in ("batch_size", "history_frames", "prediction_horizon", "sampling_steps", "action_dim", "action_depth", "action_heads", "text_max_length", "validation_batches", "validation_batch_size"):
         if not isinstance(config[key], int) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
+    for key, default in (("history_tcp_gt_initial_ratio", 1.0), ("history_tcp_gt_final_ratio", 0.5)):
+        value = float(config.get(key, default))
+        if not math.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError(f"{key} must lie in [0,1]")
+        config[key] = value
+    if config["history_tcp_gt_final_ratio"] > config["history_tcp_gt_initial_ratio"]:
+        raise ValueError("History GT ratio must stay constant or decrease")
     if config["action_dim"] % config["action_heads"] or config["action_dim"] % 4:
         raise ValueError("action_dim must be divisible by action_heads and 4")
     if config.get("normalize_geometry", False):
@@ -100,6 +107,19 @@ def validate_config(config, *, eval_only=False):
             config[key] = str(Path(config[key]).expanduser())
     config["training_stage"] = 2
     return config
+
+
+def history_tcp_gt_ratio(config, global_step, total_steps):
+    """Linear probability over cumulative optimizer updates, including resume.
+
+    global_step counts completed updates: the first update uses the initial
+    ratio and the last planned update uses the final ratio. A one-step run
+    uses the initial ratio.
+    """
+    progress = min(1.0, max(0.0, global_step / max(1, total_steps - 1)))
+    initial = float(config.get("history_tcp_gt_initial_ratio", 1.0))
+    final = float(config.get("history_tcp_gt_final_ratio", 0.5))
+    return initial + (final - initial) * progress
 
 
 def weight_file(checkpoint):
@@ -244,6 +264,9 @@ def compute_losses(prediction, batch, geometry, tcp, config):
     logs = {"objective": objective.detach()}
     for name, values in (("geometry", geometry_loss), ("tcp", tcp_loss), ("action", action_loss)):
         logs.update({f"{name}/{key}": value.detach() for key, value in values.items()})
+    for key in ("history_gt_fraction", "history_valid_fraction"):
+        if key in prediction:
+            logs[f"condition/{key}"] = prediction[key].detach()
     return objective, logs
 
 
@@ -298,7 +321,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
             elapsed[mode] += time.perf_counter() - started
             if mode == "recovered":
                 elapsed["recovered_end_to_end"] += encode_elapsed + time.perf_counter() - started
-            for name, value in action_metric_sums(prediction, batch["future_actions"]).items():
+            for name, value in action_metric_sums(prediction, batch["future_actions"], batch.get("future_action_valid")).items():
                 totals[mode][name] += float(value)
         with torch.autocast(device_type=accelerator.device.type, enabled=False):
             geometry_loss = geometry(reconstruction, prepare_geometry_batch(dict(batch), reconstruction))
@@ -449,7 +472,8 @@ def main():
         for index, batch in enumerate(progress, start=offset):
             with accelerator.accumulate(policy):
                 with accelerator.autocast():
-                    prediction = policy(batch)
+                    gt_ratio = history_tcp_gt_ratio(config, global_step, total_steps)
+                    prediction = policy(batch, history_gt_ratio=gt_ratio)
                     objective, logs = compute_losses(prediction, batch, geometry, tcp, config)
                 accelerator.backward(objective)
                 if accelerator.sync_gradients:
@@ -463,6 +487,7 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
                 metrics = {key: float(accelerator.reduce(value, reduction="mean")) for key, value in logs.items()}
+                metrics["condition/history_gt_probability"] = gt_ratio
                 metrics.update({f"lr/{group['name']}": group["lr"] for group in optimizer.param_groups})
                 accelerator.log(metrics, step=global_step)
                 if global_step % config["log_every_steps"] == 0:

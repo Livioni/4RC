@@ -107,5 +107,39 @@ def test_windows_do_not_cross_discontinuities(tmp_path):
     dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
     assert dataset.segmented_episode_count == 1
     for start in dataset.starts[0]:
-        assert start + 24 <= 32 or start >= 32
+        assert start + 9 <= 32 or start >= 32
+    dataset.starts[0] = np.array([23])  # Eight history frames, one future frame before the jump.
+    sample = dataset.get_sample(0, 8, 42)
+    assert sample["future_action_valid"].sum() == 1
+    torch.testing.assert_close(sample["future_actions"][:, 0, 0], torch.full((16,), -0.2 + 31 * 0.002))
 
+
+
+@pytest.mark.parametrize("frames", [9, 13, 24])
+def test_partial_future_padding_and_statistics(tmp_path, frames):
+    write_episode(tmp_path, frames=frames)
+    dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
+    assert dataset.starts[0].tolist() == list(range(frames - 8))
+    # Verify statistics before restricting sampling to the first window.
+    per_anchor = [np.arange(start + 8, min(start + 24, frames)).mean()
+                  for start in dataset.starts[0]]
+    expected_x = torch.tensor([-0.2, 0.2]) + float(np.mean(per_anchor)) * 0.002
+    torch.testing.assert_close(dataset.tcp_position_mean[:, 0], expected_x)
+    dataset.starts[0] = np.array([0])
+    sample = dataset.get_sample(0, 8, 42)
+    length = min(frames - 8, 16)
+    assert sample["future_action_valid"].tolist() == [True] * length + [False] * (16 - length)
+    assert sample["future_actions"].shape == (16, 2, 10)
+    torch.testing.assert_close(sample["future_frame_times"], torch.arange(8, 24) / 15)
+    if length < 16:
+        torch.testing.assert_close(sample["future_actions"][length:],
+                                   sample["future_actions"][length - 1].expand(16 - length, -1, -1))
+    batch = collate_training_samples([sample, sample])
+    assert batch["future_action_valid"].shape == (2, 16)
+
+
+def test_no_future_label_is_not_sampled(tmp_path):
+    from arc.datasets.robotwin_action import NoActionEpisodes
+    write_episode(tmp_path, frames=8)
+    with pytest.raises(NoActionEpisodes):
+        RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
