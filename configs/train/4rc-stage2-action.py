@@ -5,9 +5,10 @@
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-stage2-action"
+output_dir = "outputs/4rc-stage2-action-bs4x3"
+wandb_run_name = "4rc-stage2-action-bs4x3"
 logging_dir = "logs"
-stage1_checkpoint = None  # Required for a new run; file or stage-one checkpoint directory.
+stage1_checkpoint = "outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint/model.safetensors"  # Required for a new run; file or stage-one checkpoint directory.
 resume = None  # Stage-two checkpoint directory when resuming.
 
 # == Dataset Configuration ==
@@ -32,7 +33,7 @@ data_sources = (
 view = "third_views"
 history_frames = 8
 prediction_horizon = 16  # Short futures repeat the last valid action; padding is masked.
-batch_size = 1  # Per GPU; each sample contains history_frames input images.
+batch_size = 3  # Per GPU; each sample contains history_frames input images.
 # The action adapter requires forward, contiguous windows. The runner derives
 # these image budgets and intervals again from batch_size / history_frames.
 train_batch_images = batch_size * history_frames
@@ -92,7 +93,7 @@ history_tcp_gt_final_ratio = 0.5
 # == Training Configuration ==
 seed = 42
 num_train_epochs = None  # No epoch limit; stop at the cumulative max_train_steps.
-max_train_steps = 100_000
+max_train_steps = 500_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"
 max_grad_norm = 1.0

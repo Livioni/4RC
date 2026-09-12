@@ -435,7 +435,6 @@ python scripts/upload_robotwin_to_hf.py \
 “--keep-archives” 会保留上传成功的 tar；“--overwrite” 会重新上传远端已存在
 的 task；“--rebuild-archives” 会重新创建 staging 中已有的 tar。
 
-
 ## 11. 第二阶段：重建条件下的 TCP 动作生成
 
 训练入口分为 train_4rc_stage1.py 和 train_4rc_stage2.py。第一阶段继续使用
@@ -444,20 +443,20 @@ configs/train/4rc-stage2-action.py，联合优化历史重建与未来动作生�
 
 ### 启动、初始化与恢复
 
-~~~bash
+```bash
 # 第一阶段
 accelerate launch train_4rc_stage1.py \
   --config configs/train/4rc-giant-train-mixed.py
 
 # 使用第一阶段 checkpoint 初始化第二阶段
-accelerate launch train_4rc_stage2.py \
+accelerate launch --num_processes 4 train_4rc_stage2.py \
   --stage1-checkpoint outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint \
   --batch-size 1
 
 # 恢复第二阶段
 accelerate launch train_4rc_stage2.py \
   --resume outputs/4rc-stage2-action/checkpoint-1000
-~~~
+```
 
 stage1_checkpoint 在新训练时必须提供，支持权重文件或 Accelerate checkpoint
 目录。也可直接使用本地 checkpoints/RoboTwin-TCP-Tracking/model.safetensors。
@@ -470,19 +469,19 @@ action head 使用单独的训练集统计量。Safetensors 加载会正确恢�
 
 ### 历史长度与每卡 batch size
 
-~~~python
+```python
 history_frames = 8
 prediction_horizon = 16
 batch_size = 1
-~~~
+```
 
 batch_size 是每张 GPU 的 clip 数。脚本自动计算
 train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch_size,)。
 
-| 每卡 batch size | RGB batch | 历史图像数 |
-|---|---|---|
-| 1 | [1,8,3,252,322] | 8 |
-| 2 | [2,8,3,252,322] | 16 |
+| 每卡 batch size | RGB batch       | 历史图像数 |
+| --------------- | --------------- | ---------- |
+| 1               | [1,8,3,252,322] | 8          |
+| 2               | [2,8,3,252,322] | 16         |
 
 有效 batch size 为每卡 clip 数 × GPU 数 × gradient accumulation steps。
 历史窗口固定为配置长度；未来只读取 TCP 标签和坐标转换所需外参，不读取
@@ -539,16 +538,16 @@ GT 历史完全无效的窗口仍不训练；预测投影无效时使用缺失 t
 权重默认均为 1。生成损失更新池化、共享 query encoder 和 backbone；
 GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head 的梯度，该 head 由恢复损失更新。
 
-| 参数组 | 训练开关 | 学习率 |
-|---|---|---|
-| backbone | train_backbone | lr_backbone |
-| geometry head | train_geometry_head | lr_head |
-| sparse motion decoder | train_motion_decoder | lr_motion_decoder |
-| 共享 visual query encoder | train_query_encoder | lr_query_encoder |
-| TCP recovery head | train_tcp_head | lr_tcp_head |
-| 历史池化、位置/时间编码 | train_history_pool | lr_history_pool |
-| DiT | train_action_head | lr_action_head |
-| 文本投影 | train_language_projection | lr_language_projection |
+| 参数组                    | 训练开关                  | 学习率                 |
+| ------------------------- | ------------------------- | ---------------------- |
+| backbone                  | train_backbone            | lr_backbone            |
+| geometry head             | train_geometry_head       | lr_head                |
+| sparse motion decoder     | train_motion_decoder      | lr_motion_decoder      |
+| 共享 visual query encoder | train_query_encoder       | lr_query_encoder       |
+| TCP recovery head         | train_tcp_head            | lr_tcp_head            |
+| 历史池化、位置/时间编码   | train_history_pool        | lr_history_pool        |
+| DiT                       | train_action_head         | lr_action_head         |
+| 文本投影                  | train_language_projection | lr_language_projection |
 
 旧模块学习率继承 mixed 配置，新模块默认 1e-4。关闭开关或把该组学习率设为
 0 会冻结参数。camera decoder 和 dense track head 不参与第二阶段训练。
@@ -559,11 +558,11 @@ GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head �
 stage1_validation_overlap 默认 unknown；需审计第一阶段是否使用过这些
 episode，才能将结果解释为未见 episode 泛化。
 
-~~~bash
+```bash
 python train_4rc_stage2.py \
   --resume outputs/4rc-stage2-action/final_checkpoint \
   --eval-only --validation-batches 16
-~~~
+```
 
 验证结果写入 validation/step-XXXXXXXX.json，包括：
 
@@ -584,6 +583,6 @@ frame_times 为 [B,K]；intrinsics 为 [B,K,3,3]。不接收历史 GT 轨迹。
 action_gripper [B,16,2] 和未来时间。失败样本的 success 为 false，
 位置/旋转为 NaN，夹爪为 −1。重建、池化和 T5 编码在一次生成中只执行一次。
 
-~~~bash
+```bash
 python -m pytest tests/test_action_policy.py tests/test_action_dataset.py -q
-~~~
+```

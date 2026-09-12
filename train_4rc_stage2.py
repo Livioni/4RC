@@ -158,6 +158,7 @@ def build_policy(config):
     arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
     if not config.get("resume"):
         # Strict loading prevents silently starting with random recovery heads.
+        LOGGER.info("Load checkpoint from stage1: %s", config["stage1_checkpoint"])
         load_model_weights(arc, config["stage1_checkpoint"])
     policy = TCPActionPolicy(
         arc, t5_model=config["t5_model"], text_max_length=config["text_max_length"],
@@ -386,7 +387,10 @@ def main():
         root.mkdir(parents=True, exist_ok=True)
         (root / "config.json").write_text(json.dumps(config, indent=2))
     tracker_config = {key: json.dumps(value) if isinstance(value, (dict, list, tuple)) else value for key, value in config.items()}
-    accelerator.init_trackers("4RC-Stage2-Action", config=tracker_config)
+    init_kwargs = {}
+    if config.get("wandb_run_name"):
+        init_kwargs["wandb"] = {"name": config["wandb_run_name"]}
+    accelerator.init_trackers("4RC-Stage2-Action", config=tracker_config, init_kwargs=init_kwargs)
     policy = build_policy(config)
     geometry, tcp = build_criteria(config)
     geometry, tcp = geometry.to(accelerator.device), tcp.to(accelerator.device)
