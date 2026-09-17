@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Infer a complete RoboTwin episode with overlapping TCP windows.
 
+This entry point includes its own preprocessing, model loading and visualization.
+It requires the repository arc package and installed third-party dependencies.
+Edit the configuration block below or override it with command-line options.
+
 Each window shares one boundary frame with the next window. The final metric
 TCP positions from one window are projected into that shared image to become
 the next window's left/right visual query points.
@@ -21,6 +25,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import gc
+import re
 from dataclasses import dataclass
 import html
 import json
@@ -34,34 +41,1187 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from PIL import Image, ImageDraw, ImageOps
+from torchvision.transforms import functional as TVF
 
-from geometry_inference import load_robotwin_views, resolve_device, resolve_dtype
-from tcp_inference import (
-    ARM_NAMES,
-    DEFAULT_MODEL,
-    TRAIN_MAX_FRAMES,
-    _frame_index,
-    _load_query_points_file,
-    _validate_query_points,
-    add_interactive_query_point,
-    collect_rgb_paths,
-    infer_tcp_and_depth,
-    infer_tcp_and_geometry,
-    infer_tcp_trajectory,
-    load_ground_truth_query_points,
-    load_tcp_model,
-    matrix_to_rpy,
-    prepare_frame_point_clouds,
-    project_tcp_positions_to_query_points,
-    render_query_overlay,
-    start_visualization,
-    stop_visualization,
-)
+# ==================== 用户配置（命令行参数可覆盖） ====================
+# 路径相对于启动时的工作目录；模型必须含 TCP visual query / tracking 权重。
+DEFAULT_MODEL = Path("checkpoints/RoboTwin-Stage1/model.safetensors")
+# 填入完整 episode 目录后可直接运行；None 表示必须传 --input。
+# 目录需包含 images/<view>/、intrinsics/<view>.npy 和 metadata.json。
+DEFAULT_INPUT: Path | None = None
+DEFAULT_OUTPUT: Path | None = None  # None：保存到输入目录 / DEFAULT_OUTPUT_FILENAME
+DEFAULT_OUTPUT_FILENAME = "tcp_episode.json"  # 完整双臂轨迹 JSON，同名文件会覆盖
+DEFAULT_VIEW = "third_views"  # 模型训练视角；原始 RGB 必须为 320×240
+DEFAULT_WINDOW_SIZE = 9  # 每窗帧数：2～18，相邻窗口共享一帧
+DEFAULT_BOUNDARY_MERGE = "previous"  # previous / next / average
+DEFAULT_DEVICE = "auto"  # auto / cuda / cuda:0 / cpu
+DEFAULT_DTYPE = "auto"  # auto / float32 / float16 / bfloat16
+
+# 首帧选点：原始图像像素，顺序为 (左 x, 左 y, 右 x, 右 y)。
+# 以下三项最多启用一项；都不启用时，从首帧真值投影取得选点。
+DEFAULT_TCP_QUERY_POINTS: tuple[float, float, float, float] | None = None
+DEFAULT_TCP_QUERY_POINTS_FILE: Path | None = None  # .npy / .npz / .json，形状 [2,2]
+DEFAULT_INTERACTIVE = False  # Gradio 交互选点，完成后展示 Viser
+DEFAULT_VISUALIZE = False  # 非交互推理完成后打开 Viser 服务
+DEFAULT_CONFIDENCE_PERCENTILE = 2.5  # 点云置信度过滤百分位 [0,99]
+DEFAULT_MAX_POINTS = 100_000  # 每帧最多显示点数；0 保留全部
+DEFAULT_POINT_SIZE = 0.003  # Viser 点大小
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8020
+DEFAULT_UI_HOST = "127.0.0.1"
+DEFAULT_UI_PORT = 7860
+
+# JSON 每帧包含左右臂 xyz_m、rpy_rad、rpy_deg、夹爪概率/开合及置信度。
+# xyz 为每帧相机坐标（x 向右、y 向下、z 向前），单位米；RPY 为固定轴 XYZ。
+GRIPPER_OPEN_THRESHOLD = 0.5  # 概率 >= 此值时 gripper_open=True
+
+# ==================== 模型/数据约定（应与训练保持一致） ====================
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+ARM_NAMES = ("left", "right")
+ARM_COLORS = ((255, 96, 64), (45, 180, 255))
+TCP_GROUND_TRUTH_DIRS = {"third_views": "TCP_third", "head_view": "TCP_head"}
+TRAIN_MAX_FRAMES = 18
+SOURCE_WIDTH, SOURCE_HEIGHT = 320, 240
+PAD_LEFT, PAD_RIGHT, PAD_TOP, PAD_BOTTOM = 1, 1, 6, 6
+PADDED_WIDTH, PADDED_HEIGHT = 322, 252
 
 
 RPY_CONVENTION = "fixed-axis XYZ (R = Rz(yaw) @ Ry(pitch) @ Rx(roll))"
 CAMERA_SUFFIX = "OpenCV camera (+x right, +y down, +z forward)"
 BOUNDARY_POLICIES = ("previous", "next", "average")
+
+
+# ==================== 内置加载、推理与可视化逻辑 ====================
+
+def _natural_sort_key(path: Path) -> tuple[tuple[int, int | str], ...]:
+    parts = re.split(r"(\d+)", path.name.lower())
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts
+        if part
+    )
+
+
+def collect_rgb_paths(
+    input_dir: Path,
+    max_frames: int,
+    frame_indices: list[int] | None = None,
+    *,
+    start_frame: int | None = None,
+    frame_interval: int = 1,
+) -> list[Path]:
+    """Collect an explicit sequence or a contiguous fixed-interval clip."""
+    if max_frames < 0 or max_frames == 1:
+        raise ValueError("--max-frames must be 0 or at least 2")
+    if start_frame is not None and start_frame < 0:
+        raise ValueError("--start-frame cannot be negative")
+    if frame_interval < 1:
+        raise ValueError("--frame-interval must be positive")
+
+    all_paths = sorted(
+        (
+            path
+            for path in input_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        ),
+        key=_natural_sort_key,
+    )
+    paths_by_index: dict[int, Path] = {}
+    for path in all_paths:
+        try:
+            index = _frame_index(path)
+        except ValueError:
+            continue
+        if index in paths_by_index:
+            raise ValueError(
+                f"Multiple images in {input_dir} resolve to frame index {index}"
+            )
+        paths_by_index[index] = path
+
+    if frame_indices is not None:
+        if len(frame_indices) < 2:
+            raise ValueError("--frame-indices requires at least 2 frame numbers")
+        if len(set(frame_indices)) != len(frame_indices):
+            raise ValueError("--frame-indices cannot contain duplicate frame numbers")
+        if any(index < 0 for index in frame_indices):
+            raise ValueError("--frame-indices cannot contain negative frame numbers")
+        missing = [index for index in frame_indices if index not in paths_by_index]
+        if missing:
+            raise FileNotFoundError(
+                f"Requested frame indices are missing from {input_dir}: {missing}"
+            )
+        return [paths_by_index[index] for index in frame_indices]
+
+    if len(paths_by_index) < 2:
+        raise ValueError(
+            f"Expected at least 2 numerically named PNG/JPEG frames in {input_dir}, "
+            f"found {len(paths_by_index)}"
+        )
+    first = min(paths_by_index) if start_frame is None else start_frame
+    last = max(paths_by_index)
+    requested = list(range(first, last + 1, frame_interval))
+    if max_frames:
+        requested = requested[:max_frames]
+    if len(requested) < 2:
+        raise ValueError(
+            f"Fewer than 2 frames remain from start={first}, interval={frame_interval}"
+        )
+    missing = [index for index in requested if index not in paths_by_index]
+    if missing:
+        preview = missing[:12]
+        suffix = "..." if len(missing) > len(preview) else ""
+        raise FileNotFoundError(
+            f"Fixed-interval clip is missing frames in {input_dir}: {preview}{suffix}"
+        )
+    return [paths_by_index[index] for index in requested]
+
+
+def load_robotwin_views(
+    paths: list[Path],
+) -> tuple[list[dict[str, torch.Tensor]], list[np.ndarray]]:
+    """Load native RoboTwin RGB and reproduce the geometry training padding."""
+    views: list[dict[str, torch.Tensor]] = []
+    colors: list[np.ndarray] = []
+
+    for index, path in enumerate(paths):
+        with Image.open(path) as image_file:
+            image = ImageOps.exif_transpose(image_file).convert("RGB")
+            if image.size != (SOURCE_WIDTH, SOURCE_HEIGHT):
+                raise ValueError(
+                    f"Expected every RGB frame to be {SOURCE_WIDTH}x{SOURCE_HEIGHT}; "
+                    f"got {image.width}x{image.height}: {path}"
+                )
+            color = np.asarray(image, dtype=np.uint8).copy()
+            image_tensor = TVF.pil_to_tensor(image).float().div_(255.0)
+
+        image_tensor = F.pad(
+            image_tensor,
+            (PAD_LEFT, PAD_RIGHT, PAD_TOP, PAD_BOTTOM),
+            mode="reflect",
+        )
+        image_tensor = image_tensor.mul_(2.0).sub_(1.0)
+        if image_tensor.shape[-2:] != (PADDED_HEIGHT, PADDED_WIDTH):
+            raise RuntimeError(
+                f"Internal padding error: got {tuple(image_tensor.shape[-2:])}, "
+                f"expected {(PADDED_HEIGHT, PADDED_WIDTH)}"
+            )
+
+        views.append(
+            {
+                "img": image_tensor.unsqueeze(0),
+                "true_shape": torch.tensor([[PADDED_HEIGHT, PADDED_WIDTH]]),
+                "idx": index,
+                "instance": str(index),
+            }
+        )
+        colors.append(color)
+    return views, colors
+
+
+def _remove_training_prefix(key: str) -> str:
+    for prefix in ("model.", "module."):
+        if key.startswith(prefix):
+            return _remove_training_prefix(key[len(prefix) :])
+    return key
+
+
+def resolve_device(requested: str) -> torch.device:
+    if requested == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA was requested ({requested}) but is not available")
+    return device
+
+
+def resolve_dtype(requested: str, device: torch.device) -> torch.dtype:
+    if requested == "auto":
+        if device.type != "cuda":
+            return torch.float32
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    dtype = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[requested]
+    if device.type != "cuda" and dtype != torch.float32:
+        raise ValueError(f"{requested} inference is only supported on CUDA by this script")
+    return dtype
+
+
+def load_ground_truth_query_points(
+    input_path: Path, view: str, frame_index: int
+) -> np.ndarray:
+    """Project the selected frame's RoboTwin TCP truth to original RGB pixels."""
+    input_path = input_path.expanduser()
+    episode_path = input_path
+    episode_rgb_dir = episode_path / "images" / view
+    if not episode_rgb_dir.is_dir():
+        if input_path.name == view and input_path.parent.name == "images":
+            episode_path = input_path.parent.parent
+        else:
+            raise FileNotFoundError(
+                "Ground-truth TCP selection requires a RoboTwin episode directory "
+                f"(or its images/{view} directory), got: {input_path}"
+            )
+
+    tcp_directory = TCP_GROUND_TRUTH_DIRS.get(view)
+    if tcp_directory is None:
+        supported = ", ".join(sorted(TCP_GROUND_TRUTH_DIRS))
+        raise ValueError(
+            f"No ground-truth TCP directory mapping for view {view!r}; "
+            f"supported views: {supported}"
+        )
+
+    intrinsics_path = episode_path / "intrinsics" / f"{view}.npy"
+    tcp_paths = [
+        episode_path / tcp_directory / f"{arm_name}_state.npy"
+        for arm_name in ARM_NAMES
+    ]
+    missing = [
+        str(path)
+        for path in (intrinsics_path, *tcp_paths)
+        if not path.is_file()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Ground-truth TCP files are missing: " + ", ".join(missing)
+        )
+
+    intrinsics = np.load(intrinsics_path, allow_pickle=False)
+    if intrinsics.shape != (3, 3) or not np.isfinite(intrinsics).all():
+        raise ValueError(
+            f"Expected finite intrinsics [3,3] in {intrinsics_path}, "
+            f"got {intrinsics.shape}"
+        )
+
+    positions = []
+    for arm_name, tcp_path in zip(ARM_NAMES, tcp_paths):
+        states = np.load(tcp_path, mmap_mode="r", allow_pickle=False)
+        if states.ndim != 2 or states.shape[1] < 3:
+            raise ValueError(
+                f"Expected {arm_name} TCP states [frames,>=3] in {tcp_path}, "
+                f"got {states.shape}"
+            )
+        if not 0 <= frame_index < states.shape[0]:
+            raise IndexError(
+                f"Frame {frame_index} is outside {tcp_path} with "
+                f"{states.shape[0]} frames"
+            )
+        positions.append(np.asarray(states[frame_index, :3], dtype=np.float32))
+    return project_tcp_positions_to_query_points(
+        np.stack(positions, axis=0),
+        intrinsics,
+        source=f"ground-truth TCP at frame {frame_index}",
+    )
+
+
+def _frame_index(path: Path) -> int:
+    match = re.search(r"(\d+)$", path.stem)
+    if match is None:
+        raise ValueError(
+            f"Cannot infer the RoboTwin frame index from image name {path.name!r}; "
+            "pass --tcp-query-points or --tcp-query-points-file explicitly"
+        )
+    return int(match.group(1))
+
+
+def _validate_query_points(points: Any, source: str) -> np.ndarray:
+    points_array = np.asarray(points, dtype=np.float32)
+    if points_array.shape != (2, 2):
+        raise ValueError(
+            f"TCP query points from {source} must have shape [2,2] "
+            f"(left/right x/y), got {points_array.shape}"
+        )
+    if not np.isfinite(points_array).all():
+        raise ValueError(f"TCP query points from {source} contain NaN/Inf")
+    inside = (
+        (points_array[:, 0] >= 0)
+        & (points_array[:, 0] < SOURCE_WIDTH)
+        & (points_array[:, 1] >= 0)
+        & (points_array[:, 1] < SOURCE_HEIGHT)
+    )
+    if not inside.all():
+        raise ValueError(
+            f"TCP query points from {source} must lie inside "
+            f"{SOURCE_WIDTH}x{SOURCE_HEIGHT}: {points_array.tolist()}"
+        )
+    return points_array
+
+
+def project_tcp_positions_to_query_points(
+    positions: Any,
+    intrinsics: Any,
+    *,
+    source: str,
+) -> np.ndarray:
+    """Project left/right camera-frame TCP xyz to original-image pixels.
+
+    The visual TCP query encoder consumes two image points, while the TCP head
+    predicts metric positions. Sliding-window inference uses this conversion on
+    the shared boundary frame to feed one window's final prediction into the
+    next window.
+    """
+    xyz = np.asarray(positions, dtype=np.float32)
+    camera_matrix = np.asarray(intrinsics, dtype=np.float32)
+    if xyz.shape != (len(ARM_NAMES), 3):
+        raise ValueError(
+            f"TCP positions from {source} must have shape [2,3], got {xyz.shape}"
+        )
+    if camera_matrix.shape != (3, 3):
+        raise ValueError(
+            f"Camera intrinsics for {source} must have shape [3,3], "
+            f"got {camera_matrix.shape}"
+        )
+    if not np.isfinite(camera_matrix).all():
+        raise ValueError(f"Camera intrinsics for {source} contain NaN/Inf")
+    if not np.isfinite(xyz).all():
+        raise ValueError(f"TCP positions from {source} contain NaN/Inf: {xyz.tolist()}")
+
+    z = xyz[:, 2]
+    invalid_depth = np.flatnonzero(z <= 0)
+    if len(invalid_depth):
+        arm_index = int(invalid_depth[0])
+        raise ValueError(
+            f"Cannot project {ARM_NAMES[arm_index]} TCP from {source}: "
+            f"expected z > 0, got xyz={xyz[arm_index].tolist()}"
+        )
+
+    homogeneous = xyz @ camera_matrix.T
+    projection_depth = homogeneous[:, 2]
+    invalid_projection_depth = np.flatnonzero(
+        ~np.isfinite(projection_depth) | (np.abs(projection_depth) < 1e-8)
+    )
+    if len(invalid_projection_depth):
+        arm_index = int(invalid_projection_depth[0])
+        raise ValueError(
+            f"Cannot project {ARM_NAMES[arm_index]} TCP from {source}: invalid "
+            f"homogeneous depth {float(projection_depth[arm_index])}"
+        )
+    pixels = homogeneous[:, :2] / projection_depth[:, None]
+
+    for arm_index, arm_name in enumerate(ARM_NAMES):
+        u, v = (float(value) for value in pixels[arm_index])
+        if not (math.isfinite(u) and math.isfinite(v)):
+            raise ValueError(
+                f"Cannot project {arm_name} TCP from {source}: projected pixel "
+                f"is not finite: {[u, v]}"
+            )
+        if not (0.0 <= u < SOURCE_WIDTH and 0.0 <= v < SOURCE_HEIGHT):
+            raise ValueError(
+                f"Cannot project {arm_name} TCP from {source}: xyz="
+                f"{xyz[arm_index].tolist()} projects outside "
+                f"{SOURCE_WIDTH}x{SOURCE_HEIGHT} at pixel={[u, v]}"
+            )
+    return _validate_query_points(pixels, f"projection of {source}")
+
+
+def _load_query_points_file(path: Path) -> np.ndarray:
+    path = path.expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"TCP query-points file does not exist: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".npy":
+        points = np.load(path, allow_pickle=False)
+    elif suffix == ".npz":
+        with np.load(path, allow_pickle=False) as archive:
+            if "tcp_query_points" in archive:
+                points = archive["tcp_query_points"]
+            elif len(archive.files) == 1:
+                points = archive[archive.files[0]]
+            else:
+                raise ValueError(
+                    f"{path} must contain 'tcp_query_points' when it has multiple keys"
+                )
+    elif suffix == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict) and "tcp_query_points" in payload:
+            points = payload["tcp_query_points"]
+        elif isinstance(payload, dict) and all(name in payload for name in ARM_NAMES):
+            points = [payload[name] for name in ARM_NAMES]
+        else:
+            points = payload
+    else:
+        raise ValueError("--tcp-query-points-file must be .npy, .npz, or .json")
+    points_array = np.asarray(points)
+    if points_array.ndim == 3:
+        points_array = points_array[0]
+    return _validate_query_points(points_array, str(path))
+
+
+def add_interactive_query_point(
+    points: list[list[float]], click_index: tuple[int, int] | list[int]
+) -> list[list[float]]:
+    """Append one original-image click in left-then-right arm order."""
+    points_array = np.asarray(points, dtype=np.float32)
+    if points_array.size == 0:
+        points_array = points_array.reshape(0, 2)
+    if points_array.ndim != 2 or points_array.shape[1:] != (2,):
+        raise ValueError(
+            f"Interactive TCP points must have shape [N,2], got {points_array.shape}"
+        )
+    if len(points_array) >= len(ARM_NAMES):
+        return points_array.tolist()
+
+    click = np.asarray(click_index, dtype=np.float32)
+    if click.shape != (2,) or not np.isfinite(click).all():
+        raise ValueError(f"Invalid image click coordinate: {click_index!r}")
+    x, y = click.tolist()
+    if not (0 <= x < SOURCE_WIDTH and 0 <= y < SOURCE_HEIGHT):
+        raise ValueError(
+            f"Image click must lie inside {SOURCE_WIDTH}x{SOURCE_HEIGHT}, got {(x, y)}"
+        )
+    return [*points_array.tolist(), [x, y]]
+
+
+def render_query_overlay(
+    image: np.ndarray, points: list[list[float]]
+) -> np.ndarray:
+    """Draw the selected left/right TCP pixels without changing image size."""
+    image_array = np.asarray(image, dtype=np.uint8)
+    if image_array.shape != (SOURCE_HEIGHT, SOURCE_WIDTH, 3):
+        raise ValueError(
+            f"Expected an RGB image with shape {(SOURCE_HEIGHT, SOURCE_WIDTH, 3)}, "
+            f"got {image_array.shape}"
+        )
+    points_array = np.asarray(points, dtype=np.float32)
+    if points_array.size == 0:
+        return image_array.copy()
+    if points_array.ndim != 2 or points_array.shape[1:] != (2,):
+        raise ValueError(
+            f"Interactive TCP points must have shape [N,2], got {points_array.shape}"
+        )
+
+    canvas = Image.fromarray(image_array.copy())
+    draw = ImageDraw.Draw(canvas)
+    radius = 6
+    for arm_index, point in enumerate(points_array[: len(ARM_NAMES)]):
+        x, y = (int(round(float(value))) for value in point)
+        color = ARM_COLORS[arm_index]
+        draw.ellipse(
+            (x - radius, y - radius, x + radius, y + radius),
+            outline=color,
+            width=3,
+        )
+        draw.line((x - radius - 2, y, x + radius + 2, y), fill=color, width=2)
+        draw.line((x, y - radius - 2, x, y + radius + 2), fill=color, width=2)
+        label = "L" if arm_index == 0 else "R"
+        label_x = min(max(x + radius + 3, 1), SOURCE_WIDTH - 12)
+        label_y = min(max(y - radius - 7, 1), SOURCE_HEIGHT - 12)
+        draw.rectangle(
+            (label_x - 1, label_y - 1, label_x + 9, label_y + 10), fill=(0, 0, 0)
+        )
+        draw.text((label_x, label_y), label, fill=color)
+    return np.asarray(canvas, dtype=np.uint8)
+
+
+def _is_shared_alias_key(key: str) -> bool:
+    return re.fullmatch(
+        r"head\.scratch\.output_conv2_aux\.[1-3]\.2\.(weight|bias)", key
+    ) is not None
+
+
+def load_tcp_model(model_path: Path, device: torch.device):
+    model_path = model_path.expanduser()
+    if not model_path.is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {model_path}")
+    if model_path.suffix.lower() != ".safetensors":
+        raise ValueError(f"Expected a .safetensors checkpoint, got: {model_path}")
+
+    from safetensors import SafetensorError
+    from safetensors.torch import load_file
+
+    from arc.models.arc.arc import Arc
+
+    try:
+        saved_state = load_file(str(model_path), device="cpu")
+    except SafetensorError as error:
+        raise ValueError(f"Could not read checkpoint {model_path}: {error}") from error
+
+    state_dict: dict[str, torch.Tensor] = {}
+    for key, value in saved_state.items():
+        normalized_key = _remove_training_prefix(key)
+        if normalized_key in state_dict:
+            raise ValueError(
+                f"Duplicate checkpoint parameter after prefix removal: {normalized_key}"
+            )
+        state_dict[normalized_key] = value
+    del saved_state
+
+    tcp_prefixes = ("tcp_visual_query_encoder.", "tcp_track_head.")
+    if not all(any(key.startswith(prefix) for key in state_dict) for prefix in tcp_prefixes):
+        raise ValueError(
+            f"{model_path} is not an image-conditioned TCP checkpoint"
+        )
+    offset_key = "tcp_visual_query_encoder.offset_embedding"
+    window_tokens = int(state_dict[offset_key].shape[0])
+    window_size = math.isqrt(window_tokens)
+    if window_size * window_size != window_tokens:
+        raise ValueError(f"Invalid TCP query window token count: {window_tokens}")
+
+    model = Arc(tcp_query_window_size=window_size)
+    try:
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    except RuntimeError as error:
+        raise ValueError(f"Checkpoint tensor shapes are incompatible with Arc: {error}") from error
+    del state_dict
+    gc.collect()
+
+    incompatible_missing = [key for key in missing if not _is_shared_alias_key(key)]
+    if incompatible_missing or unexpected:
+        details = []
+        if incompatible_missing:
+            details.append(f"missing keys: {incompatible_missing[:12]}")
+        if unexpected:
+            details.append(f"unexpected keys: {unexpected[:12]}")
+        raise ValueError("Incompatible TCP checkpoint; " + "; ".join(details))
+    return model.to(device).eval()
+
+
+def matrix_to_rpy(rotation: np.ndarray) -> np.ndarray:
+    """Inverse of RoboTwin's Rz(yaw) @ Ry(pitch) @ Rx(roll) convention."""
+    rotation = np.asarray(rotation, dtype=np.float64)
+    if rotation.shape[-2:] != (3, 3):
+        raise ValueError(f"Expected rotation matrices [...,3,3], got {rotation.shape}")
+    horizontal = np.sqrt(rotation[..., 0, 0] ** 2 + rotation[..., 1, 0] ** 2)
+    singular = horizontal < 1e-7
+
+    roll = np.arctan2(rotation[..., 2, 1], rotation[..., 2, 2])
+    pitch = np.arctan2(-rotation[..., 2, 0], horizontal)
+    yaw = np.arctan2(rotation[..., 1, 0], rotation[..., 0, 0])
+    singular_roll = np.arctan2(-rotation[..., 1, 2], rotation[..., 1, 1])
+    roll = np.where(singular, singular_roll, roll)
+    yaw = np.where(singular, 0.0, yaw)
+    return np.stack((roll, pitch, yaw), axis=-1).astype(np.float32)
+
+
+def _run_tcp_model(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
+    """Run the shared model forward used by TCP-only and geometry inference."""
+    device_views = [
+        {**view, "img": view["img"].to(device, non_blocking=True)} for view in views
+    ]
+    padded_points = query_points + np.asarray([PAD_LEFT, PAD_TOP], dtype=np.float32)
+    query_tensor = torch.from_numpy(padded_points).unsqueeze(0).to(device)
+    autocast_context = (
+        contextlib.nullcontext()
+        if dtype == torch.float32
+        else torch.autocast(device_type=device.type, dtype=dtype)
+    )
+
+    try:
+        with torch.inference_mode():
+            with autocast_context:
+                predictions, profiling = model(
+                    device_views,
+                    profiling=True,
+                    force_no_output_conversion=True,
+                    inference_track=False,
+                    decode_camera=False,
+                    decode_motion=False,
+                    tcp_query_points=query_tensor,
+                    decode_tcp=True,
+                    return_aux_pyramid=False,
+                    ref_view_strategy="first",
+                )
+    except torch.cuda.OutOfMemoryError as error:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        raise RuntimeError(
+            f"CUDA ran out of memory while processing {len(views)} frames; "
+            "reduce the clip or sliding-window length"
+        ) from error
+    return predictions, profiling
+
+
+def _extract_tcp_predictions(
+    predictions: dict[str, torch.Tensor],
+) -> dict[str, np.ndarray]:
+    return {
+        "position": predictions["tcp_position"][0].detach().float().cpu().numpy(),
+        "rotation": predictions["tcp_rotation"][0].detach().float().cpu().numpy(),
+        "gripper": predictions["tcp_gripper_logit"][0]
+        .sigmoid()
+        .detach()
+        .float()
+        .cpu()
+        .numpy(),
+        "confidence": predictions["tcp_confidence"][0]
+        .detach()
+        .float()
+        .cpu()
+        .numpy(),
+    }
+
+
+def infer_tcp_trajectory(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Infer TCP state without camera recovery or point-cloud materialization."""
+    predictions, profiling = _run_tcp_model(
+        model, views, query_points, device, dtype
+    )
+    tcp = _extract_tcp_predictions(predictions)
+    del predictions
+    return tcp, profiling
+
+
+def infer_tcp_and_geometry(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    dict[str, np.ndarray],
+    np.ndarray,
+    dict[str, Any],
+]:
+    predictions, profiling = _run_tcp_model(
+        model, views, query_points, device, dtype
+    )
+    with torch.inference_mode():
+        height, width = predictions["depth"].shape[-2:]
+        model._process_ray_pose_estimation(predictions, height, width)
+        depth = predictions["depth"][0].detach().float().cpu().numpy()
+        confidence = predictions["depth_conf"][0].detach().float().cpu().numpy()
+        extrinsics = predictions["extrinsics"][0].detach().float().cpu().numpy()
+        intrinsics = predictions["intrinsics"][0].detach().float().cpu().numpy()
+        tcp = _extract_tcp_predictions(predictions)
+    del predictions
+
+    from arc.models.arc.utils.geometry import unproject_depth_map_to_point_map
+
+    world_points, _ = unproject_depth_map_to_point_map(
+        depth[..., None], extrinsics, intrinsics
+    )
+    return depth, world_points, confidence, tcp, extrinsics, profiling
+
+
+def infer_tcp_and_depth(
+    model,
+    views: list[dict[str, torch.Tensor]],
+    query_points: np.ndarray,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[dict[str, np.ndarray], np.ndarray, dict[str, Any]]:
+    """Extract TCP and padded metric depth from one forward, without pose recovery."""
+    predictions, profiling = _run_tcp_model(
+        model, views, query_points, device, dtype
+    )
+    tcp = _extract_tcp_predictions(predictions)
+    depth = predictions["depth"][0].detach().float().cpu().numpy()
+    del predictions
+    return tcp, depth, profiling
+
+
+def prepare_frame_point_clouds(
+    depth: np.ndarray,
+    world_points: np.ndarray,
+    confidence: np.ndarray,
+    colors: list[np.ndarray],
+    *,
+    max_points_per_frame: int,
+    seed: int = 0,
+) -> list[dict[str, np.ndarray]]:
+    """Crop padding and cache each frame's valid points sorted by confidence."""
+    if max_points_per_frame < 0:
+        raise ValueError("--max-points cannot be negative")
+    if not (
+        depth.shape == confidence.shape
+        and world_points.shape == depth.shape + (3,)
+        and len(colors) == depth.shape[0]
+    ):
+        raise ValueError("Depth, points, confidence, and RGB frame shapes do not match")
+
+    row_slice = slice(PAD_TOP, PAD_TOP + SOURCE_HEIGHT)
+    column_slice = slice(PAD_LEFT, PAD_LEFT + SOURCE_WIDTH)
+    frame_clouds: list[dict[str, np.ndarray]] = []
+    for frame_slot, color in enumerate(colors):
+        frame_depth = depth[frame_slot, row_slice, column_slice]
+        frame_points = world_points[frame_slot, row_slice, column_slice]
+        frame_confidence = confidence[frame_slot, row_slice, column_slice]
+        if color.shape != (SOURCE_HEIGHT, SOURCE_WIDTH, 3):
+            raise ValueError(
+                f"Unexpected RGB shape for frame slot {frame_slot}: {color.shape}"
+            )
+
+        valid = (
+            np.isfinite(frame_depth)
+            & (frame_depth > 0)
+            & np.isfinite(frame_confidence)
+            & np.isfinite(frame_points).all(axis=-1)
+        )
+        flat_indices = np.flatnonzero(valid.reshape(-1))
+        if not len(flat_indices):
+            raise ValueError(f"Frame slot {frame_slot} has no valid geometry")
+        if max_points_per_frame and len(flat_indices) > max_points_per_frame:
+            generator = np.random.default_rng(seed + frame_slot)
+            flat_indices = generator.choice(
+                flat_indices, size=max_points_per_frame, replace=False
+            )
+
+        points = frame_points.reshape(-1, 3)[flat_indices]
+        point_colors = color.reshape(-1, 3)[flat_indices]
+        point_confidence = frame_confidence.reshape(-1)[flat_indices]
+        order = np.argsort(point_confidence, kind="stable")[::-1]
+        frame_clouds.append(
+            {
+                "points": points[order].astype(np.float32, copy=False),
+                "colors": point_colors[order].astype(np.uint8, copy=False),
+                "confidence": point_confidence[order].astype(np.float32, copy=False),
+            }
+        )
+    return frame_clouds
+
+
+def _filtered_cloud(
+    frame_cloud: dict[str, np.ndarray],
+    confidence_percentile: float,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    if not 0.0 <= confidence_percentile <= 100.0:
+        raise ValueError("Confidence percentile must be in [0,100]")
+    total = len(frame_cloud["points"])
+    keep_count = max(
+        1, int(math.ceil(total * (100.0 - confidence_percentile) / 100.0))
+    )
+    threshold = float(frame_cloud["confidence"][keep_count - 1])
+    return (
+        frame_cloud["points"][:keep_count],
+        frame_cloud["colors"][:keep_count],
+        threshold,
+    )
+
+
+def _format_frame_panel(
+    tcp: dict[str, np.ndarray],
+    *,
+    frame_slot: int,
+    frame_index: int,
+    image_path: Path,
+    num_frames: int,
+    confidence_percentile: float,
+    visible_points: int,
+    confidence_threshold: float,
+) -> str:
+    rpy = matrix_to_rpy(tcp["rotation"][frame_slot])
+    lines = [
+        f"# Frame {frame_slot + 1}/{num_frames}",
+        f"- **Episode frame:** `{frame_index}`",
+        f"- **Image:** `{image_path.name}`",
+        (
+            f"- **Geometry:** `{visible_points:,}` points, top "
+            f"`{100.0 - confidence_percentile:.1f}%` "
+            f"(confidence ≥ `{confidence_threshold:.4f}`)"
+        ),
+    ]
+    for arm_index, arm_name in enumerate(ARM_NAMES):
+        xyz_text = ", ".join(
+            f"{value:+.4f}" for value in tcp["position"][frame_slot, arm_index]
+        )
+        rpy_text = ", ".join(f"{value:+.4f}" for value in rpy[arm_index])
+        lines.extend(
+            (
+                f"## {arm_name.title()} TCP",
+                f"- **xyz (m):** `{xyz_text}`",
+                f"- **rpy (rad):** `{rpy_text}`",
+                (
+                    f"- **gripper:** "
+                    f"`{tcp['gripper'][frame_slot, arm_index]:.4f}`"
+                ),
+                (
+                    f"- **confidence:** "
+                    f"`{tcp['confidence'][frame_slot, arm_index]:.4f}`"
+                ),
+            )
+        )
+    return "\n".join(lines)
+
+
+def compute_default_third_camera_view(
+    extrinsic_w2c: np.ndarray,
+    scene_center: np.ndarray,
+    scene_extent: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Place the viewer just behind an OpenCV camera, looking along its +Z axis."""
+    extrinsic = np.asarray(extrinsic_w2c, dtype=np.float64)
+    center = np.asarray(scene_center, dtype=np.float64)
+    if extrinsic.shape not in ((3, 4), (4, 4)):
+        raise ValueError(
+            f"Expected a [3,4] or [4,4] world-to-camera matrix, got {extrinsic.shape}"
+        )
+    if center.shape != (3,):
+        raise ValueError(f"Expected a scene center [3], got {center.shape}")
+    if not np.isfinite(extrinsic).all() or not np.isfinite(center).all():
+        raise ValueError("Camera extrinsic and scene center must be finite")
+    if not math.isfinite(scene_extent) or scene_extent <= 0:
+        raise ValueError("Scene extent must be finite and positive")
+
+    rotation_w2c = extrinsic[:3, :3]
+    translation_w2c = extrinsic[:3, 3]
+    rotation_c2w = rotation_w2c.T
+    camera_center = -rotation_c2w @ translation_w2c
+    forward = rotation_c2w[:, 2]
+    up = -rotation_c2w[:, 1]
+    forward_norm = np.linalg.norm(forward)
+    up_norm = np.linalg.norm(up)
+    if forward_norm < 1e-8 or up_norm < 1e-8:
+        raise ValueError("Camera extrinsic has a degenerate rotation")
+    forward /= forward_norm
+    up /= up_norm
+
+    backoff = float(np.clip(scene_extent * 0.15, 0.05, 0.25))
+    target_distance = float(np.dot(center - camera_center, forward))
+    target_distance = max(target_distance, scene_extent * 0.5, 0.1)
+    viewer_position = camera_center - forward * backoff
+    look_at = camera_center + forward * target_distance
+    return (
+        viewer_position.astype(np.float32),
+        look_at.astype(np.float32),
+        up.astype(np.float32),
+    )
+
+
+def start_visualization(
+    frame_clouds: list[dict[str, np.ndarray]],
+    tcp: dict[str, np.ndarray],
+    frame_indices: list[int],
+    image_paths: list[Path],
+    *,
+    host: str,
+    port: int,
+    point_size: float,
+    confidence_percentile: float,
+    reference_extrinsic_w2c: np.ndarray | None = None,
+):
+    try:
+        import viser
+        import viser.transforms as tf
+    except ImportError as error:
+        raise ImportError(
+            "viser is required for visualization; install requirements.txt"
+        ) from error
+
+    num_frames = len(frame_clouds)
+    if not (
+        num_frames
+        == len(frame_indices)
+        == len(image_paths)
+        == tcp["position"].shape[0]
+        == tcp["rotation"].shape[0]
+        == tcp["gripper"].shape[0]
+        == tcp["confidence"].shape[0]
+    ):
+        raise ValueError("Geometry, TCP, image, and frame-index lengths do not match")
+
+    bounds_samples: list[np.ndarray] = []
+    for frame_cloud in frame_clouds:
+        high_confidence_count = max(1, int(len(frame_cloud["points"]) * 0.95))
+        high_confidence_points = frame_cloud["points"][:high_confidence_count]
+        sample_step = max(1, len(high_confidence_points) // 10_000)
+        bounds_samples.append(high_confidence_points[::sample_step])
+    bounds_samples.append(tcp["position"].reshape(-1, 3))
+    bounds_points = np.concatenate(bounds_samples, axis=0)
+    bounds_min = np.percentile(bounds_points, 1.0, axis=0)
+    bounds_max = np.percentile(bounds_points, 99.0, axis=0)
+    center = (bounds_min + bounds_max) * 0.5
+    extent = max(float(np.max(bounds_max - bounds_min)), 0.1)
+    marker_scale = float(np.clip(extent * 0.08, 0.025, 0.12))
+    tcp_axes_length = marker_scale * 0.55
+    axes_radius = marker_scale * 0.018
+    origin_radius = marker_scale * 0.05
+
+    default_camera_position = center + extent * np.array(
+        [0.0, 0.0, -1.2], dtype=np.float32
+    )
+    default_camera_look_at = center
+    default_camera_up = np.array([0.0, -1.0, 0.0], dtype=np.float32)
+    if reference_extrinsic_w2c is not None:
+        try:
+            (
+                default_camera_position,
+                default_camera_look_at,
+                default_camera_up,
+            ) = compute_default_third_camera_view(
+                reference_extrinsic_w2c, center, extent
+            )
+        except ValueError as error:
+            print(
+                "Warning: could not initialize behind the third camera; "
+                f"using the scene fallback view: {error}"
+            )
+
+    server = viser.ViserServer(host=host, port=port)
+    server.gui.set_panel_label("Geometry + TCP")
+    server.gui.configure_theme(
+        control_layout="floating", control_width="large", show_logo=False
+    )
+    server.scene.set_up_direction(tuple(default_camera_up.tolist()))
+    world_axes = server.scene.world_axes
+    world_axes.axes_length = tcp_axes_length * 2.0
+    world_axes.axes_radius = axes_radius
+    world_axes.origin_radius = origin_radius
+    world_axes.visible = True
+
+    with server.gui.add_folder("Playback", expand_by_default=True):
+        gui_frame = server.gui.add_slider(
+            "Frame",
+            min=0,
+            max=num_frames - 1,
+            step=1,
+            initial_value=0,
+        )
+        gui_previous = server.gui.add_button("Previous")
+        gui_next = server.gui.add_button("Next")
+        gui_playing = server.gui.add_checkbox("Play", False)
+        gui_fps = server.gui.add_slider(
+            "FPS", min=0.25, max=30.0, step=0.25, initial_value=5.0
+        )
+
+    with server.gui.add_folder("Geometry", expand_by_default=True):
+        gui_confidence = server.gui.add_slider(
+            "Confidence percentile",
+            min=0.0,
+            max=99.0,
+            step=0.5,
+            initial_value=float(confidence_percentile),
+        )
+        gui_point_size = server.gui.add_slider(
+            "Point size",
+            min=1e-5,
+            max=0.01,
+            step=1e-5,
+            initial_value=point_size,
+        )
+        gui_show_points = server.gui.add_checkbox("Show point cloud", True)
+
+    with server.gui.add_folder("TCP", expand_by_default=True):
+        gui_show_tcp = server.gui.add_checkbox("Show TCP spheres + axes", True)
+        gui_show_labels = server.gui.add_checkbox("Show TCP labels", True)
+
+    initial_points, _, initial_threshold = _filtered_cloud(
+        frame_clouds[0], confidence_percentile
+    )
+    gui_info = server.gui.add_markdown(
+        _format_frame_panel(
+            tcp,
+            frame_slot=0,
+            frame_index=frame_indices[0],
+            image_path=image_paths[0],
+            num_frames=num_frames,
+            confidence_percentile=confidence_percentile,
+            visible_points=len(initial_points),
+            confidence_threshold=initial_threshold,
+        )
+    )
+
+    frame_handles: list[dict[str, Any]] = []
+    for frame_slot, frame_cloud in enumerate(frame_clouds):
+        filtered_points, filtered_colors, _ = _filtered_cloud(
+            frame_cloud, confidence_percentile
+        )
+        root_node = server.scene.add_frame(
+            f"/frames/t{frame_slot}", show_axes=False, visible=frame_slot == 0
+        )
+        point_node = server.scene.add_point_cloud(
+            f"/frames/t{frame_slot}/geometry",
+            points=filtered_points,
+            colors=filtered_colors,
+            point_size=point_size,
+            point_shape="rounded",
+            visible=frame_slot == 0,
+        )
+
+        tcp_frames = []
+        tcp_spheres = []
+        tcp_labels = []
+        for arm_index, (arm_name, arm_color) in enumerate(
+            zip(ARM_NAMES, ARM_COLORS)
+        ):
+            quaternion = tf.SO3.from_matrix(
+                tcp["rotation"][frame_slot, arm_index]
+            ).wxyz
+            tcp_frame = server.scene.add_frame(
+                f"/frames/t{frame_slot}/tcp/{arm_name}",
+                wxyz=quaternion,
+                position=tcp["position"][frame_slot, arm_index],
+                axes_length=tcp_axes_length,
+                axes_radius=axes_radius,
+                origin_radius=origin_radius,
+                origin_color=arm_color,
+                visible=frame_slot == 0,
+            )
+            tcp_sphere = server.scene.add_icosphere(
+                f"/frames/t{frame_slot}/tcp/{arm_name}/xyz",
+                radius=marker_scale * 0.11,
+                color=arm_color,
+                position=(0.0, 0.0, 0.0),
+                visible=frame_slot == 0,
+            )
+            tcp_label = server.scene.add_label(
+                f"/frames/t{frame_slot}/tcp/{arm_name}/label",
+                text=(
+                    f"{arm_name}: "
+                    f"gripper={tcp['gripper'][frame_slot, arm_index]:.3f}"
+                ),
+                position=(0.0, 0.0, marker_scale * 1.25),
+                anchor="bottom-center",
+                visible=frame_slot == 0,
+            )
+            tcp_frames.append(tcp_frame)
+            tcp_spheres.append(tcp_sphere)
+            tcp_labels.append(tcp_label)
+
+        frame_handles.append(
+            {
+                "root": root_node,
+                "points": point_node,
+                "tcp_frames": tcp_frames,
+                "tcp_spheres": tcp_spheres,
+                "tcp_labels": tcp_labels,
+                "filter_percentile": float(confidence_percentile),
+            }
+        )
+
+    def _apply_confidence_filter(frame_slot: int) -> tuple[int, float]:
+        frame_handle = frame_handles[frame_slot]
+        percentile = float(gui_confidence.value)
+        points, colors, threshold = _filtered_cloud(
+            frame_clouds[frame_slot], percentile
+        )
+        if frame_handle["filter_percentile"] != percentile:
+            frame_handle["points"].points = points
+            frame_handle["points"].colors = colors
+            frame_handle["filter_percentile"] = percentile
+        return len(points), threshold
+
+    def _update_panel(frame_slot: int, visible_points: int, threshold: float) -> None:
+        gui_info.content = _format_frame_panel(
+            tcp,
+            frame_slot=frame_slot,
+            frame_index=frame_indices[frame_slot],
+            image_path=image_paths[frame_slot],
+            num_frames=num_frames,
+            confidence_percentile=float(gui_confidence.value),
+            visible_points=visible_points,
+            confidence_threshold=threshold,
+        )
+
+    def _update_visibility() -> None:
+        current = int(gui_frame.value)
+        with server.atomic():
+            for frame_slot, handles in enumerate(frame_handles):
+                active = frame_slot == current
+                handles["root"].visible = active
+                handles["points"].visible = active and bool(gui_show_points.value)
+                for tcp_frame, tcp_sphere, tcp_label in zip(
+                    handles["tcp_frames"],
+                    handles["tcp_spheres"],
+                    handles["tcp_labels"],
+                ):
+                    tcp_frame.visible = active and bool(gui_show_tcp.value)
+                    tcp_sphere.visible = active and bool(gui_show_tcp.value)
+                    tcp_label.visible = (
+                        active
+                        and bool(gui_show_tcp.value)
+                        and bool(gui_show_labels.value)
+                    )
+        server.flush()
+
+    @gui_previous.on_click
+    def _previous_frame(_) -> None:
+        gui_frame.value = (int(gui_frame.value) - 1) % num_frames
+
+    @gui_next.on_click
+    def _next_frame(_) -> None:
+        gui_frame.value = (int(gui_frame.value) + 1) % num_frames
+
+    @gui_playing.on_update
+    def _toggle_playing(_) -> None:
+        playing = bool(gui_playing.value)
+        gui_frame.disabled = playing
+        gui_previous.disabled = playing
+        gui_next.disabled = playing
+
+    @gui_frame.on_update
+    def _select_frame(_) -> None:
+        current = int(gui_frame.value)
+        visible_points, threshold = _apply_confidence_filter(current)
+        _update_panel(current, visible_points, threshold)
+        _update_visibility()
+
+    @gui_confidence.on_update
+    def _change_confidence(_) -> None:
+        current = int(gui_frame.value)
+        visible_points, threshold = _apply_confidence_filter(current)
+        _update_panel(current, visible_points, threshold)
+        server.flush()
+
+    @gui_point_size.on_update
+    def _change_point_size(_) -> None:
+        with server.atomic():
+            for handles in frame_handles:
+                handles["points"].point_size = float(gui_point_size.value)
+        server.flush()
+
+    @gui_show_points.on_update
+    def _toggle_points(_) -> None:
+        _update_visibility()
+
+    @gui_show_tcp.on_update
+    def _toggle_tcp(_) -> None:
+        _update_visibility()
+
+    @gui_show_labels.on_update
+    def _toggle_labels(_) -> None:
+        _update_visibility()
+
+    @server.on_client_connect
+    def _set_initial_camera(client: viser.ClientHandle) -> None:
+        with client.atomic():
+            client.camera.position = tuple(default_camera_position.tolist())
+            client.camera.look_at = tuple(default_camera_look_at.tolist())
+            client.camera.up_direction = tuple(default_camera_up.tolist())
+        client.flush()
+
+    playback_stop_event = threading.Event()
+    setattr(server, "_tcp_playback_stop_event", playback_stop_event)
+
+    def _playback_loop() -> None:
+        while not playback_stop_event.is_set():
+            if bool(gui_playing.value):
+                gui_frame.value = (int(gui_frame.value) + 1) % num_frames
+            playback_stop_event.wait(timeout=1.0 / float(gui_fps.value))
+
+    playback_thread = threading.Thread(target=_playback_loop, daemon=True)
+    playback_thread.start()
+    _update_visibility()
+    return server
+
+
+def stop_visualization(server: Any | None) -> None:
+    """Stop a TCP viser server and its playback worker."""
+    if server is None:
+        return
+    stop_event = getattr(server, "_tcp_playback_stop_event", None)
+    if stop_event is not None:
+        stop_event.set()
+    server.stop()
 
 
 @dataclass(slots=True)
@@ -93,18 +1253,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        required=True,
+        default=DEFAULT_INPUT,
+        required=DEFAULT_INPUT is None,
         help="Complete RoboTwin episode directory",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        required=True,
-        help="Destination JSON trajectory",
+        default=DEFAULT_OUTPUT,
+        help=(
+            f"Destination JSON trajectory; defaults to <input>/{DEFAULT_OUTPUT_FILENAME} "
+            "(replaces an existing file)"
+        ),
     )
     parser.add_argument(
         "--view",
-        default="third_views",
+        default=DEFAULT_VIEW,
         help="Image view below the episode's images directory",
     )
     parser.add_argument(
@@ -134,63 +1298,78 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--window-size",
         type=int,
-        default=9,
+        default=DEFAULT_WINDOW_SIZE,
         help="Frames per window; neighboring windows overlap by one frame",
     )
     parser.add_argument(
         "--boundary-merge",
         choices=BOUNDARY_POLICIES,
-        default="previous",
+        default=DEFAULT_BOUNDARY_MERGE,
         help="Which TCP prediction to emit for shared boundary frames",
     )
     parser.add_argument(
         "--device",
-        default="auto",
+        default=DEFAULT_DEVICE,
         help="Torch device such as cuda, cuda:0, or cpu",
     )
     parser.add_argument(
         "--dtype",
         choices=("auto", "float32", "float16", "bfloat16"),
-        default="auto",
+        default=DEFAULT_DTYPE,
         help="Inference autocast dtype",
     )
     parser.add_argument(
         "--visualize",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VISUALIZE,
         help="Start Viser after non-interactive JSON inference",
     )
     parser.add_argument(
         "--confidence-percentile",
         type=float,
-        default=2.5,
+        default=DEFAULT_CONFIDENCE_PERCENTILE,
         help="Initial per-frame point-cloud confidence percentile",
     )
     parser.add_argument(
         "--max-points",
         type=int,
-        default=100_000,
+        default=DEFAULT_MAX_POINTS,
         help="Randomly retain at most this many points per frame; 0 keeps all",
     )
     parser.add_argument(
         "--point-size",
         type=float,
-        default=0.0016,
+        default=DEFAULT_POINT_SIZE,
         help="Viser point size in world units",
     )
-    parser.add_argument("--host", default="127.0.0.1", help="Viser bind address")
-    parser.add_argument("--port", type=int, default=8020, help="Viser port")
+    parser.add_argument("--host", default=DEFAULT_HOST, help="Viser bind address")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Viser port")
     parser.add_argument(
         "--ui-host",
-        default="127.0.0.1",
+        default=DEFAULT_UI_HOST,
         help="Interactive selection-page bind address",
     )
     parser.add_argument(
         "--ui-port",
         type=int,
-        default=7860,
+        default=DEFAULT_UI_PORT,
         help="Interactive selection-page port",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.output is None:
+        args.output = args.input.expanduser() / DEFAULT_OUTPUT_FILENAME
+    # 显式 CLI 选点方式优先于顶部默认配置，避免互斥选项的默认值冲突。
+    if not (args.interactive or args.tcp_query_points is not None or args.tcp_query_points_file is not None):
+        configured = sum((DEFAULT_INTERACTIVE, DEFAULT_TCP_QUERY_POINTS is not None,
+                          DEFAULT_TCP_QUERY_POINTS_FILE is not None))
+        if configured > 1:
+            parser.error("顶部首帧选点配置最多只能启用一项")
+        args.interactive = DEFAULT_INTERACTIVE
+        args.tcp_query_points = DEFAULT_TCP_QUERY_POINTS
+        args.tcp_query_points_file = DEFAULT_TCP_QUERY_POINTS_FILE
+    if not 0.0 <= GRIPPER_OPEN_THRESHOLD <= 1.0:
+        parser.error("GRIPPER_OPEN_THRESHOLD 必须在 [0,1] 内")
+    return args
 
 
 def build_sliding_windows(
@@ -558,7 +1737,7 @@ def build_json_result(
                 "rpy_rad": rpy[frame_slot, arm_index].tolist(),
                 "rpy_deg": np.rad2deg(rpy[frame_slot, arm_index]).tolist(),
                 "gripper_probability": gripper_probability,
-                "gripper_open": gripper_probability >= 0.5,
+                "gripper_open": gripper_probability >= GRIPPER_OPEN_THRESHOLD,
                 "confidence": float(
                     prediction.tcp["confidence"][frame_slot, arm_index]
                 ),
@@ -586,7 +1765,7 @@ def build_json_result(
         "rpy_convention": RPY_CONVENTION,
         "gripper": {
             "prediction": "probability",
-            "binary_threshold": 0.5,
+            "binary_threshold": GRIPPER_OPEN_THRESHOLD,
         },
         "windowing": {
             "window_size": window_size,
