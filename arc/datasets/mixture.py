@@ -129,9 +129,9 @@ def _validate_adapter(source: DatasetSource) -> None:
         ("tcp_position_mean", dataset.tcp_position_mean),
         ("tcp_position_std", dataset.tcp_position_std),
     ):
-        if not isinstance(value, torch.Tensor) or value.shape != (2, 3):
+        if not isinstance(value, torch.Tensor) or value.shape != (getattr(dataset, "num_arms", 2), 3):
             raise ValueError(
-                f"Dataset source {source.name!r} {label} must have shape [2,3]"
+                f"Dataset source {source.name!r} {label} must have shape [num_arms,3]"
             )
         if not torch.isfinite(value).all():
             raise ValueError(
@@ -170,6 +170,9 @@ def validate_training_sample(sample: Mapping[str, Any], source_name: str) -> Non
             f"Dataset source {source_name!r} images must have shape [S,3,H,W]"
         )
     sequence, _, height, width = images.shape
+    arms = sample["tcp_query_points"].shape[0]
+    if arms not in (1, 2):
+        raise ValueError("Training samples must contain one or two arms")
     if height % 14 or width % 14:
         raise ValueError(
             f"Dataset source {source_name!r} image size {height}x{width} is not "
@@ -181,9 +184,9 @@ def validate_training_sample(sample: Mapping[str, Any], source_name: str) -> Non
         "original_mask": (sequence, height, width),
         "intrinsics": (sequence, 3, 3),
         "frame_times": (sequence,),
-        "tcp_state": (sequence, 2, 7),
-        "tcp_query_points": (2, 2),
-        "tcp_query_valid": (2,),
+        "tcp_state": (sequence, arms, 7),
+        "tcp_query_points": (arms, 2),
+        "tcp_query_valid": (arms,),
         "source_size": (2,),
         "padding": (4,),
     }
@@ -226,6 +229,8 @@ class WeightedDatasetMixture(Dataset[dict[str, Any]]):
 
         for source in self.sources:
             _validate_adapter(source)
+        if len({getattr(source.dataset, "num_arms", 2) for source in self.sources}) != 1:
+            raise ValueError("All sources in a mixture must use the same number of arms")
 
         positive_sources = np.flatnonzero(self.weights > 0)
         if len(positive_sources) == 1:
@@ -601,3 +606,13 @@ def build_training_dataset(config: Mapping[str, Any]) -> WeightedDatasetMixture:
 
 
 register_dataset_adapter("robotwin", _build_robotwin_adapter)
+
+
+def _build_droid_adapter(spec, config):
+    # Keep SQLite/DROID imports lazy for existing RoboTwin users.
+    from .droid import _adapter
+
+    return _adapter(spec, config)
+
+
+register_dataset_adapter("droid", _build_droid_adapter)

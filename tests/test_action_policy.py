@@ -163,7 +163,7 @@ def test_stage2_checkpoint_resume_and_evaluation(tmp_path, monkeypatch, accumula
     torch.save(arc.state_dict(), stage1)
     config = {k: v for k, v in runpy.run_path("configs/train/4rc-stage2-action.py").items() if not k.startswith("_")}
     config.update(
-        stage1_checkpoint=str(stage1), output_dir=str(tmp_path / "full"),
+        stage1_checkpoint=str(stage1), output_dir=str(tmp_path / "full"), batch_size=1,
         action_dim=32, action_depth=2, action_heads=4, mixed_precision="no",
         max_train_steps=2, num_train_epochs=num_train_epochs, gradient_accumulation_steps=accumulation,
         batches_per_epoch=2 * accumulation, warmup_steps=0, num_workers=0, report_to=[],

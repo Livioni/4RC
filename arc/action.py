@@ -21,7 +21,7 @@ def future_actions_in_current_camera(
     future_w2c: torch.Tensor,
     current_w2c: torch.Tensor,
 ) -> torch.Tensor:
-    """Convert [N,2,7] measured TCP states into [N,2,10] action targets."""
+    """Convert [N,A,7] measured TCP states into [N,A,10] action targets."""
     state = state.float()
     current_w2c = current_w2c.to(device=state.device, dtype=torch.float32)
     future_w2c = future_w2c.to(device=state.device, dtype=torch.float32)
@@ -41,7 +41,7 @@ def project_tcp(
     image_width: int,
     padding: tuple[int, int, int, int] = (1, 1, 6, 6),
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Project [...,2,3] TCPs using matching [...,3,3] padded-image intrinsics.
+    """Project [...,A,3] TCPs using matching [...,3,3] padded-image intrinsics.
 
     Invalid centres are masked, never clamped onto visible image borders.
     """
@@ -88,4 +88,3 @@ def sinusoidal(value: torch.Tensor, dim: int) -> torch.Tensor:
     )
     phase = value.float()[..., None] * freq
     return torch.cat((phase.sin(), phase.cos()), dim=-1)
-

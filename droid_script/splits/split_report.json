@@ -1,0 +1,9 @@
+{
+  "fps": 15,
+  "seed": 42,
+  "validation_fraction": 0.1,
+  "split_mode": "existing_txt",
+  "train_episodes": 30629,
+  "val_episodes": 3337,
+  "excluded": []
+}

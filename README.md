@@ -126,6 +126,11 @@ with torch.no_grad():
 
 ## Geometry and TCP training on RoboTwin
 
+For DROID monocular single-arm training with absolute robot-base camera supervision,
+see [the standalone Chinese DROID guide](droid_script/README_DROID_TRAIN_CN.md).
+Its two configurations are `configs/train/4rc-stage1-droid.py` and
+`configs/train/4rc-stage2-droid.py`; training entrypoints and shared episode split TXT files live in `droid_script/`.
+
 The training path jointly optimizes metric geometry and image-conditioned
 dual-arm TCP tracking. RGB clips use `third_views`, while `[xyz, rpy, gripper]`
 supervision is loaded from `TCP_third`. First-frame TCP positions are projected

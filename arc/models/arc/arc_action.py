@@ -56,17 +56,18 @@ class ScalarTimeEncoder(nn.Module):
 class TCPHistoryPool(nn.Module):
     """One centre-query attention pool per frame and arm; no temporal pooling."""
 
-    def __init__(self, input_dim: int = 1536, dim: int = 512, heads: int = 8):
+    def __init__(self, input_dim: int = 1536, dim: int = 512, heads: int = 8, num_arms: int = 2):
         super().__init__()
         if dim % 4 or dim % heads:
             raise ValueError("History dimension must be divisible by 4 and heads")
         self.dim = dim
+        self.num_arms = num_arms
         self.projection = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, dim))
         self.pool_norm = nn.LayerNorm(dim)
         self.pool = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=0.0)
         self.pooled_norm = nn.LayerNorm(dim)
         self.xy_projection = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
-        self.arm_embedding = nn.Embedding(2, dim)
+        self.arm_embedding = nn.Embedding(num_arms, dim)
         self.valid_embedding = nn.Embedding(2, dim)
         self.missing_token = nn.Parameter(torch.zeros(dim))
         self.output_norm = nn.LayerNorm(dim)
@@ -77,11 +78,11 @@ class TCPHistoryPool(nn.Module):
         *, image_height: int, image_width: int,
     ) -> torch.Tensor:
         batch, frames = patches.shape[:2]
-        values = self.projection(patches).reshape(batch * frames * 2, 9, self.dim)
+        values = self.projection(patches).reshape(batch * frames * self.num_arms, 9, self.dim)
         centre = values[:, 4:5]
         normalized = self.pool_norm(values)
         pooled, _ = self.pool(normalized[:, 4:5], normalized, normalized, need_weights=False)
-        pooled = self.pooled_norm(centre + pooled).reshape(batch, frames, 2, self.dim)
+        pooled = self.pooled_norm(centre + pooled).reshape(batch, frames, self.num_arms, self.dim)
         pooled = torch.where(valid[..., None], pooled, self.missing_token.to(pooled))
         xy = torch.nan_to_num(centres.float())
         xy = torch.where(valid[..., None], xy, torch.zeros_like(xy))
@@ -140,14 +141,14 @@ class ActionDiTBlock(nn.Module):
 
 
 class TCPActionDiT(nn.Module):
-    def __init__(self, dim: int = 512, depth: int = 8, heads: int = 8):
+    def __init__(self, dim: int = 512, depth: int = 8, heads: int = 8, num_arms: int = 2):
         super().__init__()
-        self.action_projection = nn.Linear(20, dim)
+        self.action_projection = nn.Linear(10 * num_arms, dim)
         self.flow_time = ScalarTimeEncoder(dim)
         self.blocks = nn.ModuleList([ActionDiTBlock(dim, heads) for _ in range(depth)])
         self.output_norm = nn.LayerNorm(dim, elementwise_affine=False)
         self.output_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
-        self.output_projection = nn.Linear(dim, 20)
+        self.output_projection = nn.Linear(dim, 10 * num_arms)
         nn.init.zeros_(self.output_modulation[-1].weight)
         nn.init.zeros_(self.output_modulation[-1].bias)
         nn.init.zeros_(self.output_projection.weight)
@@ -193,7 +194,7 @@ class TCPActionPolicy(nn.Module):
         self, arc: nn.Module, *, language_encoder: nn.Module | None = None,
         t5_model: str = "google-t5/t5-base", text_max_length: int = 128,
         dim: int = 512, depth: int = 8, heads: int = 8, prediction_horizon: int = 16,
-        time_unit_seconds: float = 1 / 15, padding=(1, 1, 6, 6),
+        time_unit_seconds: float = 1 / 15, padding=(1, 1, 6, 6), decode_camera: bool = False,
     ):
         super().__init__()
         if prediction_horizon < 1 or time_unit_seconds <= 0:
@@ -201,6 +202,8 @@ class TCPActionPolicy(nn.Module):
         if arc.tcp_visual_query_encoder.window_size != 3:
             raise ValueError("Stage two requires a 3x3 TCP query window")
         self.arc = arc
+        self.num_arms = getattr(arc.tcp_visual_query_encoder, "num_arms", 2)
+        self.decode_camera = decode_camera
         self.language_encoder = language_encoder if language_encoder is not None else FrozenT5Encoder(
             t5_model, text_max_length,
         )
@@ -210,15 +213,15 @@ class TCPActionPolicy(nn.Module):
             nn.LayerNorm(self.language_encoder.output_dim),
             nn.Linear(self.language_encoder.output_dim, dim),
         )
-        self.history_pool = TCPHistoryPool(arc.tcp_visual_query_encoder.embed_dim, dim, heads)
+        self.history_pool = TCPHistoryPool(arc.tcp_visual_query_encoder.embed_dim, dim, heads, self.num_arms)
         self.physical_time = ScalarTimeEncoder(dim)
         self.token_type = nn.Embedding(2, dim)
-        self.dit = TCPActionDiT(dim, depth, heads)
+        self.dit = TCPActionDiT(dim, depth, heads, self.num_arms)
         self.prediction_horizon = prediction_horizon
         self.time_unit_seconds = time_unit_seconds
         self.padding = tuple(padding)
-        self.register_buffer("action_position_mean", torch.zeros(2, 3))
-        self.register_buffer("action_position_std", torch.ones(2, 3))
+        self.register_buffer("action_position_mean", torch.zeros(self.num_arms, 3))
+        self.register_buffer("action_position_std", torch.ones(self.num_arms, 3))
 
     def train(self, mode=True):
         super().train(mode)
@@ -226,8 +229,8 @@ class TCPActionPolicy(nn.Module):
         return self
 
     def set_action_position_stats(self, mean, std):
-        if mean.shape != (2, 3) or std.shape != (2, 3):
-            raise ValueError("Action position statistics must be [2,3]")
+        if mean.shape != (self.num_arms, 3) or std.shape != (self.num_arms, 3):
+            raise ValueError(f"Action position statistics must be [{self.num_arms},3]")
         if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
             raise ValueError("Action statistics must be finite with positive standard deviations")
         self.action_position_mean.copy_(mean.to(self.action_position_mean))
@@ -239,16 +242,16 @@ class TCPActionPolicy(nn.Module):
         return value.flatten(-2)
 
     def denormalize_actions(self, actions):
-        value = actions.float().reshape(*actions.shape[:2], 2, 10).clone()
+        value = actions.float().reshape(*actions.shape[:2], self.num_arms, 10).clone()
         value[..., :3] = value[..., :3] * self.action_position_std + self.action_position_mean
         return value
 
     def reconstruct(self, images, initial_query_points):
-        if images.ndim != 5 or initial_query_points.shape != (images.shape[0], 2, 2):
-            raise ValueError("Expected images [B,K,3,H,W] and initial TCP points [B,2,2]")
+        if images.ndim != 5 or initial_query_points.shape != (images.shape[0], self.num_arms, 2):
+            raise ValueError(f"Expected images [B,K,3,H,W] and initial TCP points [B,{self.num_arms},2]")
         prediction = self.arc(
             [{"img": frame} for frame in images.unbind(1)],
-            inference_track=False, decode_camera=False, decode_motion=False,
+            inference_track=False, decode_camera=self.decode_camera, decode_motion=False,
             decode_tcp=True, tcp_query_points=initial_query_points,
             return_aux_pyramid=False, return_backbone_features=True,
             force_no_output_conversion=True, ref_view_strategy="first",
@@ -286,7 +289,7 @@ class TCPActionPolicy(nn.Module):
             patches.flatten(0, 1), centres.flatten(0, 1),
             image_height=height, image_width=width,
         )
-        sampled = sampled.reshape(batch, frames, 2, 9, channels)
+        sampled = sampled.reshape(batch, frames, self.num_arms, 9, channels)
         relative = (frame_times - frame_times[:, -1:]) / self.time_unit_seconds
         history = self.history_pool(
             sampled, centres, valid, self.physical_time(relative), self.token_type.weight[0],
@@ -361,7 +364,7 @@ class TCPActionPolicy(nn.Module):
             raise ValueError("Sampling steps must be positive")
         batch = condition.history.shape[0]
         actions = torch.randn(
-            batch, self.prediction_horizon, 20, device=condition.history.device,
+            batch, self.prediction_horizon, self.num_arms * 10, device=condition.history.device,
             dtype=torch.float32, generator=generator,
         )
         for index in range(steps):
@@ -380,6 +383,7 @@ class TCPActionPolicy(nn.Module):
             "action_position": position.masked_fill(~success[:, None, None, None], float("nan")),
             "action_rotation": rotation.masked_fill(~success[:, None, None, None, None], float("nan")),
             "action_gripper": gripper.masked_fill(~success[:, None, None], -1),
+            "action_gripper_open": ((value[..., 9] + 1) / 2).clamp(0, 1).masked_fill(~success[:, None, None], float("nan")),
             "action_gripper_score": value[..., 9].masked_fill(~success[:, None, None], float("nan")),
             "future_frame_times": condition.future_frame_times,
         }
@@ -405,4 +409,3 @@ class TCPActionPolicy(nn.Module):
             images, intrinsics, frame_times, future_times, instructions, reconstruction, features,
         )
         return self.sample_condition(condition, steps=steps, generator=generator)
-

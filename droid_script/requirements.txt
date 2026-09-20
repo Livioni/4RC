@@ -1,0 +1,17 @@
+# DROID training/test dependencies. Install torch 2.8.0 + torchvision 0.23.0
+# separately from the appropriate CUDA (or CPU) PyTorch index.
+numpy>=1.26,<3
+pillow>=10
+addict==2.4.0
+einops>=0.8,<0.9
+accelerate==1.10.1
+transformers==4.55.4
+huggingface-hub>=0.34,<1
+sentencepiece>=0.2
+safetensors>=0.5
+opencv-python-headless>=4.8,<6
+pillow-heif
+matplotlib
+tensorboard
+wandb
+pytest>=8

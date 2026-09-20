@@ -1,0 +1,59 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "DROID: Stage 1",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/droid_script/train_4rc_stage1.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}"
+            },
+            "args": [
+                "--config",
+                "${workspaceFolder}/configs/train/4rc-stage1-droid.py",
+                "--num-workers",
+                "0",
+                "--max-episodes",
+                "8",
+                "--max-train-steps",
+                "2",
+                "--output-dir",
+                "${workspaceFolder}/outputs/droid/stage1_debug"
+            ]
+        },
+        {
+            "name": "DROID: Stage 2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/droid_script/train_4rc_stage2.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}"
+            },
+            "args": [
+                "--config",
+                "${workspaceFolder}/configs/train/4rc-stage2-droid.py",
+                "--stage1-checkpoint",
+                "${workspaceFolder}/droid_script/outputs/stage1_debug/final_checkpoint",
+                "--num-workers",
+                "0",
+                "--max-episodes",
+                "8",
+                "--max-train-steps",
+                "2",
+                "--batch-size",
+                "1",
+                "--validation-batches",
+                "1",
+                "--output-dir",
+                "${workspaceFolder}/outputs/droid/stage2_debug"
+            ]
+        }
+    ]
+}

@@ -10,7 +10,7 @@ from arc.rotation import rotation_6d_to_matrix
 
 
 class TCPVisualQueryEncoder(nn.Module):
-    """Sample local first-frame patch features around two TCP image points."""
+    """Sample local first-frame patch features around one or two TCP points."""
 
     NUM_ARMS = 2
 
@@ -20,8 +20,12 @@ class TCPVisualQueryEncoder(nn.Module):
         patch_size: int = 14,
         window_size: int = 3,
         adapter_dim: int = 256,
+        num_arms: int = 2,
     ) -> None:
         super().__init__()
+        if num_arms not in (1, 2):
+            raise ValueError("num_arms must be 1 or 2")
+        self.num_arms = self.NUM_ARMS = num_arms
         if window_size < 1 or window_size % 2 != 1:
             raise ValueError("window_size must be a positive odd integer")
         self.embed_dim = embed_dim
@@ -116,7 +120,7 @@ class TCPVisualQueryEncoder(nn.Module):
 
 
 class TCPTrackHead(nn.Module):
-    """Pool local motion tokens and regress absolute dual-arm TCP trajectories."""
+    """Pool local motion tokens and regress absolute per-arm TCP trajectories."""
 
     NUM_ARMS = 2
 
@@ -125,8 +129,12 @@ class TCPTrackHead(nn.Module):
         embed_dim: int = 1536,
         hidden_dim: int = 512,
         window_size: int = 3,
+        num_arms: int = 2,
     ) -> None:
         super().__init__()
+        if num_arms not in (1, 2):
+            raise ValueError("num_arms must be 1 or 2")
+        self.num_arms = self.NUM_ARMS = num_arms
         if window_size < 1 or window_size % 2 != 1:
             raise ValueError("window_size must be a positive odd integer")
         self.window_size = window_size
@@ -159,7 +167,7 @@ class TCPTrackHead(nn.Module):
         self, mean: torch.Tensor, std: torch.Tensor
     ) -> None:
         if mean.shape != (self.NUM_ARMS, 3) or std.shape != (self.NUM_ARMS, 3):
-            raise ValueError("TCP position statistics must both have shape [2,3]")
+            raise ValueError(f"TCP position statistics must both have shape [{self.num_arms},3]")
         if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
             raise ValueError("TCP position statistics must be finite")
         if torch.any(std <= 0):

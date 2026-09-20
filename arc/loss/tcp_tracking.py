@@ -24,6 +24,7 @@ class TCPTrackingLoss(nn.Module):
         gamma: float = 1.0,
         alpha: float = 0.2,
         confidence_max: float = 20.0,
+        gripper_encoding: str = "binary",
     ) -> None:
         super().__init__()
         offsets = torch.cat(
@@ -43,6 +44,9 @@ class TCPTrackingLoss(nn.Module):
         self.gamma = gamma
         self.alpha = alpha
         self.confidence_max = confidence_max
+        if gripper_encoding not in ("binary", "continuous"):
+            raise ValueError("Unknown gripper encoding")
+        self.gripper_encoding = gripper_encoding
 
     def _rigid_points(
         self, position: torch.Tensor, rotation: torch.Tensor
@@ -125,7 +129,7 @@ class TCPTrackingLoss(nn.Module):
         gripper_terms = F.binary_cross_entropy_with_logits(
             predictions["tcp_gripper_logit"].float(),
             target_gripper,
-            pos_weight=pos_weight,
+            pos_weight=pos_weight if self.gripper_encoding == "binary" else None,
             reduction="none",
         )
         gripper_loss = self._masked_mean(gripper_terms, trajectory_mask)
@@ -155,4 +159,8 @@ class TCPTrackingLoss(nn.Module):
             "metric_tcp_position_m": position_metric.detach(),
             "metric_tcp_rotation_deg": (rotation_metric * (180.0 / math.pi)).detach(),
             "metric_tcp_gripper_accuracy": gripper_metric.detach(),
+            "metric_tcp_gripper_mae": self._masked_mean(
+                (predictions["tcp_gripper_logit"].float().sigmoid() - target_gripper).abs(),
+                trajectory_mask,
+            ).detach(),
         }

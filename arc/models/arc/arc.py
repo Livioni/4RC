@@ -30,8 +30,9 @@ class Arc(
 ):
     PATCH_SIZE = 14
 
-    def __init__(self, freeze="none", motion_decoder_depth=4, motion_decoder_has_self_attention=True, motion_decoder_has_cross_attention=True, motion_decoder_use_adaln=True, track_head_activation="inv_log", tcp_query_window_size=3):
+    def __init__(self, freeze="none", motion_decoder_depth=4, motion_decoder_has_self_attention=True, motion_decoder_has_cross_attention=True, motion_decoder_use_adaln=True, track_head_activation="inv_log", tcp_query_window_size=3, num_arms=2):
         super().__init__()
+        self.num_arms = num_arms
 
         self.backbone = DinoV2(
             name="vitg",
@@ -72,9 +73,10 @@ class Arc(
             embed_dim=1536,
             patch_size=self.PATCH_SIZE,
             window_size=tcp_query_window_size,
+            num_arms=num_arms,
         )
         self.tcp_track_head = TCPTrackHead(
-            embed_dim=1536, window_size=tcp_query_window_size
+            embed_dim=1536, window_size=tcp_query_window_size, num_arms=num_arms
         )
 
         self.set_freeze(freeze)
@@ -346,9 +348,9 @@ class Arc(
         if decode_tcp:
             if tcp_query_points is None:
                 raise ValueError("tcp_query_points is required when decode_tcp=True")
-            if tcp_query_points.shape != (x.shape[0], 2, 2):
+            if tcp_query_points.shape != (x.shape[0], self.num_arms, 2):
                 raise ValueError(
-                    "tcp_query_points must have shape [B,2,2], got "
+                    f"tcp_query_points must have shape [B,{self.num_arms},2], got "
                     f"{tuple(tcp_query_points.shape)}"
                 )
             sparse_motion_levels = []
