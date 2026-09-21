@@ -185,7 +185,7 @@ def build_optimizer(policy, config):
         ("motion_decoder", [policy.arc.motion_decoder], "train_motion_decoder", "lr_motion_decoder"),
         ("query_encoder", [policy.arc.tcp_visual_query_encoder], "train_query_encoder", "lr_query_encoder"),
         ("tcp_head", [policy.arc.tcp_track_head], "train_tcp_head", "lr_tcp_head"),
-        ("history_pool", [policy.history_pool, policy.physical_time, policy.token_type], "train_history_pool", "lr_history_pool"),
+        ("history_pool", [policy.history_pool, policy.global_encoder, policy.physical_time, policy.token_type], "train_history_pool", "lr_history_pool"),
         ("action_head", [policy.dit], "train_action_head", "lr_action_head"),
         ("language_projection", [policy.language_projection], "train_language_projection", "lr_language_projection"),
     ]

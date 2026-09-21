@@ -1,4 +1,4 @@
-"""Pooled TCP history and a text-conditioned flow-matching action policy."""
+"""Global visual context and pooled TCP history for flow-matching actions."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -101,6 +101,43 @@ class TCPHistoryPool(nn.Module):
         return self.output_norm(output).flatten(1, 2)
 
 
+class GlobalVisualEncoder(nn.Module):
+    """Encode every last-frame patch, preserving its row-major spatial position."""
+
+    def __init__(self, input_dim: int, dim: int, patch_size: int = 14):
+        super().__init__()
+        if dim % 4 or patch_size < 1:
+            raise ValueError("Global dimension must be divisible by 4 and patch size positive")
+        self.dim = dim
+        self.patch_size = patch_size
+        self.projection = nn.Sequential(nn.LayerNorm(input_dim), nn.Linear(input_dim, dim))
+        self.xy_projection = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
+        self.output_norm = nn.LayerNorm(dim)
+
+    def forward(
+        self, patches: torch.Tensor, time_embedding: torch.Tensor, global_type: torch.Tensor,
+        *, image_height: int, image_width: int,
+    ) -> torch.Tensor:
+        grid_height = image_height // self.patch_size
+        grid_width = image_width // self.patch_size
+        if grid_height < 1 or grid_width < 1 or patches.shape[1] != grid_height * grid_width:
+            raise ValueError("Global patch count must match the image patch grid")
+        # Match TCP centre coordinates: padded-image pixels normalized to 2*pi.
+        y, x = torch.meshgrid(
+            torch.arange(grid_height, device=patches.device, dtype=torch.float32),
+            torch.arange(grid_width, device=patches.device, dtype=torch.float32),
+            indexing="ij",
+        )
+        x = (x.flatten() + 0.5) * self.patch_size / image_width * (2 * math.pi)
+        y = (y.flatten() + 0.5) * self.patch_size / image_height * (2 * math.pi)
+        spatial = self.xy_projection(torch.cat((
+            sinusoidal(x, self.dim // 2), sinusoidal(y, self.dim // 2),
+        ), dim=-1))
+        return self.output_norm(
+            self.projection(patches) + spatial[None] + time_embedding[:, None] + global_type
+        )
+
+
 class ActionDiTBlock(nn.Module):
     def __init__(self, dim: int, heads: int, mlp_ratio: int = 4):
         super().__init__()
@@ -161,7 +198,7 @@ class TCPActionDiT(nn.Module):
         action = self.action_projection(noisy_actions) + future_time_embedding + future_type
         x = torch.cat((history, action), dim=1)
         count = history.shape[1]
-        # Historical hidden states cannot read future actions or their noise.
+        # The global/TCP observation prefix cannot read future actions or noise.
         mask = torch.zeros(x.shape[1], x.shape[1], dtype=torch.bool, device=x.device)
         mask[:count, count:] = True
         padding_mask = None
@@ -181,6 +218,8 @@ class TCPActionDiT(nn.Module):
 
 @dataclass
 class ActionCondition:
+    """History is [global patches, TCP history]; history_valid covers only TCPs."""
+
     history: torch.Tensor
     text: torch.Tensor
     text_valid: torch.Tensor
@@ -214,8 +253,12 @@ class TCPActionPolicy(nn.Module):
             nn.Linear(self.language_encoder.output_dim, dim),
         )
         self.history_pool = TCPHistoryPool(arc.tcp_visual_query_encoder.embed_dim, dim, heads, self.num_arms)
+        self.global_encoder = GlobalVisualEncoder(
+            arc.tcp_visual_query_encoder.embed_dim, dim, arc.tcp_visual_query_encoder.patch_size,
+        )
         self.physical_time = ScalarTimeEncoder(dim)
-        self.token_type = nn.Embedding(2, dim)
+        # Preserve existing type IDs: 0 = TCP history, 1 = future, 2 = global.
+        self.token_type = nn.Embedding(3, dim)
         self.dit = TCPActionDiT(dim, depth, heads, self.num_arms)
         self.prediction_horizon = prediction_horizon
         self.time_unit_seconds = time_unit_seconds
@@ -291,10 +334,16 @@ class TCPActionPolicy(nn.Module):
         )
         sampled = sampled.reshape(batch, frames, self.num_arms, 9, channels)
         relative = (frame_times - frame_times[:, -1:]) / self.time_unit_seconds
+        history_time = self.physical_time(relative)
         history = self.history_pool(
-            sampled, centres, valid, self.physical_time(relative), self.token_type.weight[0],
+            sampled, centres, valid, history_time, self.token_type.weight[0],
             image_height=height, image_width=width,
         )
+        global_tokens = self.global_encoder(
+            patches[:, -1], history_time[:, -1], self.token_type.weight[2],
+            image_height=height, image_width=width,
+        )
+        history = torch.cat((global_tokens, history), dim=1)
         text, text_valid = self.language_encoder(list(instructions))
         text = self.language_projection(text)
         future_time = self.physical_time(

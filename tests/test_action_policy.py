@@ -6,15 +6,15 @@ import pytest
 import torch
 
 from arc.action import future_actions_in_current_camera, project_tcp, safe_rotation_6d_to_matrix
-from arc.models.arc.arc_action import TCPActionPolicy
+from arc.models.arc.arc_action import GlobalVisualEncoder, TCPActionPolicy
 from arc.loss.action import flow_matching_loss
 from stage2_helpers import TinyArc, TinyLanguage, tiny_batch
 
 torch.set_num_threads(2)
 
 
-def policy():
-    model = TCPActionPolicy(TinyArc(), language_encoder=TinyLanguage(), dim=32, depth=2, heads=4)
+def policy(arc=None):
+    model = TCPActionPolicy(TinyArc() if arc is None else arc, language_encoder=TinyLanguage(), dim=32, depth=2, heads=4)
     # Exercise nonzero gates, as after the zero-initialized head starts learning.
     torch.nn.init.normal_(model.dit.output_projection.weight, std=0.03)
     for block in model.dit.blocks:
@@ -33,6 +33,9 @@ def test_joint_gradient_shapes_and_teacher_forcing(batch_size):
     flow_matching_loss(prediction)["objective"].backward()
     assert model.arc.backbone.weight.grad.abs().sum() > 0
     assert model.history_pool.pool.in_proj_weight.grad.abs().sum() > 0
+    assert model.global_encoder.projection[-1].weight.grad.abs().sum() > 0
+    assert model.global_encoder.xy_projection[-1].weight.grad.abs().sum() > 0
+    assert model.token_type.weight.grad.abs().sum(-1).gt(0).all()
     assert model.arc.tcp_visual_query_encoder.adapter[-1].weight.grad.abs().sum() > 0
     assert all(p.grad is None for p in model.arc.tcp_track_head.parameters())
     assert all(p.grad is None for p in model.language_encoder.parameters())
@@ -60,17 +63,156 @@ def test_history_mask_time_and_centre_encoding():
             batch["instruction"], reconstruction, features, **(kwargs | overrides),
         )
     c = condition()
-    assert c.history.shape == (1, 16, 32)
+    assert c.history.shape == (1, 9 + 16, 32)
+    assert c.history_valid.shape == (1, 8, 2)
     common = (c.history, c.text, c.text_valid, c.future_time_embedding, model.token_type.weight[1])
     v1, h1 = model.dit(torch.randn(1, 16, 20), torch.tensor([0.1]), *common, return_history=True)
     v2, h2 = model.dit(torch.randn(1, 16, 20) * 10, torch.tensor([0.9]), *common, return_history=True)
     torch.testing.assert_close(h1, h2)
     assert not torch.allclose(v1, v2)
     moved = condition(centres=batch["history_tcp_query_points"] + 2)
-    assert not torch.allclose(c.history, moved.history)
+    torch.testing.assert_close(c.history[:, :9], moved.history[:, :9])
+    assert not torch.allclose(c.history[:, 9:], moved.history[:, 9:])
     times = batch["frame_times"].clone()
     times[:, :-1] -= 1
-    assert not torch.allclose(c.history, condition(frame_times=times).history)
+    retimed = condition(frame_times=times)
+    torch.testing.assert_close(c.history[:, :9], retimed.history[:, :9])
+    assert not torch.allclose(c.history[:, 9:], retimed.history[:, 9:])
+    # Padded future keys remain invisible to valid actions and the full prefix.
+    noise = torch.randn(1, 16, 20)
+    future_valid = torch.arange(16)[None] < 7
+    first, prefix = model.dit(noise, torch.tensor([0.4]), *common,
+                              return_history=True, future_valid=future_valid)
+    noise[:, 7:] = torch.randn_like(noise[:, 7:]) * 100
+    second, changed_prefix = model.dit(noise, torch.tensor([0.4]), *common,
+                                       return_history=True, future_valid=future_valid)
+    torch.testing.assert_close(first[:, :7], second[:, :7])
+    torch.testing.assert_close(prefix, changed_prefix)
+
+
+@pytest.mark.parametrize("image_size", [(42, 42), (28, 70), (14, 14)])
+def test_global_prefix_uses_only_last_frame_global_patch_channels(image_size):
+    model = policy().eval()
+    batch = tiny_batch(batch_size=2)
+    height, width = image_size
+    batch["images"] = torch.zeros(2, 8, 3, height, width)
+    count = (height // 14) * (width // 14)
+    patches = torch.randn(2, 8, count, 32)
+    special = torch.randn(2, 8, 32)
+
+    def condition(value, special_tokens=special):
+        return model.make_condition(
+            batch["images"], batch["intrinsics"], batch["frame_times"],
+            batch["future_frame_times"], batch["instruction"], {},
+            [(value, special_tokens, special_tokens)] * 4,
+            centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
+        )
+
+    original = condition(patches)
+    assert original.history.shape == (2, count + 16, 32)
+    assert original.history_valid.shape == (2, 8, 2)
+    distractors = patches.clone()
+    distractors[:, :-1] = torch.randn_like(distractors[:, :-1])
+    distractors[:, -1, :, :16] = torch.randn_like(distractors[:, -1, :, :16])
+    changed = condition(distractors, special + 100)
+    torch.testing.assert_close(original.history[:, :count], changed.history[:, :count])
+    # A per-patch encoder keeps the row-major order and every patch independently.
+    modified = patches.clone()
+    index = count // 2
+    modified[0, -1, index, -16:] += torch.linspace(-2, 2, 16)
+    changed = condition(modified)
+    unaffected = torch.ones(2, count, dtype=torch.bool)
+    unaffected[0, index] = False
+    torch.testing.assert_close(original.history[:, :count][unaffected], changed.history[:, :count][unaffected])
+    assert not torch.allclose(original.history[0, index], changed.history[0, index])
+
+
+def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradients():
+    model = policy().eval()
+    batch = tiny_batch()
+    batch["images"] = torch.zeros(1, 8, 3, 84, 84)
+    patches = torch.randn(1, 8, 36, 32, requires_grad=True)
+
+    def condition(value):
+        return model.make_condition(
+            batch["images"], batch["intrinsics"], batch["frame_times"],
+            batch["future_frame_times"], batch["instruction"], {}, [(value, None, None)] * 4,
+            centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
+        )
+
+    original = condition(patches)
+    modified = patches.detach().clone()
+    # Bottom-right patch lies outside both TCP sampling neighbourhoods.
+    modified[:, -1, -1, -16:] += torch.linspace(-3, 3, 16)
+    changed = condition(modified)
+    torch.testing.assert_close(original.history[:, 36:], changed.history[:, 36:])
+    noise = torch.randn(1, 16, 20)
+    def predict(c):
+        return model.dit(noise, torch.tensor([0.5]), c.history, c.text, c.text_valid,
+                         c.future_time_embedding, model.token_type.weight[1])
+    velocity = predict(original)
+    assert not torch.allclose(velocity, predict(changed))
+    velocity.square().mean().backward()
+    assert patches.grad[:, -1, -1, -16:].abs().sum() > 0
+    assert patches.grad[:, :-1, -1].eq(0).all()
+    assert patches.grad[..., :16].eq(0).all()
+
+
+def test_global_encoder_preserves_spatial_identity_and_checks_patch_grid():
+    encoder = GlobalVisualEncoder(16, 32)
+    patches = torch.ones(2, 6, 16)
+    time = torch.randn(2, 32)
+    token_type = torch.randn(32)
+    output = encoder(patches, time, token_type, image_height=28, image_width=42)
+    assert output.shape == (2, 6, 32)
+    # Identical visual features still identify different columns and rows.
+    assert not torch.allclose(output[:, 0], output[:, 1])
+    assert not torch.allclose(output[:, 0], output[:, 3])
+    with pytest.raises(ValueError, match="patch count"):
+        encoder(patches[:, :-1], time, token_type, image_height=28, image_width=42)
+
+
+@pytest.mark.parametrize("droid", [False, True])
+@pytest.mark.parametrize("enabled,rate", [(True, 1e-4), (False, 1e-4), (True, 0.)])
+def test_global_optimizer_membership_and_freezing(droid, enabled, rate):
+    if droid:
+        from droid_script import train_4rc_stage2 as runner
+        from droid_script.tests.helpers import SmallArc
+        model = policy(SmallArc())
+        config = runpy.run_path("configs/train/4rc-stage2-droid.py")
+    else:
+        import train_4rc_stage2 as runner
+        model = policy()
+        config = runpy.run_path("configs/train/4rc-stage2-action.py")
+    config.update(train_history_pool=enabled, lr_history_pool=rate, train_backbone=False)
+    optimizer = runner.build_optimizer(model, config)
+    parameters = [p for group in optimizer.param_groups for p in group["params"]]
+    assert len(parameters) == len({id(p) for p in parameters})
+    assert {id(p) for p in parameters} == {id(p) for p in model.parameters() if p.requires_grad}
+    trainable = enabled and rate > 0
+    for module in (model.global_encoder, model.history_pool, model.physical_time, model.token_type):
+        assert all(p.requires_grad == trainable for p in module.parameters())
+    assert not any(p.requires_grad for p in model.arc.backbone.parameters())
+    if trainable:
+        group = next(group for group in optimizer.param_groups if group["name"] == "history_pool")
+        assert group["lr"] == rate
+        assert {id(p) for p in model.global_encoder.parameters()} <= {id(p) for p in group["params"]}
+        if not droid:
+            flow_matching_loss(model(tiny_batch()))["objective"].backward()
+            assert model.global_encoder.projection[-1].weight.grad.abs().sum() > 0
+            assert all(p.grad is None for p in model.arc.backbone.parameters())
+
+
+def test_legacy_stage2_weights_remain_incompatible(tmp_path):
+    from train_4rc_stage2 import load_model_weights
+    model = policy()
+    old_state = {key: value for key, value in model.state_dict().items()
+                 if not key.startswith("global_encoder.")}
+    old_state["token_type.weight"] = old_state["token_type.weight"][:2]
+    checkpoint = tmp_path / "legacy_stage2.pt"
+    torch.save(old_state, checkpoint)
+    with pytest.raises(RuntimeError, match="token_type.weight"):
+        load_model_weights(model, checkpoint)
 
 
 def test_sampling_reuses_encoding_and_reports_missing_history():

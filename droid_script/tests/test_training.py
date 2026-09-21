@@ -70,7 +70,7 @@ def test_single_arm_policy_joint_gradients_and_continuous_gripper(droid_files):
     assert "camera_decoder" in {group["name"] for group in optimizer.param_groups}
     criteria = build_criteria(config)
     before = model.arc.cam_dec.fc_t.weight.detach().clone()
-    for step in range(2):
+    for step in range(3):
         optimizer.zero_grad(set_to_none=True)
         prediction = model(batch)
         assert prediction["action_velocity"].shape == (1, 16, 10)
@@ -79,13 +79,26 @@ def test_single_arm_policy_joint_gradients_and_continuous_gripper(droid_files):
         assert torch.isfinite(objective)
         # TCP/DiT output layers start at zero. Their upstream modules receive
         # gradients after the first optimizer update.
-        if step == 1:
+        if step >= 1:
             for module in (model.arc.cam_dec, model.arc.head, model.arc.motion_decoder,
                            model.arc.tcp_track_head, model.dit):
                 assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+        # Action conditioning needs both the output projection and AdaLN
+        # gates to open; the global branch starts receiving gradients on step 3.
+        if step == 2:
+            assert model.global_encoder.projection[-1].weight.grad.abs().sum() > 0
+            assert model.global_encoder.xy_projection[-1].weight.grad.abs().sum() > 0
+            assert model.token_type.weight.grad[2].abs().sum() > 0
         optimizer.step()
     assert not torch.equal(before, model.arc.cam_dec.fc_t.weight)
     model.eval()
+    reconstruction, features = model.reconstruct(batch["images"], batch["tcp_query_points"])
+    condition = model.make_condition(
+        batch["images"], batch["intrinsics"], batch["frame_times"], batch["future_frame_times"],
+        batch["instruction"], reconstruction, features,
+    )
+    assert condition.history.shape == (1, 13 * 23 + 8, 32)
+    assert condition.history_valid.shape == (1, 8, 1)
     result = model.sample_actions(batch["images"], batch["instruction"], batch["tcp_query_points"],
                                   batch["frame_times"], batch["intrinsics"], steps=1)
     assert result["action_position"].shape == (1, 16, 1, 3)

@@ -2,6 +2,7 @@
 
 `stage2_sliding_window_inference.py` 独立加载完整 Stage2 策略，不导入 Stage1 推理脚本或训练入口。
 默认 checkpoint 为 `checkpoints/RoboTwin-Stage2/90000`，模型结构、历史帧数和预测长度来自该目录的 `config.json`。
+当前 policy 使用最后观测帧全局 patch 前缀和三类 token embedding。旧的仅含 TCP 历史条件的 Stage2 checkpoint 与此结构不兼容；请通过 `--checkpoint` 指定新结构训练得到的 checkpoint。
 
 ## 运行
 

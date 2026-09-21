@@ -69,7 +69,7 @@ train_geometry_head = True
 train_motion_decoder = True  # Shared sparse TCP decoder; dense tracking is not run.
 train_query_encoder = True
 train_tcp_head = True
-train_history_pool = True
+train_history_pool = True  # Global visual encoder, TCP pooling, and time/type embeddings.
 train_action_head = True
 train_language_projection = True
 # Camera decoder and dense track head are frozen by the stage-two optimizer.

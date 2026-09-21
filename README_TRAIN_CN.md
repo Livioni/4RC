@@ -491,7 +491,7 @@ train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch
 归一化统计及验证指标仅计真实未来标签，FDE 取最后一个有效步。未来时间仍
 按采样频率递增，补齐不会跨越异常轨迹分段。--history-frames 和 --prediction-horizon 可用于配置新实验。
 
-### 历史 token、编码与 DiT
+### 全局视觉、历史 token 与 DiT
 
 每次前向先恢复历史 geometry/TCP，再从各历史帧的最后一层 backbone 全局
 特征中，在左右 TCP 中心分别采样 3×3 patch，复用现有 visual query encoder。
@@ -500,15 +500,34 @@ train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch
 做 attention pooling，再加中心残差和 LayerNorm。每帧保留左右臂各一个
 token，8 帧共 16 个历史 tokens。
 
-池化结果加入 TCP 中心的二维位置、左右臂身份、历史/未来类型、投影有效性
+池化结果加入 TCP 中心的二维位置、左右臂身份、TCP 历史类型、投影有效性
 及相对当前帧的物理时间编码。二维位置使用归一化 padded 图像坐标的
 sin/cos 编码加 MLP；物理时间使用独立 sin/cos 编码加 MLP，以 1/15 秒为
 单位。连续 15 Hz 数据的历史编码为 [-7,...,0]，未来为 [1,...,16]。
 
-Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 297M 参数（不含条件编码模块）。主序列为 16 个历史 tokens 加 16 个未来
-动作 tokens。历史只能读取历史；未来能读取全部历史和未来。仅未来动作
-加噪、接受生成时间 tau 的 AdaLN-Zero 调制，并计算 flow matching loss。
-物理时间和生成时间使用独立编码模块。
+同时取最后一个观测帧的最后一层 backbone 全局分支特征（后 1536 维），
+保留整图全部 patch，按行优先排列；不池化、不包含 camera/time 特殊 tokens。
+独立的 global_encoder 使用 LayerNorm → Linear 投影到 action_dim，加入
+patch 中心二维位置编码、相对时间 0 的物理时间编码及全局视觉类型 embedding，
+再经过 LayerNorm。位置编码沿用归一化 padded 图像坐标的 sin/cos 加 MLP。
+类型 embedding 共三类：0 = TCP 历史，1 = 未来动作，2 = 全局视觉。
+
+Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 297M 参数（不含条件编码模块）。
+主序列固定为 `[最后观测帧全局 patches | TCP 局部历史 | 未来动作]`。
+默认 252×322 图像、14×14 patch 对应 18×23 = 414 个全局 tokens，
+加上 16 个 TCP 历史和 16 个未来动作，共 446 个 tokens；显存和计算量相应增加。
+全局与 TCP 历史 tokens 相互可见，但均不能读取未来动作；未来动作能读取
+全部观测条件和未被 padding 屏蔽的未来动作。仅未来动作加噪、接受生成时间
+tau 的 AdaLN-Zero 调制，并计算 flow matching loss。物理时间和生成时间
+使用独立编码模块。训练、验证和推理共用同一条条件构造路径。
+
+ActionCondition.history 现在表示 `[B,G+K×A,D]` 的完整观测前缀；
+history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报告推理失败。
+全局特征复用本次 backbone 输出，采样迭代不会重复编码。
+
+此结构新增 global_encoder，并将 token_type 从两类扩展到三类，因此旧 Stage2
+checkpoint 无法直接续训或推理，严格加载会拒绝不匹配参数。请从 Stage1
+checkpoint 开始新的 Stage2 训练，并使用新的输出目录；新结构自身支持完整断点恢复。
 
 T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
 投影进入每层 cross-attention，并传递文本 padding mask。
@@ -535,7 +554,7 @@ GT 历史完全无效的窗口仍不训练；预测投影无效时使用缺失 t
 偏移；不要重复添加 padding。
 
 联合损失包括 geometry、TCP recovery 和 action flow matching，三个外部
-权重默认均为 1。生成损失更新池化、共享 query encoder 和 backbone；
+权重默认均为 1。生成损失更新全局编码、池化、共享 query encoder 和 backbone；
 GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head 的梯度，该 head 由恢复损失更新。
 
 | 参数组                    | 训练开关                  | 学习率                 |
@@ -545,7 +564,7 @@ GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head �
 | sparse motion decoder     | train_motion_decoder      | lr_motion_decoder      |
 | 共享 visual query encoder | train_query_encoder       | lr_query_encoder       |
 | TCP recovery head         | train_tcp_head            | lr_tcp_head            |
-| 历史池化、位置/时间编码   | train_history_pool        | lr_history_pool        |
+| 全局编码、历史池化、位置/时间/类型编码 | train_history_pool        | lr_history_pool        |
 | DiT                       | train_action_head         | lr_action_head         |
 | 文本投影                  | train_language_projection | lr_language_projection |
 
@@ -581,7 +600,7 @@ frame_times 为 [B,K]；intrinsics 为 [B,K,3,3]。不接收历史 GT 轨迹。
 
 输出包括 success、action_position [B,16,2,3]、action_rotation [B,16,2,3,3]、
 action_gripper [B,16,2] 和未来时间。失败样本的 success 为 false，
-位置/旋转为 NaN，夹爪为 −1。重建、池化和 T5 编码在一次生成中只执行一次。
+位置/旋转为 NaN，夹爪为 −1。重建、全局编码、池化和 T5 编码在一次生成中只执行一次。
 
 ```bash
 python -m pytest tests/test_action_policy.py tests/test_action_dataset.py -q

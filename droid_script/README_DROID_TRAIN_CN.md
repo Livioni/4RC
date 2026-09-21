@@ -256,6 +256,17 @@ accelerate launch --num_processes 1 droid_script/train_4rc_stage2.py \
 
 第二阶段只读取历史 RGB/深度，未来只读 TCP 标签。未来不足 16 帧时重复末状态用于存储，补齐部分不参与动作损失。窗口不能跨越轨迹异常切段点；首帧 TCP 必须能投影到图像内。
 
+DiT 输入为 `[最后观测帧的整图 patch tokens | TCP 局部历史 tokens | 未来动作 tokens]`。
+全局分支保留最后一层 backbone 全局特征的全部 patch，投影后加入 patch 中心二维位置、
+相对时间 0 及独立可学习类型 embedding。三类类型 ID 为 TCP 历史 0、未来动作 1、全局视觉 2。
+默认 182×322 图像对应 13×23 = 299 个全局 tokens，加 8 个单臂历史和 16 个未来动作，
+共 323 个 tokens。全局/TCP 条件互相可见且不能读取未来动作；仅未来动作接受加噪和生成时间调制。
+新增全局编码器与历史池化共用 train_history_pool / lr_history_pool；冻结开关也同时生效。
+训练、验证和推理使用相同的条件构造逻辑，TCP 全无效时的失败判定保持不变。
+
+新增全局编码器和第三类 embedding 后，旧 Stage2 checkpoint 无法直接加载。
+请从 Stage1 开始新的 Stage2 实验并使用新的输出目录；新结构支持正常断点恢复。
+
 动作内部为每步 10 维：位置 3、旋转 6D、连续夹爪 1。接口保留臂维度，未来标签为 `[B,H,1,10]`，输出位置为 `[B,H,1,3]`。连续夹爪输出使用 `action_gripper_open`，范围 `[0,1]`；`action_gripper` 仍提供二值开闭结果。
 
 仅验证已有第二阶段 checkpoint：
