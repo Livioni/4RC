@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 
 
-DEFAULT_CHECKPOINT = Path("checkpoints/RoboTwin-Stage2/90000")
+DEFAULT_CHECKPOINT = Path("checkpoints/RoboTwin-Stage2/180000")
 WIDTH, HEIGHT = 320, 240
 PADDING = (1, 1, 6, 6)
 ARMS = ("left", "right")
@@ -140,14 +140,17 @@ def validate_query_points(points: Any) -> np.ndarray:
     return value.copy()
 
 
-def project_queries(positions: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
+def project_queries(positions: np.ndarray, intrinsics: np.ndarray, *, allow_outside: bool = False) -> np.ndarray:
     xyz = np.asarray(positions, dtype=np.float32)
     if xyz.shape != (2, 3) or not np.isfinite(xyz).all() or np.any(xyz[:, 2] <= 1e-6):
         raise ValueError("Cannot propagate TCP queries: non-finite or behind-camera TCP")
     pixels = xyz @ intrinsics.T
     if np.any(np.abs(pixels[:, 2]) <= 1e-6):
         raise ValueError("Cannot project TCP queries: zero projection denominator")
-    return validate_query_points(pixels[:, :2] / pixels[:, 2:3])
+    uv = pixels[:, :2] / pixels[:, 2:3]
+    if not np.isfinite(uv).all():
+        raise ValueError("Cannot project TCP queries: non-finite projection")
+    return uv.copy() if allow_outside else validate_query_points(uv)
 
 
 def load_tcp_truth(episode: EpisodeInputs) -> np.ndarray | None:
@@ -329,6 +332,8 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
         raise ValueError("max_windows must be positive")
     scheduled = windows if max_windows is None else windows[:max_windows]
     queries = validate_query_points(initial_queries)
+    projected_queries = queries.copy()
+    query_clipped = np.zeros(2, dtype=bool)
     steps = config.get("sampling_steps", 8) if steps is None else steps
     if steps < 1:
         raise ValueError("sampling steps must be positive")
@@ -375,6 +380,8 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
                 "frame_indices": episode.frame_indices[start:end], "anchor_frame": int(episode.frame_indices[end - 1]),
                 "future_frame_indices": episode.frame_indices[end - 1] + np.arange(1, policy.prediction_horizon + 1),
                 "query_points_px": queries.copy(), "query_source": query_source,
+                "query_points_projected_px": projected_queries.copy(),
+                "query_points_clipped": query_clipped.copy(),
                 "history_position": position, "history_rotation": rotation,
                 **{key: value for key, value in prediction.items() if key not in {"history_position", "history_rotation"}},
                 "ground_truth": gt, "metrics": trajectory_metrics(prediction, gt),
@@ -385,7 +392,17 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             print(f"  {record['inference_seconds']:.2f}s; success={prediction['success']}; ADE={record['metrics']['position_ade_m']}", flush=True)
             if number + 1 < len(scheduled):
                 next_start = scheduled[number + 1][0]
-                queries = project_queries(camera_positions[next_start - start], episode.intrinsics)
+                projected_queries = project_queries(
+                    camera_positions[next_start - start], episode.intrinsics, allow_outside=True,
+                )
+                # Match training's initial query fallback. This only changes the
+                # visual sampling point, not the recovered 3D TCP or history mask.
+                queries = np.clip(projected_queries, [0, 0], [WIDTH - 1, HEIGHT - 1]).astype(np.float32)
+                query_clipped = np.any(queries != projected_queries, axis=-1)
+                if query_clipped.any():
+                    arms = ", ".join(arm for arm, clipped in zip(ARMS, query_clipped) if clipped)
+                    print(f"  Warning: next-window {arms} TCP queries clipped to image bounds: "
+                          f"{projected_queries.tolist()} -> {queries.tolist()}", flush=True)
                 query_source = f"window {number} recovered TCP at frame {episode.frame_indices[next_start]}"
         result["complete"] = len(scheduled) == len(windows)
         if not result["complete"]:
@@ -728,7 +745,7 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8020)
     parser.add_argument("--ui-host", default="127.0.0.1")
     parser.add_argument("--ui-port", type=int, default=7860)
-    parser.add_argument("--point-size", type=float, default=0.0016)
+    parser.add_argument("--point-size", type=float, default=0.003)
     parser.add_argument("--fps", type=float, default=5.0, help="Initial playback frames per second (0.25–30)")
     parser.add_argument("--confidence-percentile", type=float, default=2.5)
     parser.add_argument("--max-points", type=int, default=100_000, help="Per displayed frame; 0 keeps all points")

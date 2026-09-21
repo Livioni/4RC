@@ -204,3 +204,34 @@ def test_headless_discards_geometry(episode, tmp_path, monkeypatch):
     assert sorted(p.name for p in output.iterdir()) == ["predictions.json"]
     with pytest.raises(ValueError, match="in-memory geometry"):
         inference.build_playback_frames(result)
+
+
+def test_outside_queries_continue_sliding_windows(episode, tmp_path, monkeypatch, capsys):
+    calls = []
+
+    def outside(*args, **kwargs):
+        calls.append(args[3].numpy().copy())
+        result = fake_window(*args, **kwargs)
+        result["history_position"][:, 0, :2] = [-2, 2]
+        return result
+
+    monkeypatch.setattr(inference, "infer_stage2_window", outside)
+    policy = type("Policy", (), {"prediction_horizon": 16})()
+    output = tmp_path / "outside"
+    result = inference.infer_episode_sliding_windows(
+        policy, episode, inference.initial_truth_queries(episode), output,
+        config={"history_frames": 8}, query_source="test",
+    )
+    assert result["complete"] and len(calls) == 3
+    for query in calls[1:]:
+        np.testing.assert_array_equal(query[0, 0], [1, 245])  # Including image padding.
+    stored = json.loads((output / "predictions.json").read_text())
+    for window in stored["windows"][1:]:
+        assert window["query_points_projected_px"][0] == [-40, 320]
+        assert window["query_points_px"][0] == [0, 239]
+        assert window["query_points_clipped"] == [True, False]
+        assert window["history_position"][0][0] == [-2, 2, 1]
+    assert "clipped to image bounds" in capsys.readouterr().out
+    # User input and first-frame truth retain strict validation.
+    with pytest.raises(ValueError, match="outside"):
+        inference.project_queries(np.array([[-2, 2, 1], [0, 0, 1]]), episode.intrinsics)
