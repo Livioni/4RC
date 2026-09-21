@@ -101,7 +101,7 @@ find_unused_parameters = True
 
 # == Optimizer Configuration ==
 # Each module has an independent rate. A False train flag or zero LR freezes it.
-lr_backbone = 1e-6
+lr_backbone = 1e-5
 lr_head = 2e-5
 lr_motion_decoder = 1e-5
 lr_query_encoder = 1e-4
@@ -143,7 +143,7 @@ action_gripper_weight = 1.0
 
 # == Logging and Checkpoint Configuration ==
 log_every_steps = 10
-visualize_every_steps = 1000
-checkpointing_steps = 1000
+visualize_every_steps = 5_000
+checkpointing_steps = 10_000
 save_each_epoch = False
 report_to = ["tensorboard", "wandb"]
