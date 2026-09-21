@@ -220,6 +220,13 @@ The initial query can instead be supplied with `--tcp-query-points`, loaded with
 interactive path also embeds the complete Viser playback; use `--visualize` to
 enable Viser after a non-interactive run.
 
+In either sliding-window viewer, use **Video export → Export episode MP4 (current view)**
+to export the full episode from the camera view at click time, using the current FPS
+and visibility settings. The MP4 contains the 3D scene (not the GUI/RGB panel), keeps
+the viewport aspect ratio at up to 1920×1080, and appears in a browser download
+notification. Keep the Viser tab open and visible during export; playback resumes
+from its previous state afterward.
+
 Shared boundary frames are emitted once. Select their TCP result with
 `--boundary-merge previous` (default), `next`, or `average`; average mode uses
 equal scalar weights and an SO(3) midpoint for rotation. Projection is strict:

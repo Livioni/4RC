@@ -917,6 +917,9 @@ def start_visualization(
             "viser is required for visualization; install requirements.txt"
         ) from error
 
+    from viser_video_export import EpisodeVideoExport
+
+    scene_lock = threading.RLock()
     num_frames = len(frame_clouds)
     if not (
         num_frames
@@ -1122,8 +1125,9 @@ def start_visualization(
             confidence_threshold=threshold,
         )
 
-    def _update_visibility() -> None:
-        current = int(gui_frame.value)
+    def _update_visibility(current: int | None = None) -> None:
+        if current is None:
+            current = int(gui_frame.value)
         with server.atomic():
             for frame_slot, handles in enumerate(frame_handles):
                 active = frame_slot == current
@@ -1143,15 +1147,30 @@ def start_visualization(
                     )
         server.flush()
 
+    def _render_frame(slot: int) -> None:
+        visible_points, threshold = _apply_confidence_filter(slot)
+        _update_panel(slot, visible_points, threshold)
+        _update_visibility(slot)
+
+    def _viewer_update(callback):
+        def guarded(event):
+            with scene_lock:
+                if not video_export.busy.is_set():
+                    callback(event)
+        return guarded
+
     @gui_previous.on_click
+    @_viewer_update
     def _previous_frame(_) -> None:
         gui_frame.value = (int(gui_frame.value) - 1) % num_frames
 
     @gui_next.on_click
+    @_viewer_update
     def _next_frame(_) -> None:
         gui_frame.value = (int(gui_frame.value) + 1) % num_frames
 
     @gui_playing.on_update
+    @_viewer_update
     def _toggle_playing(_) -> None:
         playing = bool(gui_playing.value)
         gui_frame.disabled = playing
@@ -1159,6 +1178,7 @@ def start_visualization(
         gui_next.disabled = playing
 
     @gui_frame.on_update
+    @_viewer_update
     def _select_frame(_) -> None:
         current = int(gui_frame.value)
         visible_points, threshold = _apply_confidence_filter(current)
@@ -1166,6 +1186,7 @@ def start_visualization(
         _update_visibility()
 
     @gui_confidence.on_update
+    @_viewer_update
     def _change_confidence(_) -> None:
         current = int(gui_frame.value)
         visible_points, threshold = _apply_confidence_filter(current)
@@ -1173,6 +1194,7 @@ def start_visualization(
         server.flush()
 
     @gui_point_size.on_update
+    @_viewer_update
     def _change_point_size(_) -> None:
         with server.atomic():
             for handles in frame_handles:
@@ -1180,14 +1202,17 @@ def start_visualization(
         server.flush()
 
     @gui_show_points.on_update
+    @_viewer_update
     def _toggle_points(_) -> None:
         _update_visibility()
 
     @gui_show_tcp.on_update
+    @_viewer_update
     def _toggle_tcp(_) -> None:
         _update_visibility()
 
     @gui_show_labels.on_update
+    @_viewer_update
     def _toggle_labels(_) -> None:
         _update_visibility()
 
@@ -1202,10 +1227,19 @@ def start_visualization(
     playback_stop_event = threading.Event()
     setattr(server, "_tcp_playback_stop_event", playback_stop_event)
 
+    video_export = EpisodeVideoExport(
+        server, frame_count=num_frames, frame=gui_frame, fps=gui_fps,
+        controls=[gui_frame, gui_previous, gui_next, gui_playing, gui_fps,
+                  gui_confidence, gui_point_size, gui_show_points, gui_show_tcp, gui_show_labels],
+        render_frame=_render_frame, lock=scene_lock, stop_event=playback_stop_event,
+        filename="tcp_episode.mp4",
+    )
+
     def _playback_loop() -> None:
         while not playback_stop_event.is_set():
-            if bool(gui_playing.value):
-                gui_frame.value = (int(gui_frame.value) + 1) % num_frames
+            with scene_lock:
+                if not video_export.busy.is_set() and bool(gui_playing.value):
+                    gui_frame.value = (int(gui_frame.value) + 1) % num_frames
             playback_stop_event.wait(timeout=1.0 / float(gui_fps.value))
 
     playback_thread = threading.Thread(target=_playback_loop, daemon=True)

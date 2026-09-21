@@ -500,11 +500,23 @@ class Stage2Viewer:
             client.camera.look_at = (0.0, 0.0, 1.0)
             client.camera.up_direction = (0.0, -1.0, 0.0)
 
+        from viser_video_export import EpisodeVideoExport
+
+        self.video_export = EpisodeVideoExport(
+            self.server, frame_count=len(self.frame_slots), frame=self.frame, fps=self.fps,
+            controls=[self.frame, self.previous, self.next, self.play, self.fps,
+                      self.point_size, self.confidence, self.show_cloud, self.future,
+                      self.show_history, self.show_prediction, self.show_gt, self.show_axes],
+            render_frame=self.refresh, lock=self._lock, stop_event=self._closed,
+            filename="stage2_episode.mp4",
+        )
         self._thread = threading.Thread(target=self._playback, daemon=True)
         self._thread.start()
 
     def step_frame(self, direction=1):
-        self.frame.value = (int(self.frame.value) + direction) % len(self.frame_slots)
+        with self._lock:
+            if not self.video_export.busy.is_set():
+                self.frame.value = (int(self.frame.value) + direction) % len(self.frame_slots)
 
     def _toggle_playback(self):
         self.frame.disabled = bool(self.play.value) or len(self.frame_slots) == 1
@@ -550,11 +562,11 @@ class Stage2Viewer:
                 self._nodes.append(self.server.scene.add_frame(f"/{name}/{arm}", position=positions[arm],
                     wxyz=self.tf.SO3.from_matrix(rotations[arm]).wxyz, axes_length=0.035, axes_radius=0.001))
 
-    def refresh(self):
+    def refresh(self, frame_slot=None):
         with self._lock, self.server.atomic():
             if self._closed.is_set():
                 return
-            index, local = self.frame_slots[int(self.frame.value)]
+            index, local = self.frame_slots[int(self.frame.value) if frame_slot is None else frame_slot]
             record = self.result["windows"][index]
             geometry = self.result["_geometry"][index]
             for node in self._nodes:
