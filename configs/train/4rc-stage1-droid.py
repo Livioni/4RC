@@ -66,7 +66,7 @@ tcp_query_window_size = 3
 # == Training Configuration ==
 seed = 42
 num_train_epochs = None  # Stop at cumulative max_train_steps.
-max_train_steps = 100_000
+max_train_steps = 500_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"
 max_grad_norm = 1.0

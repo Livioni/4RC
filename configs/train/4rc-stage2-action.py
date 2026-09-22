@@ -5,8 +5,8 @@
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-stage2-action-bs4x3"
-wandb_run_name = "4rc-stage2-action-bs4x3"
+output_dir = "outputs/4rc-stage2-action-global-bs4x3"
+wandb_run_name = "4rc-stage2-action-global-bs4x3"
 logging_dir = "logs"
 stage1_checkpoint = "outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint/model.safetensors"  # Required for a new run; file or stage-one checkpoint directory.
 resume = None  # Stage-two checkpoint directory when resuming.

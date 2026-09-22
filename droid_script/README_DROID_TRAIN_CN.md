@@ -6,13 +6,13 @@
 
 ## 1. 两个阶段训练什么
 
-| 项目 | 第一阶段 | 第二阶段 |
-|---|---|---|
-| 输入 | 单台相机的时序 RGB、首帧一个 TCP 二维 query | 单台相机的历史 RGB、首帧一个 TCP 二维 query、instruction |
-| 默认时间窗口 | 2–18 帧，间隔 1–5，可反向 | 连续 8 帧历史，预测未来 16 帧 |
-| 训练目标 | 深度、ray、绝对相机外参、单臂 TCP 恢复 | 继续训练上述目标，并训练语言条件下的未来 TCP 生成 |
-| 相机外参 | 机器人基座到相机的绝对变换 `world-to-camera` | 同左 |
-| TCP/未来动作坐标 | 所选相机的 OpenCV 坐标 | 所选相机的 OpenCV 坐标 |
+| 项目             | 第一阶段                                      | 第二阶段                                                 |
+| ---------------- | --------------------------------------------- | -------------------------------------------------------- |
+| 输入             | 单台相机的时序 RGB、首帧一个 TCP 二维 query   | 单台相机的历史 RGB、首帧一个 TCP 二维 query、instruction |
+| 默认时间窗口     | 2–18 帧，间隔 1–5，可反向                   | 连续 8 帧历史，预测未来 16 帧                            |
+| 训练目标         | 深度、ray、绝对相机外参、单臂 TCP 恢复        | 继续训练上述目标，并训练语言条件下的未来 TCP 生成        |
+| 相机外参         | 机器人基座到相机的绝对变换`world-to-camera` | 同左                                                     |
+| TCP/未来动作坐标 | 所选相机的 OpenCV 坐标                        | 所选相机的 OpenCV 坐标                                   |
 
 每个 episode 有两台第三人称相机，数据加载器将它们作为两条独立的单目序列采样。一个 clip 内始终使用同一台相机，不把两路图像拼成双目输入，也不把它们当成两只手臂。
 
@@ -54,7 +54,7 @@ droid_script/
 
 ### 3.1 获取代码并创建环境
 
-先取得包含本次修改的仓库副本并进入根目录。上游地址为 <https://github.com/Luo-Yihang/4RC>，但还需要应用本次 DROID 修改。
+先取得包含本次修改的仓库副本并进入根目录。上游地址为 [https://github.com/Luo-Yihang/4RC](https://github.com/Luo-Yihang/4RC)，但还需要应用本次 DROID 修改。
 
 沿用原 4RC README 的 Python 3.11 Conda 环境：
 
@@ -142,13 +142,13 @@ datasets/droid_episodes/
 
 TCP 投影越界时，按相机和采样窗口分别处理，无需直接删除整个 episode。下面的“首帧”指**采样 clip 的第一帧**，不是 episode 的第 0 帧；第一阶段反向采样时，也以反向后的第一帧为准。
 
-| 情况 | 当前处理 |
-|---|---|
-| Stage1 首帧 TCP 投影在画面外 | 设置 `tcp_query_valid=False`，该 clip 的 TCP 位姿、夹爪和时序损失全部屏蔽；深度、ray 和绝对外参仍正常训练。 |
-| Stage1 / Stage2 首帧投影有效，后续 TCP 移出画面 | 仍使用有效的三维 TCP 标签监督轨迹恢复，不因后续帧投影越界而屏蔽该帧的 TCP 恢复损失。 |
-| Stage2 历史首帧 TCP 投影在画面外 | 不采样这个窗口；某台相机没有任何合格窗口时跳过该相机序列，另一台相机独立判断。 |
-| Stage2 后续历史帧用于动作条件的 TCP 投影越界 | 对应局部视觉特征替换为表示缺失的 `missing_token`，保留时间和有效性信息。有效性依据当前使用的真值轨迹或模型恢复轨迹判断。 |
-| 未来动作的 TCP 投影在画面外 | 仍参与动作训练，因为相机坐标系下的三维标签仍有效。`future_action_valid` 屏蔽的是超出有效轨迹段的补齐部分，不按未来投影是否在图内过滤。 |
+| 情况                                            | 当前处理                                                                                                                                 |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Stage1 首帧 TCP 投影在画面外                    | 设置`tcp_query_valid=False`，该 clip 的 TCP 位姿、夹爪和时序损失全部屏蔽；深度、ray 和绝对外参仍正常训练。                             |
+| Stage1 / Stage2 首帧投影有效，后续 TCP 移出画面 | 仍使用有效的三维 TCP 标签监督轨迹恢复，不因后续帧投影越界而屏蔽该帧的 TCP 恢复损失。                                                     |
+| Stage2 历史首帧 TCP 投影在画面外                | 不采样这个窗口；某台相机没有任何合格窗口时跳过该相机序列，另一台相机独立判断。                                                           |
+| Stage2 后续历史帧用于动作条件的 TCP 投影越界    | 对应局部视觉特征替换为表示缺失的`missing_token`，保留时间和有效性信息。有效性依据当前使用的真值轨迹或模型恢复轨迹判断。                |
+| 未来动作的 TCP 投影在画面外                     | 仍参与动作训练，因为相机坐标系下的三维标签仍有效。`future_action_valid` 屏蔽的是超出有效轨迹段的补齐部分，不按未来投影是否在图内过滤。 |
 
 投影有效性检查包括坐标有限、相机坐标的 z 为正、二维投影落在原始图像区域内；四周 padding 不算有效区域。无效投影的二维坐标置零仅用于占位，配合有效性 mask 使用，不将越界点夹到图像边缘后当成有效标签。
 
@@ -224,7 +224,6 @@ accelerate launch --multi_gpu --num_processes 4 droid_script/train_4rc_stage1.py
   --config configs/train/4rc-stage1-droid.py
 ```
 
-
 默认训练 backbone、geometry head、camera decoder、共享 motion decoder 和单臂 TCP 模块。`train_motion_decoder=False` 沿用原 stage1 的语义：关闭 dense tracking；共享 motion decoder 仍随 TCP tracker 训练。
 
 ## 7. 第二阶段训练与验证
@@ -299,16 +298,16 @@ accelerate launch --num_processes 1 droid_script/train_4rc_stage2.py \
 
 checkpoint 保存模型、优化器、调度器、RNG、训练位置、配置、TXT 副本和索引标识。重建索引后标识会变化，完整训练恢复会拒绝混用；需要开始新实验时使用权重初始化和新的输出目录。
 
-| 参数 | 默认值 / 用途 |
-|---|---|
-| `num_workers` | 8；SSD 较慢或主机内存紧张时降低 |
-| `prefetch_factor` | 每个 worker 预取 2 个 batch |
-| `cache_size` | 每个 worker 最多缓存 8 条 mmap TCP 轨迹 |
-| `batches_per_epoch` | 2,000，表示采样周期，不是完整遍历所有帧 |
-| `max_episodes` | 默认无限制；调试时分别限制所选 train/val 清单，不修改 TXT |
-| `max_train_steps` | stage1 100,000；stage2 500,000 |
-| `mixed_precision` | 默认 bf16；CPU 测试使用 `no` |
-| `camera_loss_weight` / `lr_camera` | 默认 1.0 / 2e-5，两个阶段都启用 |
+| 参数                                   | 默认值 / 用途                                             |
+| -------------------------------------- | --------------------------------------------------------- |
+| `num_workers`                        | 8；SSD 较慢或主机内存紧张时降低                           |
+| `prefetch_factor`                    | 每个 worker 预取 2 个 batch                               |
+| `cache_size`                         | 每个 worker 最多缓存 8 条 mmap TCP 轨迹                   |
+| `batches_per_epoch`                  | 2,000，表示采样周期，不是完整遍历所有帧                   |
+| `max_episodes`                       | 默认无限制；调试时分别限制所选 train/val 清单，不修改 TXT |
+| `max_train_steps`                    | stage1 100,000；stage2 500,000                            |
+| `mixed_precision`                    | 默认 bf16；CPU 测试使用`no`                             |
+| `camera_loss_weight` / `lr_camera` | 默认 1.0 / 2e-5，两个阶段都启用                           |
 
 数据加载使用 `spawn` worker，SQLite 连接按进程独立打开。只解码采样窗口，未来动作不加载图片。训练统计在首次使用相应窗口/划分时逐相机计算并缓存，内存不会随全数据集图片总量增长。
 
