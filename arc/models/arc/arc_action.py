@@ -193,9 +193,9 @@ class TCPActionDiT(nn.Module):
 
     def forward(
         self, noisy_actions, flow_time, history, text, text_valid,
-        future_time_embedding, future_type, *, return_history=False, future_valid=None,
+        future_step_embedding, future_type, *, return_history=False, future_valid=None,
     ):
-        action = self.action_projection(noisy_actions) + future_time_embedding + future_type
+        action = self.action_projection(noisy_actions) + future_step_embedding + future_type
         x = torch.cat((history, action), dim=1)
         count = history.shape[1]
         # The global/TCP observation prefix cannot read future actions or noise.
@@ -223,8 +223,7 @@ class ActionCondition:
     history: torch.Tensor
     text: torch.Tensor
     text_valid: torch.Tensor
-    future_time_embedding: torch.Tensor
-    future_frame_times: torch.Tensor
+    future_step_embedding: torch.Tensor
     history_valid: torch.Tensor
 
 
@@ -233,11 +232,11 @@ class TCPActionPolicy(nn.Module):
         self, arc: nn.Module, *, language_encoder: nn.Module | None = None,
         t5_model: str = "google-t5/t5-base", text_max_length: int = 128,
         dim: int = 512, depth: int = 8, heads: int = 8, prediction_horizon: int = 16,
-        time_unit_seconds: float = 1 / 15, padding=(1, 1, 6, 6), decode_camera: bool = False,
+        padding=(1, 1, 6, 6), decode_camera: bool = False,
     ):
         super().__init__()
-        if prediction_horizon < 1 or time_unit_seconds <= 0:
-            raise ValueError("Prediction horizon and time unit must be positive")
+        if prediction_horizon < 1:
+            raise ValueError("Prediction horizon must be positive")
         if arc.tcp_visual_query_encoder.window_size != 3:
             raise ValueError("Stage two requires a 3x3 TCP query window")
         self.arc = arc
@@ -256,12 +255,12 @@ class TCPActionPolicy(nn.Module):
         self.global_encoder = GlobalVisualEncoder(
             arc.tcp_visual_query_encoder.embed_dim, dim, arc.tcp_visual_query_encoder.patch_size,
         )
+        # This encodes step indices; retain the parameter name to load existing Stage2 weights.
         self.physical_time = ScalarTimeEncoder(dim)
         # Preserve existing type IDs: 0 = TCP history, 1 = future, 2 = global.
         self.token_type = nn.Embedding(3, dim)
         self.dit = TCPActionDiT(dim, depth, heads, self.num_arms)
         self.prediction_horizon = prediction_horizon
-        self.time_unit_seconds = time_unit_seconds
         self.padding = tuple(padding)
         self.register_buffer("action_position_mean", torch.zeros(self.num_arms, 3))
         self.register_buffer("action_position_std", torch.ones(self.num_arms, 3))
@@ -302,18 +301,13 @@ class TCPActionPolicy(nn.Module):
         return prediction, prediction.pop("backbone_features")
 
     def make_condition(
-        self, images, intrinsics, frame_times, future_frame_times, instructions,
-        reconstruction, features, *, centres=None, valid=None,
+        self, images, intrinsics, instructions, reconstruction, features, *, centres=None, valid=None,
     ):
         batch, frames, _, height, width = images.shape
-        if frame_times.shape != (batch, frames) or future_frame_times.shape != (batch, self.prediction_horizon):
-            raise ValueError("Observation/future times do not match the configured horizons")
-        if (frame_times[:, 1:] <= frame_times[:, :-1]).any():
-            raise ValueError("Historical observations must be in strictly increasing time order")
-        if (future_frame_times[:, 0] <= frame_times[:, -1]).any() or (
-            future_frame_times[:, 1:] <= future_frame_times[:, :-1]
-        ).any():
-            raise ValueError("Future action times must strictly follow observations")
+        relative = torch.arange(1 - frames, 1, device=images.device, dtype=torch.float32).expand(batch, -1)
+        future_relative = torch.arange(
+            1, self.prediction_horizon + 1, device=images.device, dtype=torch.float32,
+        ).expand(batch, -1)
         if centres is None:
             if valid is not None:
                 raise ValueError("A validity override requires explicit history centres")
@@ -333,7 +327,6 @@ class TCPActionPolicy(nn.Module):
             image_height=height, image_width=width,
         )
         sampled = sampled.reshape(batch, frames, self.num_arms, 9, channels)
-        relative = (frame_times - frame_times[:, -1:]) / self.time_unit_seconds
         history_time = self.physical_time(relative)
         history = self.history_pool(
             sampled, centres, valid, history_time, self.token_type.weight[0],
@@ -346,10 +339,8 @@ class TCPActionPolicy(nn.Module):
         history = torch.cat((global_tokens, history), dim=1)
         text, text_valid = self.language_encoder(list(instructions))
         text = self.language_projection(text)
-        future_time = self.physical_time(
-            (future_frame_times - frame_times[:, -1:]) / self.time_unit_seconds,
-        )
-        return ActionCondition(history, text, text_valid, future_time, future_frame_times, valid)
+        future_time = self.physical_time(future_relative)
+        return ActionCondition(history, text, text_valid, future_time, valid)
 
     @torch.no_grad()
     def training_history_queries(self, batch, reconstruction, gt_ratio):
@@ -379,8 +370,7 @@ class TCPActionPolicy(nn.Module):
         reconstruction, features = self.reconstruct(batch["images"], batch["tcp_query_points"])
         centres, valid, use_gt = self.training_history_queries(batch, reconstruction, history_gt_ratio)
         condition = self.make_condition(
-            batch["images"], batch["intrinsics"], batch["frame_times"],
-            batch["future_frame_times"], batch["instruction"], reconstruction, features,
+            batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
             centres=centres, valid=valid,
         )
         target = self.normalize_actions(batch["future_actions"])
@@ -394,7 +384,7 @@ class TCPActionPolicy(nn.Module):
         noisy = ((1 - tau) * noise + tau * target).masked_fill(~future_valid.bool()[..., None], 0)
         velocity = self.dit(
             noisy, flow_time, condition.history, condition.text, condition.text_valid,
-            condition.future_time_embedding, self.token_type.weight[1], future_valid=future_valid,
+            condition.future_step_embedding, self.token_type.weight[1], future_valid=future_valid,
         )
         return {
             "reconstruction": reconstruction,
@@ -420,41 +410,41 @@ class TCPActionPolicy(nn.Module):
             tau = torch.full((batch,), index / steps, device=actions.device)
             actions = actions + self.dit(
                 actions, tau, condition.history, condition.text, condition.text_valid,
-                condition.future_time_embedding, self.token_type.weight[1],
+                condition.future_step_embedding, self.token_type.weight[1],
             ).float() / steps
         value = self.denormalize_actions(actions)
         success = condition.history_valid.flatten(1).any(1) & torch.isfinite(value).flatten(1).all(1)
         position = value[..., :3]
         rotation = safe_rotation_6d_to_matrix(value[..., 3:9])
         gripper = (value[..., 9] >= 0).long()
-        return {
+        result = {
             "success": success,
             "action_position": position.masked_fill(~success[:, None, None, None], float("nan")),
             "action_rotation": rotation.masked_fill(~success[:, None, None, None, None], float("nan")),
             "action_gripper": gripper.masked_fill(~success[:, None, None], -1),
             "action_gripper_open": ((value[..., 9] + 1) / 2).clamp(0, 1).masked_fill(~success[:, None, None], float("nan")),
             "action_gripper_score": value[..., 9].masked_fill(~success[:, None, None], float("nan")),
-            "future_frame_times": condition.future_frame_times,
+            "future_step_indices": torch.arange(
+                1, self.prediction_horizon + 1, device=actions.device,
+            ).expand(batch, -1),
         }
+        return result
 
     @torch.no_grad()
     def sample_actions(
-        self, images, instructions, initial_query_points, frame_times, intrinsics,
-        *, action_frequency_hz=15.0, steps=8, generator=None,
+        self, images, instructions, initial_query_points, intrinsics, *, steps=8, generator=None,
     ):
         """Padded RGB in [-1,1]; query points and intrinsics use padded pixels.
 
         No historical ground-truth poses or projections are accepted here.
+        Returns ordered future actions without timestamps or an execution frequency.
         """
         if self.training:
             raise RuntimeError("Call policy.eval() before sampling")
-        if action_frequency_hz <= 0:
-            raise ValueError("Action frequency must be positive")
-        future_times = frame_times[:, -1:] + torch.arange(
-            1, self.prediction_horizon + 1, device=images.device,
-        )[None] / action_frequency_hz
+        if intrinsics is None:
+            raise ValueError("Camera intrinsics are required")
         reconstruction, features = self.reconstruct(images, initial_query_points)
         condition = self.make_condition(
-            images, intrinsics, frame_times, future_times, instructions, reconstruction, features,
+            images, intrinsics, instructions, reconstruction, features,
         )
         return self.sample_condition(condition, steps=steps, generator=generator)

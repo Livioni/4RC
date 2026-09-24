@@ -53,13 +53,23 @@ RGB 必须为 320×240，文件名以连续帧号结尾。元数据提供正数 
 | `--confidence-percentile` | 过滤置信度最低的 2.5% 像素 |
 | `--max-points` | 每个显示帧最多 100000 点；0 不限 |
 
+交互页面提示 `Cannot find empty port in range: 7860-7860` 时，添加 `--ui-port 8097`（或其他空闲端口）。`--server-port` 和 `--server_port` 是 `--ui-port` 的别名。`--port` 只设置 Viser 端口，不会更改 Gradio 端口；两个服务应使用不同端口。
+
 通过远程机器浏览时，可转发 7860、8020 端口。页面中包含 Viser 的直接链接。
 
 ## 时间、坐标和真值
 
-当前 checkpoint 每窗输入 8 帧，预测之后 16 步。默认窗口如 `[0,8)`、`[7,15)`；
-最后一个窗口向前对齐到末帧，保持完整 8 帧，不填充历史。少于 8 帧或历史断帧会报错。
-未来步频与 episode 的 `frequency_hz` 一致。末尾仍预测 16 步，缺失真值使用有效掩码表示。
+窗口和预测长度来自 checkpoint 配置，新训练默认输入 8 帧、预测后续 16 条动作记录。
+默认窗口如 `[0,8)`、`[7,15)`；最后一个窗口向前对齐到末帧，保持完整 8 帧，
+不填充历史。少于 8 帧或历史断帧会报错；这是整段推理的窗口规则。
+
+Stage2 统一只编码历史和未来的序号，不规定动作执行频率。返回
+`future_step_indices`（1～16）及用于真值对齐的 `future_frame_indices`，不返回
+预测目标秒数 `future_frame_times`。JSON `format_version=2`，采集频率记录为
+`source_frequency_hz`，不表示动作执行频率。末尾仍预测完整长度，缺失真值使用有效掩码。
+
+加载 checkpoint 时始终使用序号条件，不再切回旧物理时间模式。已有权重可通过
+训练配置的 `stage2_checkpoint` 初始化后继续训练，再使用新 checkpoint 推理。
 
 只有第一个窗口由交互或真值选点初始化。后续窗口使用上一窗口对下一首帧恢复出的 TCP，
 按相机内参投影传递；不会用预测的未来动作替代恢复结果，也不会每窗重新读取真值作为条件。
@@ -101,8 +111,13 @@ Viser 使用与 Stage1 参考脚本相同的逐帧播放方式：
 
 `load_stage2_policy` 加载策略；`load_episode` 读取 episode；`infer_episode_sliding_windows` 处理整段。
 `infer_stage2_window` 接受 padded RGB `[1,8,3,252,322]`、padded 内参 `[1,8,3,3]`、
-padded 首帧选点 `[1,2,2]`、历史时间 `[1,8]` 和任务文字，不接收历史真值或未来图像。
-返回深度、历史 TCP、未来位置 `[16,2,3]`、旋转 `[16,2,3,3]`、夹爪、时间及成功状态。
+padded 首帧选点 `[1,2,2]` 和任务文字，不接收历史真值或未来图像。
+接口不接收 `frame_times` 和 `frequency_hz`，历史和未来均按序号编码。
+返回深度、历史 TCP、未来位置 `[16,2,3]`、旋转 `[16,2,3,3]`、夹爪、动作序号及成功状态。
+
+```python
+prediction = infer_stage2_window(policy, images, intrinsics, query_points, instruction="Lift the cup.")
+```
 单窗口接口的历史 TCP 仍在各帧自身相机坐标；整段接口负责统一到 anchor 相机。
 整段返回值的 `_geometry` 保存内存中的深度与置信度，不进入 JSON；设置 `keep_geometry=False` 可跳过缓存。
 

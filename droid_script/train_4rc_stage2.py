@@ -95,8 +95,11 @@ def validate_config(config, *, eval_only=False):
     config["reverse_probability"] = 0.0
     if not eval_only:
         training_total_steps(1, config.get("num_train_epochs"), config.get("max_train_steps"))
-    if config["time_unit_seconds"] <= 0:
-        raise ValueError("time_unit_seconds must be positive")
+    if config.get("tcp_temporal_weight", 0) != 0:
+        raise ValueError("Stage2 uses sequence indices with tcp_temporal_weight=0")
+    config.pop("time_unit_seconds", None)
+    config.pop("tcp_velocity_scale", None)
+    config["tcp_temporal_weight"] = 0.0
     for key in ("output_dir", "stage1_checkpoint", "resume"):
         if config.get(key):
             config[key] = str(Path(config[key]).expanduser())
@@ -167,14 +170,14 @@ def build_policy(config):
     policy = TCPActionPolicy(
         arc, t5_model=config["t5_model"], text_max_length=config["text_max_length"],
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
-        prediction_horizon=config["prediction_horizon"], time_unit_seconds=config["time_unit_seconds"],
+        prediction_horizon=config["prediction_horizon"],
         padding=config["padding"], decode_camera=True,
     )
     if config.get("resume"):
         checkpoint_config = Path(config["resume"]) / "config.json"
         if checkpoint_config.is_file():
             saved = json.loads(checkpoint_config.read_text())
-            for key in ("action_dim", "action_depth", "action_heads", "prediction_horizon", "time_unit_seconds"):
+            for key in ("action_dim", "action_depth", "action_heads", "prediction_horizon"):
                 if config[key] != saved[key]:
                     raise ValueError(f"Cannot resume with changed architecture: {key}")
         load_model_weights(policy, config["resume"])
@@ -249,7 +252,7 @@ def build_criteria(config):
         gripper_encoding="continuous",
         point_scale=config["tcp_point_scale"], virtual_point_radius=config["tcp_virtual_point_radius"],
         rotation_weight=config["tcp_rotation_weight"], temporal_weight=config["tcp_temporal_weight"],
-        gripper_weight=config["tcp_gripper_weight"], velocity_scale=config["tcp_velocity_scale"],
+        gripper_weight=config["tcp_gripper_weight"],
         gamma=config["loss_gamma"], alpha=config["loss_alpha"],
     )
     return geometry, tcp
@@ -299,8 +302,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
         with accelerator.autocast():
             reconstruction, features = policy.reconstruct(batch["images"], batch["tcp_query_points"])
             recovered = policy.make_condition(
-                batch["images"], batch["intrinsics"], batch["frame_times"],
-                batch["future_frame_times"], batch["instruction"], reconstruction, features,
+                batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
             )
         if accelerator.device.type == "cuda":
             torch.cuda.synchronize()
@@ -311,8 +313,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
             with accelerator.autocast():
                 if mode == "teacher_forced":
                     condition = policy.make_condition(
-                        batch["images"], batch["intrinsics"], batch["frame_times"],
-                        batch["future_frame_times"], batch["instruction"], reconstruction, features,
+                        batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
                         centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
                     )
                 elif mode == "shuffled_instruction":

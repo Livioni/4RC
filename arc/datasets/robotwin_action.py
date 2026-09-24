@@ -1,4 +1,4 @@
-"""Causal observation/action windows with deterministic episode holdouts."""
+"""Causal action windows with oldest-frame history padding and episode holdouts."""
 from __future__ import annotations
 
 import hashlib
@@ -29,10 +29,13 @@ class RoboTwinActionDataset(RoboTwin4RC):
         self.prediction_horizon = int(prediction_horizon)
         self.split = split
         super().__init__(
-            root, min_views=history_frames, max_views=history_frames,
+            # Discover short episodes/segments too; repeated oldest frames fill
+            # the history. The action sampler below still returns exactly H views.
+            root, min_views=1, max_views=history_frames,
             min_interval=1, max_interval=1, reverse_probability=0,
             **options,
         )
+        self.min_views = self.max_views = self.history_frames
         kept, starts, instructions, moments = [], [], [], []
         for episode in self.episodes:
             key = f"{split_key}/{episode.task}/{episode.name}"
@@ -46,14 +49,6 @@ class RoboTwinActionDataset(RoboTwin4RC):
             texts = tuple(text.strip() for text in texts if isinstance(text, str) and text.strip())
             if not texts:
                 continue
-            total_frames = history_frames + 1  # At least one real future label.
-            ranges = [
-                np.arange(start, end - total_frames + 1, dtype=np.int64)
-                for start, end in episode.valid_segments if end - start >= total_frames
-            ]
-            if not ranges:
-                continue
-            possible = np.concatenate(ranges)
             states = self._read_states(episode)
             intrinsics = np.load(episode.path / "intrinsics" / f"{self.view}.npy")
             pixels = np.einsum("ij,taj->tai", intrinsics, states[..., :3])
@@ -64,8 +59,18 @@ class RoboTwinActionDataset(RoboTwin4RC):
                 & (uv[..., 0] >= 0) & (uv[..., 0] < self.SOURCE_WIDTH)
                 & (uv[..., 1] >= 0) & (uv[..., 1] < self.SOURCE_HEIGHT)
             ).any(-1)
-            valid_windows = np.convolve(visible.astype(np.int32), np.ones(history_frames), mode="valid") > 0
-            possible = possible[valid_windows[possible]]
+            visible_prefix = np.r_[0, np.cumsum(visible, dtype=np.int64)]
+            ranges = []
+            for start, end in episode.valid_segments:
+                # Every anchor needs one real observation and one real future
+                # label. Never borrow history across a discontinuity.
+                anchors = np.arange(start, end - 1, dtype=np.int64)
+                first = np.maximum(start, anchors - history_frames + 1)
+                valid = visible_prefix[anchors + 1] > visible_prefix[first]
+                # Store nominal starts, which may precede the segment or be
+                # negative. They also define the unpadded model time grid.
+                ranges.append(anchors[valid] - history_frames + 1)
+            possible = np.concatenate(ranges) if ranges else np.empty(0, dtype=np.int64)
             if not len(possible):
                 continue
             extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy")
@@ -136,13 +141,23 @@ class RoboTwinActionDataset(RoboTwin4RC):
             return np.empty(0, dtype=np.int64)
         return np.arange(len(self.episodes), dtype=np.int64)
 
+    def can_sample_num_views(self, episode_or_frames, num_views):
+        if int(num_views) != self.history_frames:
+            return False
+        _, segments = self._segments_for(episode_or_frames)
+        return any(end - start >= 2 for start, end in segments)
+
     def sample_frame_indices(self, episode_or_frames, rng, num_views=None):
         if num_views is not None and int(num_views) != self.history_frames:
             raise ValueError("Action windows have a fixed configured history length")
         index = self._episode_indices[episode_or_frames.path]
         choices = self.starts[index]
         start = int(choices[int(rng.integers(len(choices)))])
-        return start + np.arange(self.history_frames, dtype=np.int64), 1
+        anchor = start + self.history_frames - 1
+        segment_start = next(begin for begin, end in episode_or_frames.valid_segments
+                             if begin <= anchor < end)
+        indices = start + np.arange(self.history_frames, dtype=np.int64)
+        return np.maximum(indices, segment_start), 1
 
     def __getitem__(self, index):
         episode_index = int(index[0] if isinstance(index, tuple) else index)
@@ -150,6 +165,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
         episode = self.episodes[episode_index]
         future_indices = int(sample["frame_indices"][-1]) + np.arange(1, self.prediction_horizon + 1)
         anchor = int(sample["frame_indices"][-1])
+        # Retain real source timestamps, including repeated oldest observations.
         segment_end = next(end for start, end in episode.valid_segments if start <= anchor < end)
         future_valid = future_indices < segment_end
         # Repeat the last valid state only for storage; masked positions carry no supervision.
@@ -176,7 +192,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
             history_tcp_query_points=centres, history_tcp_valid=valid,
             future_actions=targets,
             future_action_valid=torch.from_numpy(future_valid.copy()),
-            future_frame_times=torch.tensor(future_indices / episode.frame_rate, dtype=torch.float32),
+            future_step_indices=torch.arange(1, self.prediction_horizon + 1),
             instruction=instruction, shuffled_instruction=self.shuffled_instructions[episode_index],
         )
         return sample
@@ -219,4 +235,3 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
             raise
         sources.append(DatasetSource(source["name"], "robotwin_action", dataset, source.get("weight", 1.0)))
     return WeightedDatasetMixture(sources) if sources else None
-

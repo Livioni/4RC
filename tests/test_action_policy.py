@@ -2,6 +2,7 @@ import json
 import runpy
 import sys
 
+import numpy as np
 import pytest
 import torch
 
@@ -13,8 +14,8 @@ from stage2_helpers import TinyArc, TinyLanguage, tiny_batch
 torch.set_num_threads(2)
 
 
-def policy(arc=None):
-    model = TCPActionPolicy(TinyArc() if arc is None else arc, language_encoder=TinyLanguage(), dim=32, depth=2, heads=4)
+def policy(arc=None, **options):
+    model = TCPActionPolicy(TinyArc() if arc is None else arc, language_encoder=TinyLanguage(), dim=32, depth=2, heads=4, **options)
     # Exercise nonzero gates, as after the zero-initialized head starts learning.
     torch.nn.init.normal_(model.dit.output_projection.weight, std=0.03)
     for block in model.dit.blocks:
@@ -50,22 +51,50 @@ def test_joint_gradient_shapes_and_teacher_forcing(batch_size):
     assert model.arc.motion_decoder.weight.grad.abs().sum() > 0
 
 
-def test_history_mask_time_and_centre_encoding():
+@pytest.mark.parametrize("anchor", [0, 3, 7])
+@pytest.mark.parametrize("history_gt_ratio", [0., 1.])
+def test_padded_dataset_history_has_finite_joint_gradients(tmp_path, anchor, history_gt_ratio):
+    import train_4rc_stage2 as runner
+    from arc.datasets import collate_training_samples
+    from arc.datasets.robotwin_action import RoboTwinActionDataset
+    from test_action_dataset import write_episode
+    write_episode(tmp_path, frames=10)
+    horizon = 16
+    dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False,
+                                   prediction_horizon=horizon)
+    dataset.starts[0] = np.array([anchor - 7])
+    batch = collate_training_samples([dataset.get_sample(0, 8, 42)])
+    config = runpy.run_path("configs/train/4rc-stage2-action.py")
+    assert "future_frame_times" not in batch
+    batch.pop("frame_times")  # No physical-time condition or velocity supervision.
+    geometry, tcp = runner.build_criteria(config)
+    model = policy(prediction_horizon=horizon)
+    prediction = model(batch, history_gt_ratio=history_gt_ratio)
+    objective, _ = runner.compute_losses(prediction, batch, geometry, tcp, config)
+    assert torch.isfinite(objective)
+    objective.backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+    assert model.arc.backbone.weight.grad.abs().sum() > 0
+    assert model.dit.output_projection.weight.grad.abs().sum() > 0
+
+
+def test_history_mask_step_and_centre_encoding():
     model = policy().eval()
     batch = tiny_batch()
     reconstruction, features = model.reconstruct(batch["images"], batch["tcp_query_points"])
     kwargs = dict(
         centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
     )
-    def condition(frame_times=batch["frame_times"], **overrides):
+    def condition(**overrides):
         return model.make_condition(
-            batch["images"], batch["intrinsics"], frame_times, batch["future_frame_times"],
+            batch["images"], batch["intrinsics"],
             batch["instruction"], reconstruction, features, **(kwargs | overrides),
         )
     c = condition()
     assert c.history.shape == (1, 9 + 16, 32)
     assert c.history_valid.shape == (1, 8, 2)
-    common = (c.history, c.text, c.text_valid, c.future_time_embedding, model.token_type.weight[1])
+    common = (c.history, c.text, c.text_valid, c.future_step_embedding, model.token_type.weight[1])
     v1, h1 = model.dit(torch.randn(1, 16, 20), torch.tensor([0.1]), *common, return_history=True)
     v2, h2 = model.dit(torch.randn(1, 16, 20) * 10, torch.tensor([0.9]), *common, return_history=True)
     torch.testing.assert_close(h1, h2)
@@ -73,11 +102,6 @@ def test_history_mask_time_and_centre_encoding():
     moved = condition(centres=batch["history_tcp_query_points"] + 2)
     torch.testing.assert_close(c.history[:, :9], moved.history[:, :9])
     assert not torch.allclose(c.history[:, 9:], moved.history[:, 9:])
-    times = batch["frame_times"].clone()
-    times[:, :-1] -= 1
-    retimed = condition(frame_times=times)
-    torch.testing.assert_close(c.history[:, :9], retimed.history[:, :9])
-    assert not torch.allclose(c.history[:, 9:], retimed.history[:, 9:])
     # Padded future keys remain invisible to valid actions and the full prefix.
     noise = torch.randn(1, 16, 20)
     future_valid = torch.arange(16)[None] < 7
@@ -102,8 +126,7 @@ def test_global_prefix_uses_only_last_frame_global_patch_channels(image_size):
 
     def condition(value, special_tokens=special):
         return model.make_condition(
-            batch["images"], batch["intrinsics"], batch["frame_times"],
-            batch["future_frame_times"], batch["instruction"], {},
+            batch["images"], batch["intrinsics"], batch["instruction"], {},
             [(value, special_tokens, special_tokens)] * 4,
             centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
         )
@@ -135,8 +158,7 @@ def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradien
 
     def condition(value):
         return model.make_condition(
-            batch["images"], batch["intrinsics"], batch["frame_times"],
-            batch["future_frame_times"], batch["instruction"], {}, [(value, None, None)] * 4,
+            batch["images"], batch["intrinsics"], batch["instruction"], {}, [(value, None, None)] * 4,
             centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
         )
 
@@ -149,7 +171,7 @@ def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradien
     noise = torch.randn(1, 16, 20)
     def predict(c):
         return model.dit(noise, torch.tensor([0.5]), c.history, c.text, c.text_valid,
-                         c.future_time_embedding, model.token_type.weight[1])
+                         c.future_step_embedding, model.token_type.weight[1])
     velocity = predict(original)
     assert not torch.allclose(velocity, predict(changed))
     velocity.square().mean().backward()
@@ -220,7 +242,7 @@ def test_sampling_reuses_encoding_and_reports_missing_history():
     batch = tiny_batch()
     result = model.sample_actions(
         batch["images"], batch["instruction"], batch["tcp_query_points"],
-        batch["frame_times"], batch["intrinsics"], steps=3,
+        batch["intrinsics"], steps=3,
         generator=torch.Generator().manual_seed(123),
     )
     assert model.arc.calls == 1
@@ -231,7 +253,7 @@ def test_sampling_reuses_encoding_and_reports_missing_history():
     reconstruction, features = model.reconstruct(batch["images"], batch["tcp_query_points"])
     reconstruction["tcp_position"] = -torch.ones_like(reconstruction["tcp_position"])
     condition = model.make_condition(
-        batch["images"], batch["intrinsics"], batch["frame_times"], batch["future_frame_times"],
+        batch["images"], batch["intrinsics"],
         batch["instruction"], reconstruction, features,
     )
     result = model.sample_condition(condition, steps=1)
@@ -271,6 +293,8 @@ class TinyDataset:
     min_views = max_views = 8
     tcp_position_mean = torch.zeros(2, 3)
     tcp_position_std = torch.ones(2, 3)
+    def __init__(self, horizon=16):
+        self.horizon = horizon
     def __len__(self):
         return 2
     def set_epoch(self, epoch):
@@ -283,7 +307,7 @@ class TinyDataset:
     def get_sample(self, index, num_views, sample_seed):
         with torch.random.fork_rng():
             torch.manual_seed(sample_seed % (2**31))
-            batch = tiny_batch()
+            batch = tiny_batch(horizon=self.horizon)
         sample = {key: value[0] for key, value in batch.items()}
         sample.update(task=f"task{index}", episode=f"episode{index}")
         return sample
@@ -306,6 +330,7 @@ def test_stage2_checkpoint_resume_and_evaluation(tmp_path, monkeypatch, accumula
     config = {k: v for k, v in runpy.run_path("configs/train/4rc-stage2-action.py").items() if not k.startswith("_")}
     config.update(
         stage1_checkpoint=str(stage1), output_dir=str(tmp_path / "full"), batch_size=1,
+        prediction_horizon=16,
         action_dim=32, action_depth=2, action_heads=4, mixed_precision="no",
         max_train_steps=2, num_train_epochs=num_train_epochs, gradient_accumulation_steps=accumulation,
         batches_per_epoch=2 * accumulation, warmup_steps=0, num_workers=0, report_to=[],

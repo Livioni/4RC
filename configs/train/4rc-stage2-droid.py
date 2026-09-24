@@ -82,7 +82,7 @@ text_max_length = 128
 action_dim = 768
 action_depth = 20
 action_heads = 12
-time_unit_seconds = 1.0 / 15
+# History and future actions are encoded by sequence index.
 sampling_steps = 8
 
 # == History TCP Condition Curriculum ==
@@ -139,9 +139,8 @@ gradient_scales = 4
 tcp_point_scale = 0.1
 tcp_virtual_point_radius = 0.03
 tcp_rotation_weight = 0.5
-tcp_temporal_weight = 0.2
+tcp_temporal_weight = 0.0  # No physical TCP velocity supervision in Stage2.
 tcp_gripper_weight = 0.2
-tcp_velocity_scale = 1.0
 
 action_position_weight = 1.0
 action_rotation_weight = 1.0

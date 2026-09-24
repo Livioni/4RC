@@ -1,15 +1,16 @@
-"""Stage two: recover eight observations and generate sixteen future actions."""
+"""Stage two: recover eight observations and generate sixteen ordered actions."""
 
 # ======================================================
 # 4RC Geometry + TCP Tracking + Action Configuration
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-stage2-action-global-bs4x3"
-wandb_run_name = "4rc-stage2-action-global-bs4x3"
+output_dir = "outputs/4rc-stage2-action-global-debug"
+wandb_run_name = "4rc-stage2-action-global-debug"
 logging_dir = "logs"
-stage1_checkpoint = "outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint/model.safetensors"  # Required for a new run; file or stage-one checkpoint directory.
-resume = None  # Stage-two checkpoint directory when resuming.
+stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"  # Used when neither Stage2 initialization nor resume is set.
+stage2_checkpoint = None  # Stage2 weight file or directory; new optimizer, scheduler and step count.
+resume = None  # Optional full-state recovery for a run using the current sequence configuration.
 
 # == Dataset Configuration ==
 # Relative sampling weights are normalized over enabled sources. A zero weight
@@ -31,10 +32,11 @@ data_sources = (
     },
 )
 view = "third_views"
-history_frames = 8
-prediction_horizon = 16  # Short futures repeat the last valid action; padding is masked.
-batch_size = 3  # Per GPU; each sample contains history_frames input images.
-# The action adapter requires forward, contiguous windows. The runner derives
+history_frames = 8  # Include anchors 0..7; repeat the oldest frame if history is short.
+prediction_horizon = 16  # Next 16 action records, with no execution-frequency assumption; short futures are masked.
+batch_size = 1  # Per GPU; each sample contains history_frames input images.
+# Step indices encode observation order; repeated frames keep their source timestamps.
+# The action adapter requires forward windows within one valid segment. The runner derives
 # these image budgets and intervals again from batch_size / history_frames.
 train_batch_images = batch_size * history_frames
 scene_counts = (batch_size,)
@@ -81,7 +83,7 @@ text_max_length = 128
 action_dim = 768
 action_depth = 20
 action_heads = 12
-time_unit_seconds = 1.0 / 15
+# Sequence indices: history [-7..0], future [1..16]; no time or frequency condition.
 sampling_steps = 8
 
 # == History TCP Condition Curriculum ==
@@ -133,9 +135,8 @@ gradient_scales = 4
 tcp_point_scale = 0.1
 tcp_virtual_point_radius = 0.03
 tcp_rotation_weight = 0.5
-tcp_temporal_weight = 0.2
+tcp_temporal_weight = 0.0  # Skip physical TCP velocity loss; flow-matching supervision remains enabled.
 tcp_gripper_weight = 0.2
-tcp_velocity_scale = 1.0
 
 action_position_weight = 1.0
 action_rotation_weight = 1.0
@@ -146,4 +147,4 @@ log_every_steps = 10
 visualize_every_steps = 5_000
 checkpointing_steps = 10_000
 save_each_epoch = False
-report_to = ["tensorboard", "wandb"]
+report_to = ["tensorboard"]

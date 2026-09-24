@@ -94,13 +94,13 @@ def test_single_arm_policy_joint_gradients_and_continuous_gripper(droid_files):
     model.eval()
     reconstruction, features = model.reconstruct(batch["images"], batch["tcp_query_points"])
     condition = model.make_condition(
-        batch["images"], batch["intrinsics"], batch["frame_times"], batch["future_frame_times"],
+        batch["images"], batch["intrinsics"],
         batch["instruction"], reconstruction, features,
     )
     assert condition.history.shape == (1, 13 * 23 + 8, 32)
     assert condition.history_valid.shape == (1, 8, 1)
     result = model.sample_actions(batch["images"], batch["instruction"], batch["tcp_query_points"],
-                                  batch["frame_times"], batch["intrinsics"], steps=1)
+                                  batch["intrinsics"], steps=1)
     assert result["action_position"].shape == (1, 16, 1, 3)
     assert result["action_gripper_open"].shape == (1, 16, 1)
     assert ((result["action_gripper_open"] >= 0) & (result["action_gripper_open"] <= 1)).all()

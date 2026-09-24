@@ -62,7 +62,6 @@ class TCPTrackingLoss(nn.Module):
 
     def forward(self, predictions: dict, batch: dict) -> dict[str, torch.Tensor]:
         target_state = batch["tcp_state"].float()
-        frame_times = batch["frame_times"].float()
         target_position = target_state[..., :3]
         target_rotation = rpy_to_matrix(target_state[..., 3:6])
         target_gripper = target_state[..., 6].clamp(0.0, 1.0)
@@ -93,7 +92,8 @@ class TCPTrackingLoss(nn.Module):
         )
         pose_loss = self._masked_mean(pose_terms, trajectory_mask)
 
-        if target_state.shape[1] > 1:
+        if self.temporal_weight > 0 and target_state.shape[1] > 1:
+            frame_times = batch["frame_times"].float()
             dt = frame_times[:, 1:] - frame_times[:, :-1]
             direction = torch.where(dt < 0, -torch.ones_like(dt), torch.ones_like(dt))
             dt = direction * dt.abs().clamp_min(1e-6)

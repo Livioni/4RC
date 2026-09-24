@@ -39,6 +39,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config")
     parser.add_argument("--stage1-checkpoint")
+    parser.add_argument("--stage2-checkpoint", help="Stage2 weights or directory; initialize a new run")
     parser.add_argument("--resume")
     parser.add_argument("--output-dir")
     parser.add_argument("--batch-size", type=int)
@@ -65,16 +66,24 @@ def load_config(args):
         namespace = runpy.run_path(str(path))
         config = {key: value for key, value in namespace.items() if not key.startswith("_") and not callable(value)}
     for key in (
-        "stage1_checkpoint", "resume", "output_dir", "batch_size", "history_frames",
+        "stage1_checkpoint", "stage2_checkpoint", "resume", "output_dir", "batch_size", "history_frames",
         "prediction_horizon", "max_episodes", "max_train_steps", "num_train_epochs", "num_workers", "validation_batches",
     ):
-        if getattr(args, key) is not None:
+        if getattr(args, key, None) is not None:
             config[key] = getattr(args, key)
     return validate_config(config, eval_only=args.eval_only)
 
 
 def validate_config(config, *, eval_only=False):
     config = dict(config)
+    config.setdefault("stage2_checkpoint", None)
+    if config.get("time_encoding", "index") != "index" or config.get("tcp_temporal_weight", 0) != 0:
+        raise ValueError("Stage2 uses sequence indices with tcp_temporal_weight=0. "
+                         "Initialize old weights with --stage2-checkpoint and the current config.")
+    # These retired options are never passed to the model or saved again.
+    for key in ("time_encoding", "time_unit_seconds", "tcp_velocity_scale"):
+        config.pop(key, None)
+    config["tcp_temporal_weight"] = 0.0
     for key in ("batch_size", "history_frames", "prediction_horizon", "sampling_steps", "action_dim", "action_depth", "action_heads", "text_max_length", "validation_batches", "validation_batch_size"):
         if not isinstance(config[key], int) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
@@ -89,10 +98,10 @@ def validate_config(config, *, eval_only=False):
         raise ValueError("action_dim must be divisible by action_heads and 4")
     if config.get("normalize_geometry", False):
         raise ValueError("Stage two uses metric geometry; normalize_geometry must be False")
-    if eval_only and not config.get("resume"):
-        raise ValueError("--eval-only requires --resume pointing to a stage-two checkpoint")
-    if not config.get("resume") and not config.get("stage1_checkpoint"):
-        raise ValueError("A new stage-two run requires --stage1-checkpoint")
+    if eval_only and not (config.get("stage2_checkpoint") or config.get("resume")):
+        raise ValueError("--eval-only requires --stage2-checkpoint or --resume pointing to a Stage2 checkpoint")
+    if not any(config.get(key) for key in ("resume", "stage2_checkpoint", "stage1_checkpoint")):
+        raise ValueError("A new stage-two run requires --stage1-checkpoint or --stage2-checkpoint")
     config["train_batch_images"] = config["batch_size"] * config["history_frames"]
     config["scene_counts"] = (config["batch_size"],)
     config["min_views"] = config["max_views"] = config["history_frames"]
@@ -100,9 +109,7 @@ def validate_config(config, *, eval_only=False):
     config["reverse_probability"] = 0.0
     if not eval_only:
         training_total_steps(1, config.get("num_train_epochs"), config.get("max_train_steps"))
-    if config["time_unit_seconds"] <= 0:
-        raise ValueError("time_unit_seconds must be positive")
-    for key in ("output_dir", "stage1_checkpoint", "resume"):
+    for key in ("output_dir", "stage1_checkpoint", "stage2_checkpoint", "resume"):
         if config.get(key):
             config[key] = str(Path(config[key]).expanduser())
     config["training_stage"] = 2
@@ -155,24 +162,34 @@ def load_model_weights(model, checkpoint):
 
 
 def build_policy(config):
+    stage2 = config.get("resume") or config.get("stage2_checkpoint")
     arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
-    if not config.get("resume"):
+    if not stage2:
         # Strict loading prevents silently starting with random recovery heads.
         LOGGER.info("Load checkpoint from stage1: %s", config["stage1_checkpoint"])
         load_model_weights(arc, config["stage1_checkpoint"])
     policy = TCPActionPolicy(
         arc, t5_model=config["t5_model"], text_max_length=config["text_max_length"],
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
-        prediction_horizon=config["prediction_horizon"], time_unit_seconds=config["time_unit_seconds"],
+        prediction_horizon=config["prediction_horizon"],
     )
-    if config.get("resume"):
-        checkpoint_config = Path(config["resume"]) / "config.json"
+    if stage2:
+        path = Path(stage2)
+        checkpoint_config = (path if path.is_dir() else path.parent) / "config.json"
         if checkpoint_config.is_file():
             saved = json.loads(checkpoint_config.read_text())
-            for key in ("action_dim", "action_depth", "action_heads", "prediction_horizon", "time_unit_seconds"):
+            for key in ("action_dim", "action_depth", "action_heads"):
                 if config[key] != saved[key]:
-                    raise ValueError(f"Cannot resume with changed architecture: {key}")
-        load_model_weights(policy, config["resume"])
+                    raise ValueError(f"Cannot load Stage2 with changed architecture: {key}")
+            if config.get("tcp_query_window_size", 3) != saved.get("tcp_query_window_size", 3):
+                raise ValueError("Cannot load Stage2 with changed architecture: tcp_query_window_size")
+            LOGGER.info("Stage2 sequence horizon: %s -> %s",
+                        saved["prediction_horizon"], config["prediction_horizon"])
+        LOGGER.info("%s Stage2 checkpoint: %s",
+                    "Resume" if config.get("resume") else "Initialize weights from", stage2)
+        load_model_weights(policy, stage2)
+        # Validate the loaded action scale without replacing it with new stats.
+        policy.set_action_position_stats(policy.action_position_mean, policy.action_position_std)
     return policy
 
 
@@ -240,7 +257,7 @@ def build_criteria(config):
     tcp = TCPTrackingLoss(
         point_scale=config["tcp_point_scale"], virtual_point_radius=config["tcp_virtual_point_radius"],
         rotation_weight=config["tcp_rotation_weight"], temporal_weight=config["tcp_temporal_weight"],
-        gripper_weight=config["tcp_gripper_weight"], velocity_scale=config["tcp_velocity_scale"],
+        gripper_weight=config["tcp_gripper_weight"],
         gamma=config["loss_gamma"], alpha=config["loss_alpha"],
     )
     return geometry, tcp
@@ -290,8 +307,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
         with accelerator.autocast():
             reconstruction, features = policy.reconstruct(batch["images"], batch["tcp_query_points"])
             recovered = policy.make_condition(
-                batch["images"], batch["intrinsics"], batch["frame_times"],
-                batch["future_frame_times"], batch["instruction"], reconstruction, features,
+                batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
             )
         if accelerator.device.type == "cuda":
             torch.cuda.synchronize()
@@ -302,8 +318,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
             with accelerator.autocast():
                 if mode == "teacher_forced":
                     condition = policy.make_condition(
-                        batch["images"], batch["intrinsics"], batch["frame_times"],
-                        batch["future_frame_times"], batch["instruction"], reconstruction, features,
+                        batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
                         centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
                     )
                 elif mode == "shuffled_instruction":
@@ -372,7 +387,10 @@ def main():
         resume_dir = Path(config["resume"])
         for filename in ("trainer_state.json", "model.safetensors", "optimizer.bin", "scheduler.bin"):
             if not (resume_dir / filename).is_file():
-                raise FileNotFoundError(f"Resume checkpoint is missing {filename}: {resume_dir}")
+                raise FileNotFoundError(
+                    f"Resume checkpoint is missing {filename}: {resume_dir}. "
+                    "Use --stage2-checkpoint instead of --resume to initialize a new run from weights."
+                )
     set_seed(config["seed"])
     accelerator = Accelerator(
         mixed_precision=config["mixed_precision"],
@@ -406,7 +424,7 @@ def main():
         return
 
     dataset = build_action_dataset(config, "train")
-    if not config.get("resume"):
+    if not (config.get("resume") or config.get("stage2_checkpoint")):
         policy.set_action_position_stats(dataset.tcp_position_mean, dataset.tcp_position_std)
     # Never overwrite policy.arc.tcp_track_head.position_mean/std here.
     if accelerator.is_main_process:

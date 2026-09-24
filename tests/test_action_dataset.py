@@ -18,7 +18,7 @@ def write_episode(root, task="lift", name="episode_0", frames=32):
         (episode / directory).mkdir(parents=True)
     for i in range(frames):
         Image.fromarray(np.full((240, 320, 3), i, dtype=np.uint8)).save(episode / "images/third_views" / f"{i:06d}.png")
-        Image.fromarray(np.full((240, 320), 1000, dtype=np.uint16)).save(episode / "depths/third_views" / f"{i:06d}.png")
+        Image.fromarray(np.full((240, 320), 1000 + i, dtype=np.uint16)).save(episode / "depths/third_views" / f"{i:06d}.png")
     np.save(episode / "intrinsics/third_views.npy", np.array([[100., 0, 160], [0, 100, 120], [0, 0, 1]], np.float32))
     np.save(episode / "extrinsics/third_views.npy", np.repeat(np.eye(4, dtype=np.float32)[None, :3], frames, axis=0))
     for arm, x in (("left", -0.2), ("right", 0.2)):
@@ -55,11 +55,57 @@ def test_future_images_not_read_and_targets_aligned(tmp_path, monkeypatch):
     assert len(opened) == 16  # Eight RGB and eight depth images.
     assert sample["images"].shape == (8, 3, 252, 322)
     assert sample["future_actions"].shape == (16, 2, 10)
-    torch.testing.assert_close(sample["future_frame_times"], torch.arange(8, 24) / 15)
+    torch.testing.assert_close(sample["future_step_indices"], torch.arange(1, 17))
+    assert "future_frame_times" not in sample
     torch.testing.assert_close(sample["future_actions"][:, 0, 0], -0.2 + torch.arange(8, 24) * 0.002)
     assert sample["future_actions"][:8, :, 9].eq(-1).all()
     assert sample["future_actions"][8:, :, 9].eq(1).all()
     torch.testing.assert_close(sample["history_tcp_query_points"][0, 0], torch.tensor([141., 126.]))
+
+
+@pytest.mark.parametrize("anchor", range(8))
+def test_episode_start_repeats_oldest_observation(tmp_path, monkeypatch, anchor):
+    episode = write_episode(tmp_path, frames=24)
+    extrinsics = np.load(episode / "extrinsics/third_views.npy")
+    extrinsics[:, 0, 3] = np.arange(24) * 0.01
+    np.save(episode / "extrinsics/third_views.npy", extrinsics)
+    dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
+    assert anchor - 7 in dataset.starts[0]
+    dataset.starts[0] = np.array([anchor - 7])
+    original = Image.open
+    def checked_open(path, *args, **kwargs):
+        assert 0 <= int(Path(path).stem) <= anchor, "History read a future image"
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Image, "open", checked_open)
+    sample = dataset.get_sample(0, 8, 42)
+    indices = torch.arange(anchor - 7, anchor + 1).clamp_min(0)
+    torch.testing.assert_close(sample["frame_indices"], indices)
+    torch.testing.assert_close(sample["images"][:, 0, 10, 10], indices.float() / 255 * 2 - 1)
+    torch.testing.assert_close(sample["depth"][:, 10, 10], 1 + indices.float() / 1000)
+    torch.testing.assert_close(sample["tcp_state"][:, 0, 0], -0.2 + indices * 0.002)
+    torch.testing.assert_close(sample["extrinsics"][:, 0, 3], indices * 0.01)
+    torch.testing.assert_close(sample["frame_times"], indices.float() / 15)
+    assert sample["frame_times"].diff().ge(0).all()
+    future = torch.arange(anchor + 1, anchor + 17)
+    torch.testing.assert_close(sample["future_step_indices"], torch.arange(1, 17))
+    assert "future_frame_times" not in sample
+    torch.testing.assert_close(sample["future_actions"][:, 0, 0],
+                               -0.2 + future * 0.002 + (anchor - future) * 0.01)
+    assert sample["future_action_valid"].all()
+    torch.testing.assert_close(sample["tcp_query_points"], sample["history_tcp_query_points"][0])
+
+
+def test_future_visibility_does_not_make_early_history_eligible(tmp_path):
+    episode = write_episode(tmp_path, frames=12)
+    for arm in ("left", "right"):
+        path = episode / "TCP_third" / f"{arm}_state.npy"
+        state = np.load(path)
+        state[:3, 0] = 5  # Both TCPs are out of view until frame 3.
+        np.save(path, state)
+    dataset = RoboTwinActionDataset(
+        tmp_path, validation_fraction=0, augment=False, max_tcp_linear_speed=None,
+    )
+    assert (dataset.starts[0] + 7).tolist() == list(range(3, 11))
 
 
 def test_fixed_batches_and_epoch_independent_request_seed(tmp_path):
@@ -106,31 +152,58 @@ def test_windows_do_not_cross_discontinuities(tmp_path):
     np.save(episode / "TCP_third/left_state.npy", state)
     dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
     assert dataset.segmented_episode_count == 1
-    for start in dataset.starts[0]:
-        assert start + 9 <= 32 or start >= 32
+    assert (dataset.starts[0] + 7).tolist() == list(range(31)) + list(range(32, 63))
     dataset.starts[0] = np.array([23])  # Eight history frames, one future frame before the jump.
     sample = dataset.get_sample(0, 8, 42)
     assert sample["future_action_valid"].sum() == 1
     torch.testing.assert_close(sample["future_actions"][:, 0, 0], torch.full((16,), -0.2 + 31 * 0.002))
+    dataset.starts[0] = np.array([25])  # New segment's first frame is anchor 32.
+    sample = dataset.get_sample(0, 8, 42)
+    assert sample["frame_indices"].tolist() == [32] * 8
+    torch.testing.assert_close(sample["tcp_state"][:, 0, 0], torch.full((8,), state[32, 0]))
+    torch.testing.assert_close(sample["future_actions"][0, 0, 0], torch.tensor(state[33, 0]))
 
 
+def test_short_segments_are_kept_and_never_share_history(tmp_path):
+    episode = write_episode(tmp_path, frames=6)
+    state = np.load(episode / "TCP_third/left_state.npy")
+    state[3:, 0] += 0.6
+    np.save(episode / "TCP_third/left_state.npy", state)
+    dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
+    assert (dataset.starts[0] + 7).tolist() == [0, 1, 3, 4]
+    dataset.starts[0] = np.array([-3])  # Anchor 4, with only frames 3 and 4 available.
+    sample = dataset.get_sample(0, 8, 42)
+    assert sample["frame_indices"].tolist() == [3] * 7 + [4]
+    assert sample["future_action_valid"].sum() == 1
+    torch.testing.assert_close(sample["future_actions"][0, 0, 0], torch.tensor(state[5, 0]))
 
-@pytest.mark.parametrize("frames", [9, 13, 24])
+
+@pytest.mark.parametrize("frames", [2, 3, 8, 9, 13, 24])
 def test_partial_future_padding_and_statistics(tmp_path, frames):
     write_episode(tmp_path, frames=frames)
     dataset = RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)
-    assert dataset.starts[0].tolist() == list(range(frames - 8))
+    assert dataset.starts[0].tolist() == list(range(-7, frames - 8))
     # Verify statistics before restricting sampling to the first window.
     per_anchor = [np.arange(start + 8, min(start + 24, frames)).mean()
                   for start in dataset.starts[0]]
     expected_x = torch.tensor([-0.2, 0.2]) + float(np.mean(per_anchor)) * 0.002
     torch.testing.assert_close(dataset.tcp_position_mean[:, 0], expected_x)
-    dataset.starts[0] = np.array([0])
+    # Even episodes shorter than H remain eligible in the actual training sampler.
+    assert dataset.can_sample_num_views(dataset.episodes[0], 8)
+    assert not dataset.can_sample_num_views(dataset.episodes[0], 7)
+    mixture = WeightedDatasetMixture([DatasetSource("short", "robotwin_action", dataset, 1.)])
+    sampler = WeightedMultiSourceBatchSampler(
+        mixture, images_per_batch=8, scene_counts=(1,), batches_per_epoch=1,
+    )
+    sampled = mixture[next(iter(sampler))[0]]
+    assert sampled["images"].shape[0] == 8
+    anchor = min(7, frames - 2)
+    dataset.starts[0] = np.array([anchor - 7])
     sample = dataset.get_sample(0, 8, 42)
-    length = min(frames - 8, 16)
+    length = min(frames - anchor - 1, 16)
     assert sample["future_action_valid"].tolist() == [True] * length + [False] * (16 - length)
     assert sample["future_actions"].shape == (16, 2, 10)
-    torch.testing.assert_close(sample["future_frame_times"], torch.arange(8, 24) / 15)
+    torch.testing.assert_close(sample["future_step_indices"], torch.arange(1, 17))
     if length < 16:
         torch.testing.assert_close(sample["future_actions"][length:],
                                    sample["future_actions"][length - 1].expand(16 - length, -1, -1))
@@ -140,6 +213,6 @@ def test_partial_future_padding_and_statistics(tmp_path, frames):
 
 def test_no_future_label_is_not_sampled(tmp_path):
     from arc.datasets.robotwin_action import NoActionEpisodes
-    write_episode(tmp_path, frames=8)
+    write_episode(tmp_path, frames=1)
     with pytest.raises(NoActionEpisodes):
         RoboTwinActionDataset(tmp_path, validation_fraction=0, augment=False)

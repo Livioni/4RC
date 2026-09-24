@@ -65,7 +65,8 @@ def test_action_only_reads_history_and_masks_short_future(droid_files, monkeypat
     assert sample["future_actions"].shape == (16, 1, 10)
     assert sample["future_action_valid"].sum() == 1
     torch.testing.assert_close(sample["future_actions"], sample["future_actions"][:1].expand(16, -1, -1))
-    torch.testing.assert_close(sample["future_frame_times"], torch.arange(23, 39).float() / 15)
+    torch.testing.assert_close(sample["future_step_indices"], torch.arange(1, 17))
+    assert "future_frame_times" not in sample
     assert sample["history_tcp_valid"][0].all()
     assert sample["instruction"] != sample["shuffled_instruction"]
 

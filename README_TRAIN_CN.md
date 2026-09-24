@@ -453,25 +453,47 @@ accelerate launch --num_processes 4 train_4rc_stage2.py \
   --stage1-checkpoint outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint \
   --batch-size 1
 
-# 恢复第二阶段
+# 使用已有第二阶段权重，以当前配置开始新训练
 accelerate launch train_4rc_stage2.py \
-  --resume outputs/4rc-stage2-action/checkpoint-1000
+  --stage2-checkpoint outputs/4rc-stage2-action/checkpoint-1000
 ```
 
-stage1_checkpoint 在新训练时必须提供，支持权重文件或 Accelerate checkpoint
-目录。也可直接使用本地 checkpoints/RoboTwin-TCP-Tracking/model.safetensors。
-阶段切换只加载模型，重新创建优化器和 scheduler；恢复第二阶段则恢复完整
-训练状态，未指定 --config 时默认读取 checkpoint 内保存的配置。
+配置支持三种启动来源，优先级为 `resume > stage2_checkpoint > stage1_checkpoint`：
 
-已有 TCP recovery head 的 position mean/std 保留 checkpoint 的值，新
-action head 使用单独的训练集统计量。Safetensors 加载会正确恢复 DualDPT
-共享 LayerNorm 的别名，真实缺失或形状不匹配的参数仍会报错。
+```python
+stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"
+stage2_checkpoint = None  # Stage2 权重文件或目录；重新开始优化器、scheduler 和训练步数
+resume = None             # 完整 Stage2 checkpoint 目录；恢复全部训练状态
+```
+
+从 Stage1 初始化时，加载重建模型并创建新的动作模块；从 Stage2 初始化时，
+严格加载完整策略，包括动作头和归一化统计，不需要读取 Stage1 文件。
+`stage2_checkpoint` 不恢复优化器、scheduler、随机状态或累计步数，GT 条件比例
+也按新训练配置从头执行。可使用 `--stage2-checkpoint` 覆盖配置：
+
+```bash
+accelerate launch train_4rc_stage2.py \
+  --stage2-checkpoint checkpoints/RoboTwin-Stage2/60000/model.safetensors \
+  --output-dir outputs/4rc-stage2-index
+```
+
+Stage2 统一使用序号编码，默认 8 帧历史、16 个未来动作，关闭 TCP 物理速度损失。
+无需指定时间模式或频率参数。`stage2_checkpoint` 只读取权重；旧 checkpoint 的时间配置、
+损失权重和训练进度不会覆盖当前配置。旧权重结构相容时可以直接用于初始化新训练。
+
+`resume` 仍可恢复使用当前配置训练的完整 checkpoint；旧物理时间训练请通过
+`stage2_checkpoint` 初始化。新训练的优化器、scheduler、随机状态和累计步数从头开始。
+
+TCP recovery head 的 position mean/std 始终保留。只有从 Stage1 创建新的动作头时，
+才使用当前训练集计算动作归一化统计；Stage2 初始化及 resume 均保留已训练的尺度。
+Safetensors 加载会恢复 DualDPT 共享参数别名，真实缺失或结构不匹配仍会报错。
 
 ### 历史长度与每卡 batch size
 
 ```python
 history_frames = 8
 prediction_horizon = 16
+tcp_temporal_weight = 0.0
 batch_size = 1
 ```
 
@@ -485,11 +507,12 @@ train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch
 
 有效 batch size 为每卡 clip 数 × GPU 数 × gradient accumulation steps。
 历史窗口固定为配置长度；未来只读取 TCP 标签和坐标转换所需外参，不读取
-未来 RGB/depth。窗口正序、连续且不跨异常轨迹分段，默认需要至少 9 个连续
-有效帧（8 帧历史 + 至少 1 步未来标签）。不足 16 步的未来动作重复最后一个
-有效动作补齐，并通过 future_action_valid 屏蔽 padding 的 attention 和 loss；
-归一化统计及验证指标仅计真实未来标签，FDE 取最后一个有效步。未来时间仍
-按采样频率递增，补齐不会跨越异常轨迹分段。--history-frames 和 --prediction-horizon 可用于配置新实验。
+未来 RGB/depth。窗口正序、连续且不跨异常轨迹分段；每个锚点至少需要一个
+真实观测和一个未来标签。历史不足 8 帧时复制当前片段最早帧，保留
+重复帧的源时间戳。未来标签为锚点之后的 16 条动作记录；不足时重复最后一条，
+通过 `future_action_valid` 屏蔽补齐部分的 attention 和 loss。归一化统计及
+验证指标仅计真实未来标签，FDE 取最后一个有效步。预测动作没有规定执行频率。
+`--history-frames` 和 `--prediction-horizon` 可调整历史和预测长度。
 
 ### 全局视觉、历史 token 与 DiT
 
@@ -501,14 +524,20 @@ train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch
 token，8 帧共 16 个历史 tokens。
 
 池化结果加入 TCP 中心的二维位置、左右臂身份、TCP 历史类型、投影有效性
-及相对当前帧的物理时间编码。二维位置使用归一化 padded 图像坐标的
-sin/cos 编码加 MLP；物理时间使用独立 sin/cos 编码加 MLP，以 1/15 秒为
-单位。连续 15 Hz 数据的历史编码为 [-7,...,0]，未来为 [1,...,16]。
+及帧序号编码。二维位置和序号均使用 sin/cos 编码加 MLP；
+历史输入为 `[-7,...,0]`，未来为 `[1,...,16]`，这些数字表示先后顺序，不表示秒数。
+模型不接收时间戳或频率，因此重复时间戳无需虚拟补位。
+编码 MLP 保留已有权重的参数名称，加载旧 Stage2 权重后也只编码序号。
+
+Stage2 固定要求 `tcp_temporal_weight=0`，直接跳过物理速度计算。位置、旋转、夹爪和
+几何监督继续生效；flow-matching 的生成时间与向量场损失仍保留，它们不是机器人
+物理速度。执行动作的节奏由外部控制程序决定；去掉时间条件不保证不同视觉运动跨度下
+的泛化效果，需要按部署输入评估。
 
 同时取最后一个观测帧的最后一层 backbone 全局分支特征（后 1536 维），
 保留整图全部 patch，按行优先排列；不池化、不包含 camera/time 特殊 tokens。
 独立的 global_encoder 使用 LayerNorm → Linear 投影到 action_dim，加入
-patch 中心二维位置编码、相对时间 0 的物理时间编码及全局视觉类型 embedding，
+patch 中心二维位置编码、当前帧序号 0 的编码及全局视觉类型 embedding，
 再经过 LayerNorm。位置编码沿用归一化 padded 图像坐标的 sin/cos 加 MLP。
 类型 embedding 共三类：0 = TCP 历史，1 = 未来动作，2 = 全局视觉。
 
@@ -518,16 +547,16 @@ Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 297M 参数�
 加上 16 个 TCP 历史和 16 个未来动作，共 446 个 tokens；显存和计算量相应增加。
 全局与 TCP 历史 tokens 相互可见，但均不能读取未来动作；未来动作能读取
 全部观测条件和未被 padding 屏蔽的未来动作。仅未来动作加噪、接受生成时间
-tau 的 AdaLN-Zero 调制，并计算 flow matching loss。物理时间和生成时间
+tau 的 AdaLN-Zero 调制，并计算 flow matching loss。序号条件和生成时间
 使用独立编码模块。训练、验证和推理共用同一条条件构造路径。
 
 ActionCondition.history 现在表示 `[B,G+K×A,D]` 的完整观测前缀；
 history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报告推理失败。
 全局特征复用本次 backbone 输出，采样迭代不会重复编码。
 
-此结构新增 global_encoder，并将 token_type 从两类扩展到三类，因此旧 Stage2
-checkpoint 无法直接续训或推理，严格加载会拒绝不匹配参数。请从 Stage1
-checkpoint 开始新的 Stage2 训练，并使用新的输出目录；新结构自身支持完整断点恢复。
+仅含 TCP 历史条件、没有 global_encoder 且 token_type 只有两类的早期 Stage2
+checkpoint 与当前结构不兼容，严格加载会拒绝不匹配参数。已有全局视觉分支的
+Stage2 checkpoint 可按前述方式续训或初始化，物理时间改为序号编码不会改变权重结构。
 
 T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
 投影进入每层 cross-attention，并传递文本 padding mask。
@@ -579,7 +608,7 @@ episode，才能将结果解释为未见 episode 泛化。
 
 ```bash
 python train_4rc_stage2.py \
-  --resume outputs/4rc-stage2-action/final_checkpoint \
+  --stage2-checkpoint outputs/4rc-stage2-action/final_checkpoint \
   --eval-only --validation-batches 16
 ```
 
@@ -594,14 +623,22 @@ python train_4rc_stage2.py \
 仍可训练，但 --eval-only 要求存在验证数据。sampling_steps 默认 8，可通过
 配置比较 4/8/16 步。
 
-TCPActionPolicy.sample_actions 接收 images、instructions、initial_query_points、
-frame_times、intrinsics。images 为 padded 的 [B,K,3,H,W]、范围 [-1,1]；
-frame_times 为 [B,K]；intrinsics 为 [B,K,3,3]。不接收历史 GT 轨迹。
+`TCPActionPolicy.sample_actions` 接收按先后排列的 images、instructions、
+initial_query_points 和 intrinsics。images 为 padded `[B,K,3,H,W]`、范围 `[-1,1]`；
+intrinsics 为 `[B,K,3,3]`。接口不接收 `frame_times` 或 `action_frequency_hz`，
+为兼容旧调用传入时也不参与条件。不接收历史 GT 轨迹。
 
-输出包括 success、action_position [B,16,2,3]、action_rotation [B,16,2,3,3]、
-action_gripper [B,16,2] 和未来时间。失败样本的 success 为 false，
+```python
+result = policy.sample_actions(
+    images, instructions, initial_query_points, intrinsics=intrinsics, steps=8,
+)
+```
+
+默认输出包括 success、action_position `[B,16,2,3]`、action_rotation `[B,16,2,3,3]`、
+action_gripper `[B,16,2]` 和 future_step_indices `[B,16]`（1～16）。序号模式不返回
+future_frame_times，接口不接收时间戳和频率参数。失败样本的 success 为 false，
 位置/旋转为 NaN，夹爪为 −1。重建、全局编码、池化和 T5 编码在一次生成中只执行一次。
 
 ```bash
-python -m pytest tests/test_action_policy.py tests/test_action_dataset.py -q
+python -m pytest tests/test_action_policy.py tests/test_action_dataset.py tests/test_stage2_index_mode.py -q
 ```

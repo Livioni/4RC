@@ -91,7 +91,7 @@ def tiny_batch(batch_size=1, frames=8, horizon=16):
         "history_tcp_query_points": centres,
         "history_tcp_valid": torch.ones(batch_size, frames, 2, dtype=torch.bool),
         "frame_times": torch.arange(frames).expand(batch_size, -1) / 15,
-        "future_frame_times": torch.arange(frames, frames + horizon).expand(batch_size, -1) / 15,
+        "future_step_indices": torch.arange(1, horizon + 1).expand(batch_size, -1),
         "future_actions": future, "instruction": ["lift the cup"] * batch_size,
         "shuffled_instruction": ["open the drawer"] * batch_size,
         "depth": torch.ones(batch_size, frames, height, width),

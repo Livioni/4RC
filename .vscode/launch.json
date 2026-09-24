@@ -54,6 +54,35 @@
                 "--output-dir",
                 "${workspaceFolder}/outputs/droid/stage2_debug"
             ]
+        },
+        {
+            "name": "RoboTwin: Stage 2",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_4rc_stage2.py",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "env": {
+                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}",
+                "WANDB_MODE": "offline"
+            },
+            "args": [
+                "--config",
+                "${workspaceFolder}/configs/train/4rc-stage2-action.py",
+                "--num-workers",
+                "0",
+                "--max-episodes",
+                "8",
+                "--max-train-steps",
+                "2",
+                "--batch-size",
+                "1",
+                "--validation-batches",
+                "1",
+                "--output-dir",
+                "${workspaceFolder}/outputs/4rc-stage2-action_debug"
+            ]
         }
     ]
 }

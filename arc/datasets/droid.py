@@ -293,7 +293,7 @@ class DroidDataset(torch.utils.data.Dataset):
             sample.update(history_tcp_query_points=centres, history_tcp_valid=visible,
                           future_actions=future_actions_in_current_camera(future, ext.expand(len(future), -1, -1), ext),
                           future_action_valid=torch.tensor(future_indices < end),
-                          future_frame_times=torch.tensor(future_indices / FPS, dtype=torch.float32),
+                          future_step_indices=torch.arange(1, self.prediction_horizon + 1),
                           instruction=text, shuffled_instruction=shuffled)
         return sample
 

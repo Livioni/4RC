@@ -200,7 +200,7 @@ def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str 
         Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3)),
         t5_model=t5_model or config["t5_model"], text_max_length=config["text_max_length"],
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
-        prediction_horizon=config["prediction_horizon"], time_unit_seconds=config["time_unit_seconds"],
+        prediction_horizon=config["prediction_horizon"],
     )
     # load_model restores omitted aliases of the geometry head's shared norms.
     load_model(policy, str(checkpoint / "model.safetensors"), strict=True, device="cpu")
@@ -217,8 +217,8 @@ def _numpy(tensor: torch.Tensor) -> np.ndarray:
 
 @torch.inference_mode()
 def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
-                        query_points: torch.Tensor, frame_times: torch.Tensor, instruction: str,
-                        *, frequency_hz: float, steps: int = 8, seed: int = 42,
+                        query_points: torch.Tensor, instruction: str,
+                        *, steps: int = 8, seed: int = 42,
                         device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32) -> dict:
     """Infer one window, reusing reconstruction features for the action condition.
 
@@ -226,22 +226,18 @@ def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
     historical TCPs are in their individual cameras, actions in the last camera.
     No historical/future TCP truth or future RGB is accepted by this function.
     """
-    if not instruction.strip() or not math.isfinite(frequency_hz) or frequency_hz <= 0:
-        raise ValueError("Instruction and positive finite frequency are required")
-    images, intrinsics, query_points, frame_times = [
-        value.to(device) for value in (images, intrinsics, query_points, frame_times)
-    ]
+    if not instruction.strip():
+        raise ValueError("Instruction is required")
+    images, intrinsics, query_points = [value.to(device) for value in (images, intrinsics, query_points)]
     if images.shape[0] != 1:
         raise ValueError("Standalone window inference expects batch size one")
     generator = torch.Generator(device=device).manual_seed(seed)
-    future_times = frame_times[:, -1:] + torch.arange(1, policy.prediction_horizon + 1, device=device)[None] / frequency_hz
     context = torch.autocast(device_type=device.type, dtype=dtype) if dtype != torch.float32 else contextlib.nullcontext()
     with context:
         reconstruction, features = policy.reconstruct(images, query_points)
-        condition = policy.make_condition(images, intrinsics, frame_times, future_times,
-                                          [instruction], reconstruction, features)
+        condition = policy.make_condition(images, intrinsics, [instruction], reconstruction, features)
         actions = policy.sample_condition(condition, steps=steps, generator=generator)
-    return {
+    result = {
         "depth": _numpy(reconstruction["depth"][0]),
         "depth_confidence": _numpy(reconstruction["depth_conf"][0]),
         "history_position": _numpy(reconstruction["tcp_position"][0]),
@@ -254,8 +250,9 @@ def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
         "action_rotation": _numpy(actions["action_rotation"][0]),
         "action_gripper": actions["action_gripper"][0].cpu().numpy(),
         "action_gripper_score": _numpy(actions["action_gripper_score"][0]),
-        "future_frame_times": _numpy(actions["future_frame_times"][0]),
+        "future_step_indices": actions["future_step_indices"][0].cpu().numpy(),
     }
+    return result
 
 
 def transform_history(position: np.ndarray, rotation: np.ndarray, extrinsics: np.ndarray):
@@ -341,8 +338,9 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     result = {
-        "format_version": 1, "episode": str(episode.path), "view": episode.view,
-        "instruction": episode.instruction, "frequency_hz": episode.frequency_hz,
+        "format_version": 2,
+        "episode": str(episode.path), "view": episode.view, "time_encoding": "index",
+        "instruction": episode.instruction, "source_frequency_hz": episode.frequency_hz,
         "history_frames": config["history_frames"], "prediction_horizon": policy.prediction_horizon,
         "window_stride": stride, "sampling_steps": steps, "seed": seed,
         "coordinate_system": "Each window: last observation OpenCV camera (+x right, +y down, +z forward), metres",
@@ -359,9 +357,8 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
                 progress(number / len(scheduled), message)
             started = time.perf_counter()
             images, intrinsics, query_tensor = prepare_images(episode.image_paths[start:end], episode.intrinsics, queries)
-            frame_times = torch.tensor(episode.frame_indices[start:end] / episode.frequency_hz, dtype=torch.float32)[None]
-            prediction = infer_stage2_window(policy, images, intrinsics, query_tensor, frame_times,
-                episode.instruction, frequency_hz=episode.frequency_hz, steps=steps, seed=seed + number,
+            prediction = infer_stage2_window(policy, images, intrinsics, query_tensor, episode.instruction,
+                steps=steps, seed=seed + number,
                 device=device, dtype=dtype)
             camera_positions = prediction["history_position"]
             position, rotation = transform_history(camera_positions, prediction["history_rotation"], episode.extrinsics[start:end])
@@ -378,6 +375,7 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             record = {
                 "window_index": number, "start": start, "end": end,
                 "frame_indices": episode.frame_indices[start:end], "anchor_frame": int(episode.frame_indices[end - 1]),
+                "future_step_indices": np.arange(1, policy.prediction_horizon + 1),
                 "future_frame_indices": episode.frame_indices[end - 1] + np.arange(1, policy.prediction_horizon + 1),
                 "query_points_px": queries.copy(), "query_source": query_source,
                 "query_points_projected_px": projected_queries.copy(),
@@ -741,10 +739,12 @@ def parse_args():
     parser.add_argument("--interactive", action="store_true", help="Gradio first-frame selection and instruction editor")
     parser.add_argument("--headless", action="store_true", help="Save outputs without opening Viser")
     parser.add_argument("--max-windows", type=int, help="Debug limit; output is marked incomplete if truncated")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8020)
-    parser.add_argument("--ui-host", default="127.0.0.1")
-    parser.add_argument("--ui-port", type=int, default=7860)
+    parser.add_argument("--host", default="127.0.0.1", help="Viser 3D viewer host (default: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8020,
+                        help="Viser 3D viewer port (default: 8020); use --ui-port for Gradio")
+    parser.add_argument("--ui-host", default="127.0.0.1", help="Gradio interactive page host (default: 127.0.0.1)")
+    parser.add_argument("--ui-port", "--server-port", "--server_port", dest="ui_port", type=int, default=7860,
+                        help="Gradio interactive page port (default: 7860); independent of --port")
     parser.add_argument("--point-size", type=float, default=0.003)
     parser.add_argument("--fps", type=float, default=5.0, help="Initial playback frames per second (0.25–30)")
     parser.add_argument("--confidence-percentile", type=float, default=2.5)

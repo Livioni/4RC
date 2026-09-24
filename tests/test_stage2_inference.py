@@ -78,12 +78,12 @@ def test_single_forward_and_reproducibility():
     torch.set_num_threads(2)
     policy = TCPActionPolicy(TinyArc(), language_encoder=TinyLanguage(), dim=32, depth=2, heads=4).eval()
     batch = tiny_batch()
-    args = (policy, batch["images"], batch["intrinsics"], batch["tcp_query_points"], batch["frame_times"], "lift shoes")
-    first = inference.infer_stage2_window(*args, frequency_hz=15, steps=2)
+    args = (policy, batch["images"], batch["intrinsics"], batch["tcp_query_points"], "lift shoes")
+    first = inference.infer_stage2_window(*args, steps=2)
     assert policy.arc.calls == 1
     assert first["depth"].shape == (8, 42, 42)
     assert first["action_position"].shape == (16, 2, 3)
-    second = inference.infer_stage2_window(*args, frequency_hz=15, steps=2)
+    second = inference.infer_stage2_window(*args, steps=2)
     np.testing.assert_array_equal(first["action_position"], second["action_position"])
 
 
@@ -100,9 +100,10 @@ def test_truth_partial_missing_and_camera_transform(episode):
     assert inference.load_tcp_truth(episode) is None
 
 
-def fake_window(policy, images, intrinsics, query_points, frame_times, instruction, **kwargs):
+def fake_window(policy, images, intrinsics, query_points, instruction, **kwargs):
     frames = images.shape[1]
-    frame_index = np.rint(frame_times[0].numpy() * 15).astype(int)
+    # Fixture RGB encodes the absolute source frame; timestamps are not inputs.
+    frame_index = np.rint((images[0, :, 0, 10, 10].numpy() + 1) * 255 / 2).astype(int)
     positions = np.zeros((frames, 2, 3), dtype=np.float32)
     positions[..., 0] = frame_index[:, None] * 0.001 + [-0.2, 0.2]
     positions[..., 2] = 1
@@ -113,7 +114,7 @@ def fake_window(policy, images, intrinsics, query_points, frame_times, instructi
         "history_valid": np.ones((frames, 2), dtype=bool), "success": True,
         "action_position": np.broadcast_to(positions[-1], (16, 2, 3)).copy(),
         "action_rotation": np.broadcast_to(np.eye(3), (16, 2, 3, 3)).copy(), "action_gripper": np.zeros((16, 2), dtype=int),
-        "action_gripper_score": np.zeros((16, 2)), "future_frame_times": frame_times[0, -1].item() + np.arange(1, 17) / 15}
+        "action_gripper_score": np.zeros((16, 2)), "future_step_indices": np.arange(1, 17)}
 
 
 def test_episode_propagation_and_memory_geometry(episode, tmp_path, monkeypatch):
@@ -235,3 +236,64 @@ def test_outside_queries_continue_sliding_windows(episode, tmp_path, monkeypatch
     # User input and first-frame truth retain strict validation.
     with pytest.raises(ValueError, match="outside"):
         inference.project_queries(np.array([[-2, 2, 1], [0, 0, 1]]), episode.intrinsics)
+
+
+def test_index_window_needs_no_times_or_frequency():
+    from test_action_policy import policy
+    model = policy(prediction_horizon=16).eval()
+    batch = tiny_batch(horizon=16)
+    result = inference.infer_stage2_window(
+        model, batch["images"], batch["intrinsics"], batch["tcp_query_points"],
+        instruction="lift shoes", steps=2,
+    )
+    assert result["action_position"].shape == (16, 2, 3)
+    assert result["future_step_indices"].tolist() == list(range(1, 17))
+    assert "future_frame_times" not in result
+
+
+def test_index_episode_outputs_steps_and_record_alignment(episode, tmp_path):
+    from test_action_policy import policy
+    model = policy(prediction_horizon=16).eval()
+    result = inference.infer_episode_sliding_windows(
+        model, episode, inference.initial_truth_queries(episode), tmp_path / "index",
+        config={"history_frames": 8}, query_source="test",
+        steps=1, keep_geometry=False,
+    )
+    assert result["complete"] and result["prediction_horizon"] == 16
+    assert result["format_version"] == 2 and result["source_frequency_hz"] == 15
+    assert "frequency_hz" not in result  # The source rate is not an execution rate.
+    for record in result["windows"]:
+        assert record["future_step_indices"].tolist() == list(range(1, 17))
+        assert "future_frame_times" not in record
+        np.testing.assert_array_equal(record["future_frame_indices"], record["anchor_frame"] + np.arange(1, 17))
+        assert record["ground_truth"]["valid"].sum() == min(16, 16 - record["anchor_frame"])
+    saved = json.loads((tmp_path / "index/predictions.json").read_text())
+    assert saved["time_encoding"] == "index"
+    assert all("future_frame_times" not in w for w in saved["windows"])
+
+
+@pytest.mark.parametrize("old_metadata", [False, True])
+def test_checkpoint_loader_always_uses_sequence_indices(tmp_path, monkeypatch, old_metadata):
+    from safetensors.torch import save_model
+    import arc.models.arc.arc as arc_module
+    import arc.models.arc.arc_action as action_module
+    from test_action_policy import policy
+    monkeypatch.setattr(arc_module, "Arc", TinyArc)
+    monkeypatch.setattr(action_module, "FrozenT5Encoder", lambda *a, **k: TinyLanguage())
+    horizon = 16
+    model = policy(prediction_horizon=horizon).eval()
+    save_model(model, str(tmp_path / "model.safetensors"))
+    config = dict(training_stage=2, normalize_geometry=False, action_dim=32, action_depth=2,
+                  action_heads=4, prediction_horizon=horizon, text_max_length=128,
+                  t5_model="unused")
+    if old_metadata:
+        config.update(time_encoding="physical", time_unit_seconds=1/15)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    loaded, _ = inference.load_stage2_policy(tmp_path, torch.device("cpu"))
+    assert loaded.prediction_horizon == horizon
+    batch = tiny_batch()
+    result = loaded.sample_actions(batch["images"], batch["instruction"], batch["tcp_query_points"],
+                                   batch["intrinsics"], steps=1)
+    assert result["future_step_indices"].tolist() == [list(range(1, 17))]
+    assert "future_frame_times" not in result
+    torch.testing.assert_close(loaded.state_dict(), model.state_dict())
