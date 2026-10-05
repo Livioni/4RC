@@ -145,7 +145,8 @@ def test_stage2_weight_initialization_preserves_scale_and_restarts_training(tmp_
     runner = small_runner
     source = legacy_checkpoint / "model.safetensors" if file_only else legacy_checkpoint
     output = tmp_path / "initialized"
-    config = small_config(output, stage1_checkpoint="missing-stage1", stage2_checkpoint=str(source), max_train_steps=1)
+    config = small_config(output, stage1_checkpoint="missing-stage1", stage2_checkpoint=str(source),
+                          max_train_steps=1, tasks=["lift"])
     path = tmp_path / "initialized.json"
     path.write_text(json.dumps(config))
     expected = runner.read_weights(legacy_checkpoint)
@@ -177,6 +178,7 @@ def test_stage2_weight_initialization_preserves_scale_and_restarts_training(tmp_
     saved = json.loads((output / "final_checkpoint/config.json").read_text())
     assert not {"time_encoding", "time_unit_seconds", "tcp_velocity_scale"} & saved.keys()
     assert saved["tcp_temporal_weight"] == 0 and saved["prediction_horizon"] == 16
+    assert saved["tasks"] == ["lift"]
     trained = runner.read_weights(output / "final_checkpoint")
     for name in ("action_position_mean", "action_position_std",
                  "arc.tcp_track_head.position_mean", "arc.tcp_track_head.position_std"):
@@ -190,6 +192,8 @@ def test_stage2_weight_initialization_preserves_scale_and_restarts_training(tmp_
     runner.main()
     continued = json.loads((tmp_path / "continued/final_checkpoint/trainer_state.json").read_text())
     assert continued["global_step"] == 2 and continued["batch_in_epoch"] == 2
+    continued_config = json.loads((tmp_path / "continued/final_checkpoint/config.json").read_text())
+    assert continued_config["tasks"] == ["lift"]
 
 
 def test_index_mode_requires_velocity_loss_disabled(small_runner, tmp_path):

@@ -74,6 +74,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         seed: int = 42,
         augment: bool = True,
         max_episodes: int | None = None,
+        tasks: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.root = Path(root).expanduser()
         self.view = view
@@ -125,11 +126,28 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         if max_episodes is not None and max_episodes < 1:
             raise ValueError("max_episodes must be positive when provided")
 
+        episode_paths = self.root.glob("*/*")
+        if tasks is not None:
+            if not isinstance(tasks, (list, tuple)) or not tasks or any(
+                not isinstance(task, str) or not task.strip() for task in tasks
+            ):
+                raise ValueError("tasks must be None or a non-empty list/tuple of task names")
+            task_names = set(tasks)
+            available = {path.name: path for path in self.root.iterdir() if path.is_dir()}
+            missing = sorted(task_names.difference(available))
+            if missing:
+                raise ValueError(f"Unknown RoboTwin task(s) below {self.root}: {missing}")
+            # Restrict discovery before reading labels, limiting episodes or
+            # computing statistics. Keep the same episode ordering as all-task runs.
+            episode_paths = (
+                path for task in task_names for path in available[task].iterdir()
+            )
+
         episodes: list[RoboTwinEpisode] = []
         tcp_position_sum = np.zeros((2, 3), dtype=np.float64)
         tcp_position_square_sum = np.zeros((2, 3), dtype=np.float64)
         tcp_position_count = 0
-        for episode_path in sorted(self.root.glob("*/*")):
+        for episode_path in sorted(episode_paths):
             if not episode_path.is_dir():
                 continue
             rgb_dir = episode_path / "images" / view
@@ -233,7 +251,8 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
                 break
 
         if not episodes:
-            raise RuntimeError(f"No valid RoboTwin episodes found below {self.root}")
+            selection = "" if tasks is None else f" for tasks {tasks!r}"
+            raise RuntimeError(f"No valid RoboTwin episodes found below {self.root}{selection}")
         self.episodes = episodes
         self.invalid_transition_count = sum(
             episode.invalid_transition_count for episode in episodes

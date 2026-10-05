@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 
 
-DEFAULT_CHECKPOINT = Path("checkpoints/RoboTwin-Stage2/180000")
+DEFAULT_CHECKPOINT = Path("checkpoints/RoboTwin-Stage2-no-temporal/250000")
 WIDTH, HEIGHT = 320, 240
 PADDING = (1, 1, 6, 6)
 ARMS = ("left", "right")
@@ -99,15 +99,16 @@ def load_episode(input_path: Path, view: str, instruction: str | None = None) ->
                          extrinsics, float(rate), instruction.strip())
 
 
-def build_windows(num_frames: int, history_frames: int = 8, stride: int = 7) -> list[tuple[int, int]]:
+def build_windows(num_frames: int, history_frames: int = 8, stride: int = 1) -> list[tuple[int, int]]:
+    """Schedule causal observation ranges, including the first and last frames."""
     if history_frames < 2 or not 1 <= stride < history_frames:
         raise ValueError("window stride must be between 1 and history_frames - 1")
-    if num_frames < history_frames:
-        raise ValueError(f"Need at least {history_frames} RGB frames, found {num_frames}")
-    starts = list(range(0, num_frames - history_frames + 1, stride))
-    if starts[-1] != num_frames - history_frames:
-        starts.append(num_frames - history_frames)
-    return [(s, s + history_frames) for s in starts]
+    if num_frames < 1:
+        raise ValueError("Need at least one RGB frame")
+    anchors = list(range(0, num_frames, stride))
+    if anchors[-1] != num_frames - 1:
+        anchors.append(num_frames - 1)
+    return [(max(0, anchor - history_frames + 1), anchor + 1) for anchor in anchors]
 
 
 def load_rgb(path: Path) -> np.ndarray:
@@ -262,29 +263,35 @@ def transform_history(position: np.ndarray, rotation: np.ndarray, extrinsics: np
     return positions.astype(np.float32), rotations.astype(np.float32)
 
 
-def future_truth(episode: EpisodeInputs, truth: np.ndarray | None, anchor: int, horizon: int) -> dict:
+def tcp_truth_in_anchor_camera(episode: EpisodeInputs, truth: np.ndarray | None,
+                               offsets: np.ndarray, anchor: int) -> dict:
+    """Align selected episode frames to one camera, retaining missing-label slots."""
     from arc.action import future_actions_in_current_camera, safe_rotation_6d_to_matrix
 
-    valid = np.zeros(horizon, dtype=bool)
-    positions = np.full((horizon, 2, 3), np.nan, dtype=np.float32)
-    rotations = np.full((horizon, 2, 3, 3), np.nan, dtype=np.float32)
-    grippers = np.full((horizon, 2), -1, dtype=np.int64)
+    offsets = np.asarray(offsets, dtype=np.int64)
+    valid = np.zeros(len(offsets), dtype=bool)
+    positions = np.full((len(offsets), 2, 3), np.nan, dtype=np.float32)
+    rotations = np.full((len(offsets), 2, 3, 3), np.nan, dtype=np.float32)
+    grippers = np.full((len(offsets), 2), -1, dtype=np.int64)
     if truth is not None:
-        offsets = np.arange(anchor + 1, min(anchor + horizon + 1, len(episode.image_paths)))
-        offsets = offsets[episode.frame_indices[offsets] < len(truth)]
-        if len(offsets):
-            state = truth[episode.frame_indices[offsets]]
+        slots = np.flatnonzero((offsets >= 0) & (offsets < len(episode.image_paths)))
+        slots = slots[episode.frame_indices[offsets[slots]] < len(truth)]
+        if len(slots):
+            state = truth[episode.frame_indices[offsets[slots]]]
             finite = np.isfinite(state).all(axis=(1, 2)) & np.isin(state[..., 6], [0, 1]).all(axis=1)
-            offsets, state = offsets[finite], state[finite]
-            if len(offsets):
+            slots, state = slots[finite], state[finite]
+            if len(slots):
                 actions = future_actions_in_current_camera(torch.from_numpy(state),
-                    torch.from_numpy(episode.extrinsics[offsets]), torch.from_numpy(episode.extrinsics[anchor]))
-                slots = offsets - anchor - 1
+                    torch.from_numpy(episode.extrinsics[offsets[slots]]), torch.from_numpy(episode.extrinsics[anchor]))
                 valid[slots] = True
                 positions[slots] = actions[..., :3].numpy()
                 rotations[slots] = safe_rotation_6d_to_matrix(actions[..., 3:9]).numpy()
                 grippers[slots] = (actions[..., 9].numpy() >= 0).astype(np.int64)
     return {"valid": valid, "position": positions, "rotation": rotations, "gripper": grippers}
+
+
+def future_truth(episode: EpisodeInputs, truth: np.ndarray | None, anchor: int, horizon: int) -> dict:
+    return tcp_truth_in_anchor_camera(episode, truth, np.arange(anchor + 1, anchor + horizon + 1), anchor)
 
 
 def trajectory_metrics(prediction: dict, truth: dict) -> dict:
@@ -319,7 +326,7 @@ def save_result(result: dict, output: Path) -> None:
 
 def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_queries: np.ndarray,
                                   output: Path, *, config: dict, query_source: str,
-                                  stride: int = 7, steps: int | None = None, seed: int = 42,
+                                  stride: int = 1, steps: int | None = None, seed: int = 42,
                                   device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
                                   max_windows: int | None = None, keep_geometry: bool = True,
                                   progress: Callable[[float, str], None] | None = None) -> dict:
@@ -338,7 +345,7 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     result = {
-        "format_version": 2,
+        "format_version": 3, "window_schedule": "causal",
         "episode": str(episode.path), "view": episode.view, "time_encoding": "index",
         "instruction": episode.instruction, "source_frequency_hz": episode.frequency_hz,
         "history_frames": config["history_frames"], "prediction_horizon": policy.prediction_horizon,
@@ -356,10 +363,19 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             if progress:
                 progress(number / len(scheduled), message)
             started = time.perf_counter()
-            images, intrinsics, query_tensor = prepare_images(episode.image_paths[start:end], episode.intrinsics, queries)
+            # Match training: repeat the oldest available observation, never read ahead.
+            padding = config["history_frames"] - (end - start)
+            input_offsets = np.maximum(np.arange(end - config["history_frames"], end), start)
+            images, intrinsics, query_tensor = prepare_images(
+                [episode.image_paths[offset] for offset in input_offsets], episode.intrinsics, queries)
             prediction = infer_stage2_window(policy, images, intrinsics, query_tensor, episode.instruction,
                 steps=steps, seed=seed + number,
                 device=device, dtype=dtype)
+            # Keep only distinct observed frames for export and visualization. The
+            # last padded copy represents the actual oldest observation.
+            for key in ("depth", "depth_confidence", "history_position", "history_rotation",
+                        "history_gripper_probability", "history_confidence", "history_valid"):
+                prediction[key] = prediction[key][padding:]
             camera_positions = prediction["history_position"]
             position, rotation = transform_history(camera_positions, prediction["history_rotation"], episode.extrinsics[start:end])
             gt = future_truth(episode, truth, end - 1, policy.prediction_horizon)
@@ -374,6 +390,7 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             del depth, confidence
             record = {
                 "window_index": number, "start": start, "end": end,
+                "input_frame_indices": episode.frame_indices[input_offsets], "history_padding": padding,
                 "frame_indices": episode.frame_indices[start:end], "anchor_frame": int(episode.frame_indices[end - 1]),
                 "future_step_indices": np.arange(1, policy.prediction_horizon + 1),
                 "future_frame_indices": episode.frame_indices[end - 1] + np.arange(1, policy.prediction_horizon + 1),
@@ -382,6 +399,7 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
                 "query_points_clipped": query_clipped.copy(),
                 "history_position": position, "history_rotation": rotation,
                 **{key: value for key, value in prediction.items() if key not in {"history_position", "history_rotation"}},
+                "history_ground_truth": tcp_truth_in_anchor_camera(episode, truth, np.arange(start, end), end - 1),
                 "ground_truth": gt, "metrics": trajectory_metrics(prediction, gt),
                 "inference_seconds": time.perf_counter() - started,
             }
@@ -390,6 +408,9 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             print(f"  {record['inference_seconds']:.2f}s; success={prediction['success']}; ADE={record['metrics']['position_ade_m']}", flush=True)
             if number + 1 < len(scheduled):
                 next_start = scheduled[number + 1][0]
+                if next_start == start:
+                    # Growing startup histories still begin at the same queried frame.
+                    continue
                 projected_queries = project_queries(
                     camera_positions[next_start - start], episode.intrinsics, allow_outside=True,
                 )
@@ -438,11 +459,13 @@ def make_point_cloud(depth: np.ndarray, confidence: np.ndarray, rgb: np.ndarray,
 
 
 def build_playback_frames(result: dict) -> list[tuple[int, int]]:
-    """Use the first reconstruction covering each frame, including overlap/tail."""
+    """Play each causal prediction at its anchor; retain legacy result playback."""
     windows = result["windows"]
     geometry = result.get("_geometry", [])
     if not windows or len(geometry) != len(windows):
         raise ValueError("Playback requires in-memory geometry for every completed window")
+    if result.get("window_schedule") == "causal":
+        return [(index, record["end"] - record["start"] - 1) for index, record in enumerate(windows)]
     slots = {}
     for index, record in enumerate(windows):
         for frame in range(record["start"], record["end"]):
@@ -465,6 +488,13 @@ class Stage2Viewer:
         self.result, self.episode = result, episode
         self.max_points, self.max_depth = max_points, max_depth
         self.frame_slots = build_playback_frames(result)
+        # Older in-memory results may predate the saved historical labels.
+        if any("history_ground_truth" not in record for record in result["windows"]):
+            truth = load_tcp_truth(episode)
+            for record in result["windows"]:
+                if "history_ground_truth" not in record:
+                    record["history_ground_truth"] = tcp_truth_in_anchor_camera(
+                        episode, truth, np.arange(record["start"], record["end"]), record["end"] - 1)
         if not math.isfinite(fps) or not 0.25 <= fps <= 30:
             raise ValueError("FPS must be between 0.25 and 30")
         if not math.isfinite(point_size) or point_size <= 0:
@@ -478,7 +508,7 @@ class Stage2Viewer:
         self._nodes = []
         gui = self.server.gui
         with gui.add_folder("Playback", expand_by_default=True):
-            self.frame = gui.add_slider("Frame", min=0, max=max(1, len(self.frame_slots) - 1), step=1, initial_value=0,
+            self.frame = gui.add_slider("Frame" if result.get("window_stride", 1) == 1 else "Prediction", min=0, max=max(1, len(self.frame_slots) - 1), step=1, initial_value=0,
                                         disabled=len(self.frame_slots) == 1)
             self.previous = gui.add_button("Previous")
             self.next = gui.add_button("Next")
@@ -493,14 +523,15 @@ class Stage2Viewer:
         with gui.add_folder("TCP", expand_by_default=True):
             self.future = gui.add_slider("Future steps", min=1, max=result["prediction_horizon"], step=1,
                                          initial_value=result["prediction_horizon"])
-            self.show_history = gui.add_checkbox("Recovered history", True)
+            self.show_history = gui.add_checkbox("Recovered TCP (observed frames)", True)
+            self.show_history_gt = gui.add_checkbox("History ground truth (dashed)", True)
             self.show_prediction = gui.add_checkbox("Predicted future", True)
-            self.show_gt = gui.add_checkbox("Ground truth (dashed)", True)
+            self.show_gt = gui.add_checkbox("Future ground truth (dashed)", True)
             self.show_axes = gui.add_checkbox("TCP orientation axes", True)
         gui.add_markdown(f"**Instruction:** {episode.instruction}\n\nLeft: orange; right: blue. GT: yellow / green.")
         self.info = gui.add_markdown("")
         self.rgb_handle = gui.add_image(load_rgb(episode.image_paths[0]), label="Historical RGB")
-        for control in (self.frame, self.future, self.show_cloud, self.show_history,
+        for control in (self.frame, self.future, self.show_cloud, self.show_history, self.show_history_gt,
                         self.show_prediction, self.show_gt, self.show_axes, self.confidence):
             control.on_update(lambda _: self.refresh())
         self.previous.on_click(lambda _: self.step_frame(-1))
@@ -521,7 +552,7 @@ class Stage2Viewer:
             self.server, frame_count=len(self.frame_slots), frame=self.frame, fps=self.fps,
             controls=[self.frame, self.previous, self.next, self.play, self.fps,
                       self.point_size, self.confidence, self.show_cloud, self.future,
-                      self.show_history, self.show_prediction, self.show_gt, self.show_axes],
+                      self.show_history, self.show_history_gt, self.show_prediction, self.show_gt, self.show_axes],
             render_frame=self.refresh, lock=self._lock, stop_event=self._closed,
             filename="stage2_episode.mp4",
         )
@@ -602,11 +633,19 @@ class Stage2Viewer:
             hr = np.asarray(record["history_rotation"], dtype=np.float32)
             ap = np.asarray(record["action_position"], dtype=np.float32)
             ar = np.asarray(record["action_rotation"], dtype=np.float32)
+            history_gt = record["history_ground_truth"]
+            hgp = np.array(history_gt["position"], dtype=np.float32)
+            hgp[~np.asarray(history_gt["valid"], dtype=bool)] = np.nan
             n = self.future.value
             if self.show_history.value:
                 self._trajectory("history", hp, ARM_COLORS, width=1)
                 if self.show_axes.value:
                     self._axes("history_axes", hp[local], hr[local])
+            if self.show_history_gt.value:
+                self._trajectory("history_truth", hgp, GT_COLORS, dashed=True, width=2)
+                if self.show_axes.value:
+                    self._axes("history_truth_axes", hgp[local],
+                               np.asarray(history_gt["rotation"], dtype=np.float32)[local])
             if self.show_prediction.value and record["success"]:
                 self._trajectory("prediction", np.concatenate((hp[-1:], ap[:n])), ARM_COLORS, width=4)
                 if self.show_axes.value:
@@ -615,13 +654,13 @@ class Stage2Viewer:
             if self.show_gt.value:
                 gp = np.array(gt["position"], dtype=np.float32)[:n]
                 gp[~np.asarray(gt["valid"])[:n]] = np.nan
-                self._trajectory("truth", gp, GT_COLORS, dashed=True, width=2)
+                self._trajectory("truth", np.concatenate((hgp[-1:], gp)), GT_COLORS, dashed=True, width=2)
             grip = np.asarray(record["action_gripper"])[n - 1]
             states = ", ".join(f"{arm}: {'open' if value == 1 else 'closed' if value == 0 else 'invalid'}" for arm, value in zip(ARMS, grip))
             self.info.content = (f"**Frame {self.episode.frame_indices[frame]}** · window {index} · history {record['frame_indices'][0]}–{record['anchor_frame']} "
-                f"· future +{n}\n\nSuccess: **{record['success']}** · {states}\n\n"
+                f"· future frames {record['future_frame_indices'][0]}–{record['future_frame_indices'][n - 1]}\n\nSuccess: **{record['success']}** · {states}\n\n"
                 f"GT steps: {record['metrics']['valid_steps']} · ADE (m): {record['metrics']['position_ade_m']}\n\n"
-                "Coordinates: last historical camera; geometry is historical, trajectories are future predictions.")
+                "Coordinates: last historical camera. Dashed yellow/green: history and future ground truth.")
 
     def close(self):
         self._closed.set()
@@ -730,7 +769,8 @@ def parse_args():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--view", default="third_views")
     parser.add_argument("--instruction", help="Override metadata's first non-empty instruction")
-    parser.add_argument("--window-stride", type=int, default=7)
+    parser.add_argument("--window-stride", type=int, default=1,
+                        help="Predict every N frames from frame 0; playback shows prediction frames (default: 1)")
     parser.add_argument("--sampling-steps", type=int)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--t5-model", help="Local T5 directory or pretrained identifier")

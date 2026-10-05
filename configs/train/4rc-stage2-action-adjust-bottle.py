@@ -5,15 +5,15 @@
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-stage2-action-global-debug"
-wandb_run_name = "4rc-stage2-action-global-debug"
+output_dir = "outputs/4rc-stage2-action-adjust-bottle"
+wandb_run_name = "4rc-stage2-action-adjust-bottle"
 logging_dir = "logs"
-stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"  # Used when neither Stage2 initialization nor resume is set.
-stage2_checkpoint = None  # Stage2 weight file or directory; new optimizer, scheduler and step count.
+stage1_checkpoint = None  # Used when neither Stage2 initialization nor resume is set.
+stage2_checkpoint = "outputs/4rc-stage2-action-no-temporal/checkpoint-250000/model.safetensors"  # Stage2 weight file or directory; new optimizer, scheduler and step count.
 resume = None  # Optional full-state recovery for a run using the current sequence configuration.
 
 # == Dataset Configuration ==
-tasks = None  # All tasks; applies to every enabled source, for training and validation.
+tasks = ["adjust_bottle"]  # All tasks; applies to every enabled source, for training and validation.
 # tasks = ["adjust_bottle", "stack_blocks_two"]  # Exact task directory names.
 # Relative sampling weights are normalized over enabled sources. A zero weight
 # skips the source entirely, including task-directory checks.
@@ -36,7 +36,7 @@ data_sources = (
 view = "third_views"
 history_frames = 8  # Include anchors 0..7; repeat the oldest frame if history is short.
 prediction_horizon = 16  # Next 16 action records, with no execution-frequency assumption; short futures are masked.
-batch_size = 1  # Per GPU; each sample contains history_frames input images.
+batch_size = 3  # Per GPU; each sample contains history_frames input images.
 # Step indices encode observation order; repeated frames keep their source timestamps.
 # The action adapter requires forward windows within one valid segment. The runner derives
 # these image budgets and intervals again from batch_size / history_frames.
@@ -123,8 +123,8 @@ warmup_steps = 1000
 eta_min_factor = 0.1
 
 # == Loss Configuration ==
-geometry_loss_weight = 1.0
-tcp_loss_weight = 1.0
+geometry_loss_weight = 0.5
+tcp_loss_weight = 0.5
 action_loss_weight = 1.0
 
 depth_loss_weight = 1.0

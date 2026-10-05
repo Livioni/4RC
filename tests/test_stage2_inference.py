@@ -44,13 +44,17 @@ def test_preprocessing_and_input_validation(episode):
         inference.load_episode(episode.path, episode.view)
 
 
-@pytest.mark.parametrize("frames,stride,expected", [(8, 7, [(0, 8)]), (17, 7, [(0, 8), (7, 15), (9, 17)]),
-    (10, 1, [(0, 8), (1, 9), (2, 10)]), (15, 7, [(0, 8), (7, 15)])])
+@pytest.mark.parametrize("frames,stride,expected", [
+    (1, 1, [(0, 1)]), (3, 1, [(0, 1), (0, 2), (0, 3)]),
+    (8, 7, [(0, 1), (0, 8)]), (17, 7, [(0, 1), (0, 8), (7, 15), (9, 17)]),
+    (10, 1, [(max(0, t - 7), t + 1) for t in range(10)]),
+    (15, 7, [(0, 1), (0, 8), (7, 15)]),
+])
 def test_windows(frames, stride, expected):
     assert inference.build_windows(frames, 8, stride) == expected
 
 
-@pytest.mark.parametrize("frames,stride", [(7, 7), (8, 0), (16, 8)])
+@pytest.mark.parametrize("frames,stride", [(0, 1), (8, 0), (16, 8)])
 def test_invalid_windows(frames, stride):
     with pytest.raises(ValueError):
         inference.build_windows(frames, 8, stride)
@@ -100,6 +104,35 @@ def test_truth_partial_missing_and_camera_transform(episode):
     assert inference.load_tcp_truth(episode) is None
 
 
+def test_historical_truth_moving_camera_and_nonzero_source_indices(episode):
+    from dataclasses import replace
+
+    truth = inference.load_tcp_truth(episode)
+    world = truth[0, :, :3].copy()
+    angle = np.arange(len(truth), dtype=np.float32) * 0.03
+    extrinsics = episode.extrinsics.copy()
+    extrinsics[:, 0, 0] = extrinsics[:, 1, 1] = np.cos(angle)
+    extrinsics[:, 0, 1], extrinsics[:, 1, 0] = -np.sin(angle), np.sin(angle)
+    extrinsics[:, 0, 3] = np.arange(len(truth)) * 0.01
+    truth[..., :3] = np.einsum("tij,aj->tai", extrinsics[:, :3, :3], world) + extrinsics[:, None, :3, 3]
+    truth[..., 5] = angle[:, None]
+    # Episode-local frame 0 is source frame 3, and the window starts later still.
+    episode = replace(episode, image_paths=episode.image_paths[3:],
+                      frame_indices=episode.frame_indices[3:], extrinsics=extrinsics[3:])
+    gt = inference.tcp_truth_in_anchor_camera(episode, truth, np.arange(2, 10), 9)
+    expected = world @ extrinsics[12, :3, :3].T + extrinsics[12, :3, 3]
+    np.testing.assert_allclose(gt["position"], np.broadcast_to(expected, (8, 2, 3)), atol=1e-6)
+    np.testing.assert_allclose(gt["rotation"], np.broadcast_to(extrinsics[12, :3, :3], (8, 2, 3, 3)), atol=1e-6)
+    assert gt["valid"].all()
+
+    truth[7, 0, 0] = np.nan
+    gt = inference.tcp_truth_in_anchor_camera(episode, truth[:11], np.arange(2, 10), 9)
+    assert gt["valid"].tolist() == [True, True, False, True, True, True, False, False]
+    assert np.isnan(gt["position"][~gt["valid"]]).all()
+    missing = inference.tcp_truth_in_anchor_camera(episode, None, np.arange(2, 10), 9)
+    assert not missing["valid"].any() and np.isnan(missing["position"]).all()
+
+
 def fake_window(policy, images, intrinsics, query_points, instruction, **kwargs):
     frames = images.shape[1]
     # Fixture RGB encodes the absolute source frame; timestamps are not inputs.
@@ -126,22 +159,133 @@ def test_episode_propagation_and_memory_geometry(episode, tmp_path, monkeypatch)
     policy = type("Policy", (), {"prediction_horizon": 16})()
     output = tmp_path / "result"
     result = inference.infer_episode_sliding_windows(policy, episode, inference.initial_truth_queries(episode), output,
-        config={"history_frames": 8}, query_source="test")
-    assert result["complete"] and len(result["windows"]) == 3
-    # Final tail-aligned window starts at frame 9, not at previous window's last frame 14.
-    np.testing.assert_allclose(calls[2][0, :, 0], 161 + 100 * (np.array([-0.2, 0.2]) + 0.009), atol=1e-5)
+        config={"history_frames": 8}, query_source="test", stride=7)
+    assert result["complete"] and len(result["windows"]) == 4
+    # Startup windows retain the initial query; the final window begins at frame 9.
+    np.testing.assert_array_equal(calls[0], calls[1])
+    np.testing.assert_allclose(calls[3][0, :, 0], 161 + 100 * (np.array([-0.2, 0.2]) + 0.009), atol=1e-5)
     stored = json.loads((output / "predictions.json").read_text())
     assert stored["windows"][-1]["ground_truth"]["position"][0][0] == [None] * 3
     assert stored["windows"][-1]["metrics"]["position_ade_m"] is None
-    assert len(result["_geometry"]) == 3
-    assert result["_geometry"][0]["depth"].shape == (8, 240, 320)
+    assert len(result["_geometry"]) == 4
+    assert result["_geometry"][0]["depth"].shape == (1, 240, 320)
+    assert result["_geometry"][1]["depth"].shape == (8, 240, 320)
     assert "_geometry" not in stored and "geometry_file" not in stored["windows"][0]
     assert not list(output.rglob("*.npz")) and not list(output.rglob("*.npy"))
     slots = inference.build_playback_frames(result)
-    assert len(slots) == 17
-    assert slots[7] == (0, 7)  # Shared boundary is displayed only once.
-    assert slots[8] == (1, 1)
-    assert slots[-1] == (2, 7)  # Tail-aligned window still reaches the final frame.
+    assert slots == [(0, 0), (1, 7), (2, 7), (3, 7)]
+    assert [result["windows"][i]["start"] + local for i, local in slots] == [0, 7, 14, 16]
+
+
+@pytest.mark.parametrize("num_frames", [1, 3, 10])
+def test_causal_startup_never_reads_future_rgb(episode, tmp_path, monkeypatch, num_frames):
+    from dataclasses import replace
+
+    episode = replace(episode, image_paths=episode.image_paths[:num_frames],
+                      frame_indices=episode.frame_indices[:num_frames], extrinsics=episode.extrinsics[:num_frames])
+    reads, calls = [], []
+    original_load = inference.load_rgb
+    def load(path):
+        reads.append(int(path.stem))
+        return original_load(path)
+    def run(*args, **kwargs):
+        anchor = len(calls)
+        expected = np.maximum(np.arange(anchor - 7, anchor + 1), 0)
+        assert reads == expected.tolist()
+        reads.clear()
+        rgb_indices = np.rint((args[1][0, :, 0, 10, 10].numpy() + 1) * 255 / 2).astype(int)
+        np.testing.assert_array_equal(rgb_indices, expected)
+        calls.append(args[3].numpy().copy())
+        prediction = fake_window(*args, **kwargs)
+        # Distinct reconstruction outputs for repeated slots must never turn into
+        # a visible motion history or be used to replace the original query.
+        padding = max(0, 7 - anchor)
+        prediction["history_position"][:padding, :, 0] += 1
+        return prediction
+    monkeypatch.setattr(inference, "load_rgb", load)
+    monkeypatch.setattr(inference, "infer_stage2_window", run)
+    result = inference.infer_episode_sliding_windows(
+        type("Policy", (), {"prediction_horizon": 16})(), episode,
+        inference.initial_truth_queries(episode), tmp_path / "causal",
+        config={"history_frames": 8}, query_source="test",
+    )
+    assert len(calls) == num_frames
+    slots = inference.build_playback_frames(result)
+    for t, record in enumerate(result["windows"]):
+        assert record["anchor_frame"] == t
+        np.testing.assert_array_equal(record["input_frame_indices"], np.maximum(np.arange(t - 7, t + 1), 0))
+        np.testing.assert_array_equal(record["frame_indices"], np.arange(max(0, t - 7), t + 1))
+        np.testing.assert_array_equal(record["future_frame_indices"], np.arange(t + 1, t + 17))
+        assert record["history_padding"] == max(0, 7 - t)
+        assert len(record["history_position"]) == min(t + 1, 8)
+        assert record["history_position"][:, :, 0].max() < 0.3
+        assert slots[t] == (t, min(t, 7))
+    for query in calls[:8]:
+        np.testing.assert_array_equal(query, calls[0])
+
+
+@pytest.mark.parametrize("truth_available", [True, False])
+def test_viewer_history_truth_and_future_anchor(episode, tmp_path, monkeypatch, truth_available):
+    import contextlib
+    import threading
+    from types import SimpleNamespace
+
+    queries = inference.initial_truth_queries(episode)
+    if not truth_available:
+        for arm in inference.ARMS:
+            (episode.path / "TCP_third" / f"{arm}_state.npy").unlink()
+    monkeypatch.setattr(inference, "infer_stage2_window", fake_window)
+    policy = SimpleNamespace(prediction_horizon=16)
+    output = tmp_path / "viewer"
+    result = inference.infer_episode_sliding_windows(
+        policy, episode, queries, output, config={"history_frames": 8}, query_source="test",
+    )
+    stored = json.loads((output / "predictions.json").read_text())
+    for record in stored["windows"]:
+        length = record["end"] - record["start"]
+        assert len(record["history_ground_truth"]["position"]) == length
+        assert record["history_ground_truth"]["valid"] == [truth_available] * length
+
+    # Exercise frame selection and overlays without a browser or server thread.
+    viewer = inference.Stage2Viewer.__new__(inference.Stage2Viewer)
+    viewer.result, viewer.episode = result, episode
+    viewer.frame_slots = inference.build_playback_frames(result)
+    viewer._lock, viewer._closed = threading.RLock(), threading.Event()
+    viewer._nodes = []
+    viewer.server = SimpleNamespace(atomic=contextlib.nullcontext)
+    viewer.rgb_handle, viewer.info = SimpleNamespace(), SimpleNamespace()
+    for name, value in dict(frame=0, future=1, show_cloud=False, show_history=True,
+                            show_history_gt=True, show_prediction=True, show_gt=True,
+                            show_axes=True).items():
+        setattr(viewer, name, SimpleNamespace(value=value))
+    trajectories, axes = {}, {}
+    viewer._trajectory = lambda name, points, *args, **kwargs: trajectories.update({name: points.copy()})
+    viewer._axes = lambda name, points, rotations: axes.update({name: points.copy()})
+    viewer.refresh(frame_slot=0)
+    assert trajectories["history"].shape == (1, 2, 3)
+    assert trajectories["history_truth"].shape == (1, 2, 3)
+    np.testing.assert_array_equal(viewer.rgb_handle.image, inference.load_rgb(episode.image_paths[0]))
+    assert "future frames 1–1" in viewer.info.content
+    viewer.refresh(frame_slot=8)  # Frame 8 uses a prediction anchored at frame 8.
+    gt = result["windows"][8]["history_ground_truth"]
+    np.testing.assert_allclose(trajectories["history_truth"], gt["position"], equal_nan=True)
+    assert trajectories["history_truth"].shape == (8, 2, 3)  # Independent of Future steps.
+    np.testing.assert_allclose(axes["history_truth_axes"], gt["position"][-1], equal_nan=True)
+    assert trajectories["truth"].shape == (2, 2, 3)
+    np.testing.assert_allclose(trajectories["truth"][0], gt["position"][-1], equal_nan=True)
+    if truth_available:
+        # The GT anchor must not be replaced by the reconstructed anchor.
+        assert not np.allclose(trajectories["truth"][0], trajectories["prediction"][0])
+    else:
+        assert np.isnan(trajectories["history_truth"]).all()
+        assert np.isnan(trajectories["truth"]).all()
+
+    viewer.show_history_gt.value = False
+    trajectories.clear()
+    axes.clear()
+    viewer.refresh(frame_slot=8)
+    assert "history_truth" not in trajectories and "history_truth_axes" not in axes
+    assert "truth" in trajectories  # The future GT toggle remains independent.
 
 
 def test_invalid_propagation_saves_partial_output(episode, tmp_path, monkeypatch):
@@ -156,9 +300,9 @@ def test_invalid_propagation_saves_partial_output(episode, tmp_path, monkeypatch
     output = tmp_path / "failed"
     with pytest.raises(ValueError, match="behind-camera"):
         inference.infer_episode_sliding_windows(policy, episode, inference.initial_truth_queries(episode), output,
-            config={"history_frames": 8}, query_source="test")
+            config={"history_frames": 8}, query_source="test", stride=7)
     saved = json.loads((output / "predictions.json").read_text())
-    assert not saved["complete"] and len(saved["windows"]) == 1 and "error" in saved
+    assert not saved["complete"] and len(saved["windows"]) == 2 and "error" in saved
     assert saved["windows"][0]["action_position"][0][0] == [None] * 3
 
 
@@ -221,13 +365,14 @@ def test_outside_queries_continue_sliding_windows(episode, tmp_path, monkeypatch
     output = tmp_path / "outside"
     result = inference.infer_episode_sliding_windows(
         policy, episode, inference.initial_truth_queries(episode), output,
-        config={"history_frames": 8}, query_source="test",
+        config={"history_frames": 8}, query_source="test", stride=7,
     )
-    assert result["complete"] and len(calls) == 3
-    for query in calls[1:]:
+    assert result["complete"] and len(calls) == 4
+    np.testing.assert_array_equal(calls[0], calls[1])
+    for query in calls[2:]:
         np.testing.assert_array_equal(query[0, 0], [1, 245])  # Including image padding.
     stored = json.loads((output / "predictions.json").read_text())
-    for window in stored["windows"][1:]:
+    for window in stored["windows"][2:]:
         assert window["query_points_projected_px"][0] == [-40, 320]
         assert window["query_points_px"][0] == [0, 239]
         assert window["query_points_clipped"] == [True, False]
@@ -260,7 +405,7 @@ def test_index_episode_outputs_steps_and_record_alignment(episode, tmp_path):
         steps=1, keep_geometry=False,
     )
     assert result["complete"] and result["prediction_horizon"] == 16
-    assert result["format_version"] == 2 and result["source_frequency_hz"] == 15
+    assert result["format_version"] == 3 and result["source_frequency_hz"] == 15
     assert "frequency_hz" not in result  # The source rate is not an execution rate.
     for record in result["windows"]:
         assert record["future_step_indices"].tolist() == list(range(1, 17))

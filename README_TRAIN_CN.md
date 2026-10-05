@@ -441,6 +441,39 @@ python scripts/upload_robotwin_to_hf.py \
 现有 geometry + TCP recovery 配置；第二阶段使用
 configs/train/4rc-stage2-action.py，联合优化历史重建与未来动作生成。
 
+### Stage2 只训练指定任务
+
+在 `configs/train/4rc-stage2-action.py` 中设置顶层 `tasks`：
+
+```python
+tasks = None  # 默认使用全部任务
+# 只训练指定任务时，改为：
+# tasks = ["adjust_bottle", "stack_blocks_two"]
+```
+
+任务名精确对应数据根目录下的文件夹名。列表统一作用于所有启用的数据源
+（包括 `RoboTwin` 和 `RoboTwin_random`），同时限制训练集和验证集；数据源采样
+权重保持原值。此配置只接入 Stage2，没有新增命令行参数。
+
+筛选发生在读取 episode 内容、应用每个数据源的 `max_episodes` 上限和划分
+训练/验证集之前。保留原有排序及哈希划分，因此同一个 episode 不会因任务列表
+变化而切换划分。动作窗口、当前数据统计和 `data_manifest.json` 仅包含所选任务；
+已有 Stage2 checkpoint 的归一化统计仍按原规则保留。
+
+`tasks` 可以是非空字符串列表或元组，重复名称自动去重；空列表、错误格式，或
+任一启用数据源缺少指定任务时会报错。权重为零的数据源跳过检查。未配置或设为
+`None` 时使用全部任务，旧配置仍可使用。所选数据没有训练 episode 时会报错；
+验证划分为空时沿用现有跳过验证的行为，`--eval-only` 则要求存在验证 episode。
+
+任务列表会随配置保存到 `config.json`。使用 `--resume` 且未指定 `--config` 时，
+会读取 checkpoint 内保存的配置；若要恢复时使用修改后的任务列表，显式指定：
+
+```bash
+accelerate launch train_4rc_stage2.py \
+  --config configs/train/4rc-stage2-action.py \
+  --resume outputs/4rc-stage2-action/checkpoint-1000
+```
+
 ### 启动、初始化与恢复
 
 ```bash

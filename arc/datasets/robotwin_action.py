@@ -219,6 +219,8 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
         source_options = dict(source.get("options", {}))
         root = source_options.pop("root")
         options.update(source_options)
+        # Stage2 uses one task selection for every enabled source and both splits.
+        options["tasks"] = config.get("tasks")
         if config.get("max_episodes") is not None:
             options["max_episodes"] = config["max_episodes"]
         options["augment"] = bool(config.get("augment", True)) and split == "train"
