@@ -34,7 +34,7 @@ from tcp_sliding_window_inference import (
 )
 
 
-DEFAULT_MODEL = Path("checkpoints/Droid-Stage1/250000/checkpoint-250000")
+DEFAULT_MODEL = Path("checkpoints/Droid-Stage1/checkpoint-250000/model.safetensors")
 DEFAULT_OUTPUT_ROOT = Path("outputs/droid/stage1_inference")
 SOURCE_WIDTH, SOURCE_HEIGHT = 320, 180
 PADDED_WIDTH, PADDED_HEIGHT = 322, 182
