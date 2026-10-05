@@ -60,7 +60,7 @@ batches_per_epoch = None
 recent_buffer_size = 10_000
 
 # == Validation Configuration ==
-validation_fraction = 0.1
+validation_fraction = 0
 validation_batches = 16
 validation_batch_size = 1
 validate_every_steps = 1000
