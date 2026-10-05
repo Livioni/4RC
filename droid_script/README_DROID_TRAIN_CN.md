@@ -356,4 +356,84 @@ DROID_RUN_REAL_TESTS=1 python -m pytest -q \
 - **checkpoint 形状不匹配**：DROID 是原生单臂；双臂权重只能通过第一阶段的显式初始化迁移路径使用，不能作为第二阶段 DROID checkpoint 或完整 resume。
 - **TXT 被修改后无法 resume**：使用 checkpoint 中 `splits/` 的原始清单，或创建新实验，避免混淆验证集合。
 
-原有双臂滑窗推理应用没有在本次改动中扩展为 DROID 界面；本文覆盖训练、数据检查及训练入口提供的验证流程。
+## 11. DROID Stage 1 一键与交互推理
+
+使用 `droid_script/infer_4rc_stage1.py`，输入是**一个 episode 目录**。每次只处理一台相机，未指定 `--camera` 时选择编号排序后的第一台，并在终端打印实际编号。原有根目录双臂推理入口保持原用途。
+
+### 11.1 环境与 checkpoint
+
+沿用第 3 节的训练环境。交互选点和三维展示额外需要：
+
+```bash
+conda activate 4rc
+python -m pip install "gradio==6.12.0" viser
+python droid_script/infer_4rc_stage1.py --help
+```
+
+纯 JSON 推理无需安装 Gradio/Viser。默认 checkpoint 是当前仓库的 `checkpoints/Droid-Stage1/250000/checkpoint-250000`。其他权重通过 `--model` 指定，支持含 `model.safetensors` / `pytorch_model.bin` / `model.pt` 的目录或直接指定权重文件。
+
+必须使用**训练后的单臂 DROID Stage 1 checkpoint**。推理完整恢复 checkpoint 中的 `tcp_track_head.position_mean/std`，不重新计算训练集统计，也不执行双臂到单臂初始化迁移。推理不需要训练索引、split TXT、GT 深度或 GT 外参。
+
+### 11.2 一键推理
+
+以下命令跑到 episode 结尾并保存 JSON，然后打开 Viser。终端会显示本机地址 `http://127.0.0.1:8020`，按 Ctrl+C 关闭。只需 JSON 时去掉 `--visualize`，写完后进程自动退出。
+
+```bash
+python droid_script/infer_4rc_stage1.py \
+  --input "datasets/droid_episodes/AUTOLab__Fri_Aug_18_11:40:54_2023" \
+  --visualize
+```
+
+默认初始选点由 `TCP/<camera>/state.npy` 的相机坐标 XYZ 和 `intrinsic/<camera>.npy` 投影得到。第 0 帧无效时，从**首个有效且至少剩余两帧的帧**开始，终端和 JSON 均明确记录跳过的开头帧。当前 RAIL episode 的相机 `20521388` 自动从第 28 帧开始，`24259877` 自动从第 24 帧开始。
+
+指定相机、checkpoint、起点或测试长度：
+
+```bash
+python droid_script/infer_4rc_stage1.py \
+  --input "datasets/droid_episodes/RAIL__Tue_Oct__3_10:06:26_2023" \
+  --camera 24259877 \
+  --model checkpoints/Droid-Stage1/250000/checkpoint-250000 \
+  --start-frame 24 --max-frames 18 \
+  --output outputs/droid/example_tcp.json
+```
+
+`--start-frame` 使用原始帧号；显式指定后不会再自动调整。`--max-frames 0`（默认）表示推理所有剩余帧。没有 GT 时，可用 `--tcp-query-point X Y` 指定一个**原始 320×180 图像像素**；若未指定起点，手动 query 对应第 0 帧。
+
+窗口默认 9 帧，`--window-size` 范围 2–18；相邻窗口共享一帧，重叠帧保留前窗预测。后续 query 使用上一窗口末帧的**预测** TCP，经真实相机内参投影获得，只有最初选点需要 GT。若边界预测出现负深度或投影越界，脚本会明确报告相机、窗口和帧号并停止，不静默改用 GT 或裁剪到边缘；失败不会覆盖已有 JSON。显存不足时可降低窗口长度。
+
+### 11.3 浏览器交互推理
+
+```bash
+python droid_script/infer_4rc_stage1.py \
+  --input "datasets/droid_episodes/AUTOLab__Fri_Aug_18_11:40:54_2023" \
+  --interactive
+```
+
+打开 `http://127.0.0.1:7860`，先通过“相机”下拉框选择相机，再选择起始帧，在 RGB 中点击**一个 TCP**，或使用“当前帧 GT TCP”，再点击“运行推理”。切换相机或起始帧会清除旧选点。切换相机还会更新 RGB、内参、GT 和默认有效起始帧，并清除上一台相机的界面结果。`--camera` 仅设置交互页面的初始相机；若指定 `--start-frame`，切换后仍使用该帧号。缺少 GT 或投影无效时，GT 按钮禁用，仍可手动选点。推理结束后可下载 JSON，并在嵌入的 Viser 中逐帧播放 RGB、点云和 TCP 位姿。重复运行会复用模型并替换上一轮 Viser 服务。
+
+Viser 的点云由预测深度、相机 decoder 预测内参与绝对位姿生成。展示时将 TCP 位置和姿态从相机坐标转换到相同的机器人基座坐标；JSON 中仍保留相机坐标 TCP。界面支持点云置信度过滤、点大小、显示开关和 15 fps 播放。`--max-points` 控制每帧显示点数（默认 100000，0 不限制），`--confidence-percentile` 默认 2.5。
+
+远程机器推荐转发两个端口：
+
+```bash
+ssh -L 7860:127.0.0.1:7860 -L 8020:127.0.0.1:8020 user@server
+```
+
+也可通过 `--ui-host` / `--ui-port` 与 `--host` / `--port` 分别设置 Gradio 和 Viser 的监听地址及端口；两个端口必须不同。
+
+### 11.4 结果格式与验证
+
+默认输出：`outputs/droid/stage1_inference/<episode>/<camera>/tcp_episode.json`，交互模式会随当前选中的相机更新路径。显式传入 `--output` 时始终使用指定文件，切换相机后再次推理也会替换该文件。成功后原子替换同名文件，源数据目录不写入预测。
+
+- 顶层包含 episode、相机、checkpoint、15 Hz 帧率、覆盖起止帧、`skipped_prefix_frames`、`unprocessed_suffix_frames`、初始 query 和窗口记录。
+- `frames` 每帧包含原始 `frame_index`、`time_seconds = frame_index / 15`、RGB 路径、窗口来源和单个 `tcp` 对象。
+- `tcp.xyz_m` 是 OpenCV 相机坐标 XYZ（米）；`rpy_rad` / `rpy_deg` 使用 `Rz(yaw) @ Ry(pitch) @ Rx(roll)`；`confidence` 是模型原始置信度，不是概率。
+- `tcp.gripper_open` 是 `[0,1]` 的**连续夹爪开度浮点数**，不是布尔值；不输出左右臂字段。
+
+新增回归测试：
+
+```bash
+python -m pytest -q droid_script/tests/test_inference.py
+```
+
+已使用本地 250000 步 checkpoint 在 GPU 上验证 AUTOLab 默认相机的 175 帧 / 22 窗口，以及 RAIL 默认相机第 28–134 帧的 107 帧 / 14 窗口；两者均完成 TCP、预测几何、JSON 保存和 Viser 服务启动/关闭验证。这是推理链路验证，不是预测精度评测。
