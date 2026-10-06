@@ -179,6 +179,17 @@ def test_point_cloud_and_tcp_share_absolute_frame():
     np.testing.assert_allclose(clouds[0]["points"][90 * 320 + 160], [1, 2, 5])
 
 
+def test_gt_viewer_trajectory_uses_dataset_extrinsic(episode):
+    from droid_script.stage1_viewer import load_gt_trajectory
+
+    paths = episode.image_paths[2:6]
+    observed = load_gt_trajectory(episode, paths)
+    state = np.load(episode.path / "TCP" / episode.camera / "state.npy")
+    world_to_camera = np.load(episode.path / "extrinsic" / f"{episode.camera}.npy")
+    expected = (state[2:6, :3] - world_to_camera[:3, 3]) @ world_to_camera[:3, :3]
+    np.testing.assert_allclose(observed, expected)
+
+
 @pytest.mark.parametrize("kwargs", [{}, {"no_gt": True}])
 def test_interactive_build_and_frame_change_reset(episode, tmp_path, kwargs):
     pytest.importorskip("gradio")

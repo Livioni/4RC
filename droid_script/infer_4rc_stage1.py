@@ -383,6 +383,10 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
     parser.add_argument("--visualize", action="store_true", help="Show Viser after non-interactive inference")
+    parser.add_argument("--show-pred-trajectory", action=argparse.BooleanOptionalAction, default=True,
+                        help="Initially show the predicted TCP trajectory in Viser (orange)")
+    parser.add_argument("--show-gt-trajectory", action=argparse.BooleanOptionalAction, default=True,
+                        help="Initially show the GT TCP trajectory in Viser when labels/extrinsics are available (green)")
     parser.add_argument("--max-points", type=int, default=100_000, help="Per-frame point cap; 0 keeps all")
     parser.add_argument("--confidence-percentile", type=float, default=2.5)
     parser.add_argument("--point-size", type=float, default=0.003)

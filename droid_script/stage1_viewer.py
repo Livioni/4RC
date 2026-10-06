@@ -13,6 +13,43 @@ import torch
 from droid_script import infer_4rc_stage1 as inference
 
 
+PRED_COLOR = (255, 90, 40)
+GT_COLOR = (50, 220, 100)
+
+
+def load_gt_trajectory(episode, paths) -> np.ndarray:
+    """Read selected camera-frame labels and undo the dataset's world-to-camera pose."""
+    state_path = episode.path / "TCP" / episode.camera / "state.npy"
+    state = np.load(state_path, allow_pickle=False, mmap_mode="r")
+    if state.shape != (len(episode.image_paths), 7):
+        raise ValueError(f"Expected TCP state [{len(episode.image_paths)},7] in {state_path}, got {state.shape}")
+    ext_path = episode.path / "extrinsic" / f"{episode.camera}.npy"
+    w2c = np.load(ext_path, allow_pickle=False).astype(np.float32)
+    if (w2c.shape != (4, 4) or not np.isfinite(w2c).all()
+            or not np.allclose(w2c[3], [0, 0, 0, 1], atol=1e-6)
+            or not np.allclose(w2c[:3, :3].T @ w2c[:3, :3], np.eye(3), atol=1e-4)
+            or not np.isclose(np.linalg.det(w2c[:3, :3]), 1, atol=1e-4)):
+        raise ValueError(f"Expected rigid world-to-camera matrix [4,4]: {ext_path}")
+    positions = np.array(state[[inference._frame_index(path) for path in paths], :3], dtype=np.float32)
+    # Keep gaps in place, and retain finite labels even when outside the camera view.
+    positions[~np.isfinite(positions).all(-1)] = np.nan
+    return (positions - w2c[:3, 3]) @ w2c[:3, :3]
+
+
+def add_trajectory(scene, name, positions, color):
+    """Draw the full selected clip without bridging invalid GT frames."""
+    positions = np.asarray(positions, dtype=np.float32)
+    valid = np.isfinite(positions).all(-1)
+    nodes = []
+    if valid.any():
+        nodes.append(scene.add_point_cloud(f"{name}/points", points=positions[valid],
+                                           colors=color, point_size=0.004))
+    segments = np.stack((positions[:-1], positions[1:]), axis=1)[valid[:-1] & valid[1:]]
+    if len(segments):
+        nodes.append(scene.add_line_segments(f"{name}/lines", points=segments, colors=color, line_width=3))
+    return nodes
+
+
 def read_rgb(path: Path) -> np.ndarray:
     with Image.open(path) as image:
         if image.size != (320, 180):
@@ -51,6 +88,13 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
     if prediction.clouds is None or prediction.camera_to_base is None:
         raise ValueError("Viewer requires predicted depth and camera geometry")
     tcp = inference.tcp_to_base(prediction.tcp, prediction.camera_to_base)
+    gt_positions, gt_error = None, ""
+    try:
+        gt_positions = load_gt_trajectory(episode, paths)
+        if not np.isfinite(gt_positions).all(-1).any():
+            raise ValueError("No finite GT TCP positions in the selected clip")
+    except (OSError, ValueError) as error:
+        gt_positions, gt_error = None, str(error)
     server = viser.ViserServer(host=args.host, port=args.port)
     stopped = threading.Event()
     lock = threading.RLock()
@@ -67,15 +111,32 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
                                           initial_value=args.confidence_percentile)
         point_size = server.gui.add_slider("Point size", min=0.00001, max=max(0.02, args.point_size),
                                           step=0.00001, initial_value=args.point_size)
-        show_cloud = server.gui.add_checkbox("Show point cloud", initial_value=True)
-        show_tcp = server.gui.add_checkbox("Show TCP", initial_value=True)
+        show_cloud = server.gui.add_checkbox("Show predicted point cloud", initial_value=True)
+        show_tcp = server.gui.add_checkbox("Show predicted TCP pose", initial_value=True)
+    with server.gui.add_folder("TCP trajectories (robot base coordinates)"):
+        show_pred_trajectory = server.gui.add_checkbox("Show predicted trajectory (orange)",
+                                                       initial_value=args.show_pred_trajectory)
+        show_gt_trajectory = server.gui.add_checkbox("Show GT trajectory (green)",
+                                                     initial_value=args.show_gt_trajectory and gt_positions is not None,
+                                                     disabled=gt_positions is None)
+        server.gui.add_markdown("Full selected clip. Orange: prediction; green: GT.\n\n"
+                                "Prediction uses predicted camera poses; GT uses dataset calibration.")
+        if gt_error:
+            server.gui.add_markdown(f"GT trajectory unavailable: {gt_error}")
     rgb = server.gui.add_image(read_rgb(paths[0]), label="RGB")
     info = server.gui.add_markdown("")
     cloud_node = server.scene.add_point_cloud("/geometry", points=np.zeros((1, 3), dtype=np.float32),
                                               colors=np.zeros((1, 3), dtype=np.uint8), point_size=args.point_size)
     tcp_node = server.scene.add_frame("/tcp", axes_length=0.05, axes_radius=0.001,
-                                      origin_radius=0.004, origin_color=(255, 90, 40))
-    label = server.scene.add_label("/tcp/label", "TCP", position=(0, 0, 0.065))
+                                      origin_radius=0.004, origin_color=PRED_COLOR)
+    label = server.scene.add_label("/tcp/label", "Pred TCP", position=(0, 0, 0.065))
+    pred_trajectory = add_trajectory(server.scene, "/trajectories/pred", tcp["position"][:, 0], PRED_COLOR)
+    gt_trajectory = []
+    gt_node = gt_label = None
+    if gt_positions is not None:
+        gt_trajectory = add_trajectory(server.scene, "/trajectories/gt", gt_positions, GT_COLOR)
+        gt_node = server.scene.add_icosphere("/tcp_gt", radius=0.006, color=GT_COLOR)
+        gt_label = server.scene.add_label("/tcp_gt/label", "GT TCP", position=(0, 0, 0.02))
     first_cloud = prediction.clouds[0]["points"]
     center = np.median(first_cloud, axis=0) if len(first_cloud) else tcp["position"][0, 0]
     extent = (max(float(np.max(np.percentile(first_cloud, 95, axis=0) - np.percentile(first_cloud, 5, axis=0))), 0.3)
@@ -103,19 +164,28 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
             tcp_node.position = tcp["position"][slot, 0]
             tcp_node.wxyz = tf.SO3.from_matrix(tcp["rotation"][slot, 0]).wxyz
             tcp_node.visible = show_tcp.value
-            label.text = f"TCP · opening={tcp['gripper'][slot, 0]:.3f}"
+            label.text = f"Pred TCP · opening={tcp['gripper'][slot, 0]:.3f}"
             label.visible = show_tcp.value
+            for node in pred_trajectory:
+                node.visible = show_pred_trajectory.value
+            for node in gt_trajectory:
+                node.visible = show_gt_trajectory.value
+            if gt_node is not None:
+                valid_gt = bool(np.isfinite(gt_positions[slot]).all())
+                if valid_gt:
+                    gt_node.position = gt_positions[slot]
+                gt_node.visible = gt_label.visible = show_gt_trajectory.value and valid_gt
             rgb.image = read_rgb(paths[slot])
             source_frame = inference._frame_index(paths[slot])
             xyz = prediction.tcp["position"][slot, 0]
             info.content = (f"**{episode.path.name} / {episode.camera}**\n\n"
                             f"Frame **{source_frame}** · {source_frame / 15:.3f} s · {slot + 1}/{len(paths)}\n\n"
-                            f"TCP camera XYZ (m): `{np.round(xyz, 4).tolist()}`\n\n"
+                            f"Pred TCP camera XYZ (m): `{np.round(xyz, 4).tolist()}`\n\n"
                             f"Gripper opening: **{tcp['gripper'][slot, 0]:.4f}** · "
                             f"confidence: **{tcp['confidence'][slot, 0]:.3f}**\n\n"
-                            f"Visible points: {int(mask.sum())}. Scene: predicted robot-base coordinates.")
+                            f"Visible predicted cloud points: {int(mask.sum())}. Scene: robot-base coordinates.")
 
-    for control in (frame, percentile, point_size, show_cloud, show_tcp):
+    for control in (frame, percentile, point_size, show_cloud, show_tcp, show_pred_trajectory, show_gt_trajectory):
         control.on_update(lambda _: render())
     previous.on_click(lambda _: setattr(frame, "value", (int(frame.value) - 1) % len(paths)))
     following.on_click(lambda _: setattr(frame, "value", (int(frame.value) + 1) % len(paths)))

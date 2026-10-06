@@ -413,6 +413,10 @@ python droid_script/infer_4rc_stage1.py \
 
 Viser 的点云由预测深度、相机 decoder 预测内参与绝对位姿生成。展示时将 TCP 位置和姿态从相机坐标转换到相同的机器人基座坐标；JSON 中仍保留相机坐标 TCP。界面支持点云置信度过滤、点大小、显示开关和 15 fps 播放。`--max-points` 控制每帧显示点数（默认 100000，0 不限制），`--confidence-percentile` 默认 2.5。
 
+默认叠加本次推理帧段的完整 TCP 轨迹：**橙色为预测，绿色为 GT**，播放时坐标轴标记当前预测位姿，绿色圆点标记当前 GT 位置。Viser 的 `TCP trajectories` 面板可独立切换两条轨迹；启动时也可用 `--no-show-pred-trajectory` / `--no-show-gt-trajectory` 隐藏，对应的 `--show-pred-trajectory` / `--show-gt-trajectory` 显示。这些选项同时适用于 `--visualize` 和 `--interactive`。
+
+GT 轨迹读取 `TCP/<camera>/state.npy`，使用数据集 `extrinsic/<camera>.npy` 的真实 world-to-camera 外参逆变换到机器人基座坐标；预测轨迹和点云使用模型预测相机位姿。因此两者的偏差也包含预测相机位姿误差。GT 按实际推理帧号截取，无效位置留作断点。缺少或损坏 GT / 外参时，界面说明原因并禁用 GT 开关，预测展示仍可使用。
+
 远程机器推荐转发两个端口：
 
 ```bash
