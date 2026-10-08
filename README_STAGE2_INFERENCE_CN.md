@@ -2,8 +2,11 @@
 
 `stage2_sliding_window_inference.py` 独立加载完整 Stage2 策略，不导入 Stage1 推理脚本或训练入口。
 默认 checkpoint 为 `checkpoints/RoboTwin-Stage2/90000`，模型结构、历史帧数和预测长度来自该目录的 `config.json`。
-当前 policy 使用最后观测帧的帧内/跨帧特征按通道 concat（1536+1536=3072）构造全局 patch 前缀，并使用三类 token embedding。
-旧的仅含 TCP 历史条件或仅使用跨帧 1536 维全局输入的 Stage2 checkpoint 与此结构不兼容；请通过 `--checkpoint` 指定 3072 维 concat 结构训练得到的 checkpoint。
+加载器根据 `global_encoder.projection.1.weight` 的实际形状自动识别全局视觉结构：旧 checkpoint
+使用最后观测帧的跨帧 1536 维特征，新 checkpoint 使用帧内/跨帧按通道 concat 的 3072 维特征。
+两种结构均保持原有 token 数和严格权重校验，无需转换 checkpoint 或修改配置文件。
+RoboTwin 的 FourRC 评测适配器复用此加载器，同样自动兼容两种结构。
+更早的仅含 TCP 历史、没有全局视觉分支的 checkpoint 仍不支持。
 
 ## 运行
 
@@ -71,8 +74,8 @@ Stage2 统一只编码历史和未来的序号，不规定动作执行频率。�
 预测目标秒数 `future_frame_times`。JSON `format_version=3`，采集频率记录为
 `source_frequency_hz`，不表示动作执行频率。末尾仍预测完整长度，缺失真值使用有效掩码。
 
-加载 checkpoint 时始终使用序号条件，不再切回旧物理时间模式。结构兼容的已有权重可通过
-训练配置的 `stage2_checkpoint` 初始化后继续训练，再使用新 checkpoint 推理。
+加载 checkpoint 时始终使用序号条件，不再切回旧物理时间模式。推理自动兼容 1536/3072 维
+全局输入；训练入口仍默认使用 3072 维 concat，1536 维旧权重不能直接用于新结构训练或 resume。
 
 初始窗口由交互或真值选点初始化；历史仍从第 0 帧开始时复用初始选点。窗口起点向前移动后，
 使用上一窗口对新起始帧恢复出的 TCP，按相机内参投影传递；不会用预测的未来动作替代恢复结果，

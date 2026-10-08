@@ -102,7 +102,7 @@ class TCPHistoryPool(nn.Module):
 
 
 class GlobalVisualEncoder(nn.Module):
-    """Project concatenated last-frame local/global patches in row-major order."""
+    """Project last-frame patch features in row-major order."""
 
     def __init__(self, input_dim: int, dim: int, patch_size: int = 14):
         super().__init__()
@@ -233,13 +233,17 @@ class TCPActionPolicy(nn.Module):
         t5_model: str = "google-t5/t5-base", text_max_length: int = 128,
         dim: int = 512, depth: int = 8, heads: int = 8, prediction_horizon: int = 16,
         padding=(1, 1, 6, 6), decode_camera: bool = False,
+        global_feature_mode: str = "concat",
     ):
         super().__init__()
         if prediction_horizon < 1:
             raise ValueError("Prediction horizon must be positive")
         if arc.tcp_visual_query_encoder.window_size != 3:
             raise ValueError("Stage two requires a 3x3 TCP query window")
+        if global_feature_mode not in ("concat", "cross_frame"):
+            raise ValueError("global_feature_mode must be 'concat' or 'cross_frame'")
         self.arc = arc
+        self.global_feature_mode = global_feature_mode
         self.num_arms = getattr(arc.tcp_visual_query_encoder, "num_arms", 2)
         self.decode_camera = decode_camera
         self.language_encoder = language_encoder if language_encoder is not None else FrozenT5Encoder(
@@ -253,7 +257,8 @@ class TCPActionPolicy(nn.Module):
         )
         self.history_pool = TCPHistoryPool(arc.tcp_visual_query_encoder.embed_dim, dim, heads, self.num_arms)
         self.global_encoder = GlobalVisualEncoder(
-            2 * arc.tcp_visual_query_encoder.embed_dim, dim, arc.tcp_visual_query_encoder.patch_size,
+            (2 if global_feature_mode == "concat" else 1) * arc.tcp_visual_query_encoder.embed_dim,
+            dim, arc.tcp_visual_query_encoder.patch_size,
         )
         # This encodes step indices; retain the parameter name to load existing Stage2 weights.
         self.physical_time = ScalarTimeEncoder(dim)
@@ -321,7 +326,7 @@ class TCPActionPolicy(nn.Module):
         centres = torch.where(valid[..., None], centres.float(), torch.zeros_like(centres.float()))
         channels = self.arc.tcp_visual_query_encoder.embed_dim
         # The backbone already concatenates [frame-local, cross-frame] channels.
-        # Keep both halves for the global prefix; TCP sampling uses cross-frame features.
+        # New models keep both halves; legacy inference uses only cross-frame features.
         last_layer_patches = features[-1][0]
         patches = last_layer_patches[..., -channels:]
         # Reuse this module without registering a duplicate child/optimizer group.
@@ -335,8 +340,9 @@ class TCPActionPolicy(nn.Module):
             sampled, centres, valid, history_time, self.token_type.weight[0],
             image_height=height, image_width=width,
         )
+        global_patches = last_layer_patches if self.global_feature_mode == "concat" else patches
         global_tokens = self.global_encoder(
-            last_layer_patches[:, -1], history_time[:, -1], self.token_type.weight[2],
+            global_patches[:, -1], history_time[:, -1], self.token_type.weight[2],
             image_height=height, image_width=width,
         )
         history = torch.cat((global_tokens, history), dim=1)

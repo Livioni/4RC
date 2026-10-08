@@ -590,9 +590,11 @@ history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报
 全局特征复用本次 backbone 输出，采样迭代不会重复编码。
 
 仅含 TCP 历史条件的早期 Stage2 checkpoint，以及全局视觉分支仅使用跨帧 1536 维
-特征的 Stage2 checkpoint，均与当前结构不兼容；严格加载会拒绝缺失或形状不匹配的参数。
+特征的 Stage2 checkpoint，均与当前默认训练结构不兼容；严格加载会拒绝缺失或形状不匹配的参数。
 请从 Stage1 权重开始新的 Stage2 实验并使用新的输出目录。使用 3072 维 concat 输入
 训练得到的 Stage2 checkpoint 支持正常初始化、断点恢复和推理。
+独立滑窗推理和 RoboTwin FourRC 评测按权重形状自动兼容 1536 维跨帧与 3072 维 concat
+两种结构，此兼容路径不改变新训练的默认结构，也不转换旧权重。
 
 T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
 投影进入每层 cross-attention，并传递文本 padding mask。

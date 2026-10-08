@@ -79,7 +79,8 @@ class Viewer:
         self.server.stop()
 
 
-def start_viewer(args, episode, prediction, paths) -> Viewer:
+def start_viewer(args, episode, prediction, paths, *, frame_rate=15.0,
+                 scene_frame="robot base coordinates", load_ground_truth=True) -> Viewer:
     try:
         import viser
         import viser.transforms as tf
@@ -90,6 +91,8 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
     tcp = inference.tcp_to_base(prediction.tcp, prediction.camera_to_base)
     gt_positions, gt_error = None, ""
     try:
+        if not load_ground_truth:
+            raise ValueError("Input video has no calibrated GT trajectory")
         gt_positions = load_gt_trajectory(episode, paths)
         if not np.isfinite(gt_positions).all(-1).any():
             raise ValueError("No finite GT TCP positions in the selected clip")
@@ -105,22 +108,25 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
         previous = server.gui.add_button("Previous")
         following = server.gui.add_button("Next")
         playing = server.gui.add_checkbox("Play", initial_value=False)
-        fps = server.gui.add_slider("FPS", min=1, max=30, step=1, initial_value=15)
-    with server.gui.add_folder("Geometry (robot base coordinates)"):
+        fps = server.gui.add_slider("FPS", min=0.1, max=max(60, frame_rate), step=0.1, initial_value=frame_rate)
+    with server.gui.add_folder(f"Geometry ({scene_frame})"):
         percentile = server.gui.add_slider("Confidence percentile", min=0, max=99, step=0.5,
                                           initial_value=args.confidence_percentile)
         point_size = server.gui.add_slider("Point size", min=0.00001, max=max(0.02, args.point_size),
                                           step=0.00001, initial_value=args.point_size)
         show_cloud = server.gui.add_checkbox("Show predicted point cloud", initial_value=True)
         show_tcp = server.gui.add_checkbox("Show predicted TCP pose", initial_value=True)
-    with server.gui.add_folder("TCP trajectories (robot base coordinates)"):
+    with server.gui.add_folder(f"TCP trajectories ({scene_frame})"):
         show_pred_trajectory = server.gui.add_checkbox("Show predicted trajectory (orange)",
                                                        initial_value=args.show_pred_trajectory)
         show_gt_trajectory = server.gui.add_checkbox("Show GT trajectory (green)",
                                                      initial_value=args.show_gt_trajectory and gt_positions is not None,
                                                      disabled=gt_positions is None)
         server.gui.add_markdown("Full selected clip. Orange: prediction; green: GT.\n\n"
-                                "Prediction uses predicted camera poses; GT uses dataset calibration.")
+                                "Prediction uses predicted camera poses; GT uses dataset calibration."
+                                if load_ground_truth else
+                                "Orange: predicted TCP trajectory. Scene uses model-predicted coordinates; "
+                                "no real robot-base calibration is available for this video.")
         if gt_error:
             server.gui.add_markdown(f"GT trajectory unavailable: {gt_error}")
     rgb = server.gui.add_image(read_rgb(paths[0]), label="RGB")
@@ -179,11 +185,11 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
             source_frame = inference._frame_index(paths[slot])
             xyz = prediction.tcp["position"][slot, 0]
             info.content = (f"**{episode.path.name} / {episode.camera}**\n\n"
-                            f"Frame **{source_frame}** · {source_frame / 15:.3f} s · {slot + 1}/{len(paths)}\n\n"
+                            f"Frame **{source_frame}** · {source_frame / frame_rate:.3f} s · {slot + 1}/{len(paths)}\n\n"
                             f"Pred TCP camera XYZ (m): `{np.round(xyz, 4).tolist()}`\n\n"
                             f"Gripper opening: **{tcp['gripper'][slot, 0]:.4f}** · "
                             f"confidence: **{tcp['confidence'][slot, 0]:.3f}**\n\n"
-                            f"Visible predicted cloud points: {int(mask.sum())}. Scene: robot-base coordinates.")
+                            f"Visible predicted cloud points: {int(mask.sum())}. Scene: {scene_frame}.")
 
     for control in (frame, percentile, point_size, show_cloud, show_tcp, show_pred_trajectory, show_gt_trajectory):
         control.on_update(lambda _: render())
@@ -191,7 +197,7 @@ def start_viewer(args, episode, prediction, paths) -> Viewer:
     following.on_click(lambda _: setattr(frame, "value", (int(frame.value) + 1) % len(paths)))
 
     def playback():
-        while not stopped.wait(1.0 / max(1, float(fps.value))):
+        while not stopped.wait(1.0 / max(0.1, float(fps.value))):
             if playing.value:
                 frame.value = (int(frame.value) + 1) % len(paths)
 

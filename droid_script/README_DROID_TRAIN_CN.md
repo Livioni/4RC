@@ -442,3 +442,42 @@ python -m pytest -q droid_script/tests/test_inference.py
 ```
 
 已使用本地 250000 步 checkpoint 在 GPU 上验证 AUTOLab 默认相机的 175 帧 / 22 窗口，以及 RAIL 默认相机第 28–134 帧的 107 帧 / 14 窗口；两者均完成 TCP、预测几何、JSON 保存和 Viser 服务启动/关闭验证。这是推理链路验证，不是预测精度评测。
+
+### 11.5 In-the-wild 视频推理（MP4，无标定/GT）
+
+新入口 `droid_script/infer_4rc_stage1_video.py` 直接接收视频文件，无需制作 DROID episode、提供相机内参或 TCP 标签。使用同一单臂 Stage1 checkpoint，默认路径为 `checkpoints/Droid-Stage1/checkpoint-250000/model.safetensors`；可用 `--model` 指定其他权重。
+
+```bash
+conda activate 4rc
+python droid_script/infer_4rc_stage1_video.py \
+  --input datasets/robolab/test/Pick_up_the_banana_and_place_it_in_the_bowl_0_third_person_2_15fps.mp4 \
+  --interactive
+```
+
+打开 `http://127.0.0.1:7860`，选择起始帧，点击一个 TCP（夹爪工作点），再点击“运行推理”。完成后页面嵌入 Viser（默认 `http://127.0.0.1:8020`），支持 RGB/点云逐帧播放、TCP 位姿、完整预测轨迹、置信度过滤及点大小调整，并可下载 JSON。切换起始帧会清除选点；重复推理复用模型并关闭上一轮 Viser。`--interactive` 自动开启 Viser，无需额外传 `--visualize`。
+
+也可直接传入选点，并在完成后打开 Viser：
+
+```bash
+python droid_script/infer_4rc_stage1_video.py \
+  --input datasets/robolab/test/Pick_up_the_banana_and_place_it_in_the_bowl_0_third_person_2_15fps.mp4 \
+  --start-frame 40 --tcp-query-point 195 74 \
+  --max-frames 18 --visualize
+```
+
+上述点是示例视频第 40 帧附近的夹爪工作点；更准确的选点请使用交互界面。命令行 `--tcp-query-point X Y` 与交互选点均对应**缩放后的 320×180 RGB**，不是原视频的 640×360 像素，也不包含 padding。只需 JSON 时去掉 `--visualize`。必须提供 `--interactive` 或 `--tcp-query-point` 其中之一。
+
+- 视频所有帧直接缩放到 320×180，再按训练约定四边各 reflect-pad 1 像素至 322×182。保留完整画面；非 16:9 视频会改变宽高比。
+- 保留源视频帧序和帧率，不自动抽帧；`--start-frame` 从 0 开始，`--max-frames 0` 表示所有剩余帧。模型训练帧率为 15 fps，建议输入也为 15 fps。`--fps` 只覆盖时间戳与播放帧率，不做视频重采样。
+- 窗口默认 9 帧，支持 2–18 帧；相邻窗口共享一帧，保留前窗预测。下一窗 query 由前窗末帧预测 TCP 和**该帧预测相机内参**投影获得，自动扣除 padding。负深度或投影越界时报告窗口/帧号并停止，已有 JSON 不会被失败结果覆盖。
+- Viser 点云和 TCP 使用模型预测的世界坐标（DROID 训练时的基座坐标约定）；该视频没有真实基座标定，坐标、尺度和轨迹精度均依赖模型预测。JSON 的 `tcp.xyz_m` / RPY 仍是各帧相机坐标预测。
+- 默认结果和持久化 RGB 缓存位于 `outputs/droid/stage1_video/<视频名>-<指纹>/`，结果文件为 `tcp_video.json`。可用 `--output` 指定 JSON，`--output-root` 指定缓存/默认结果根目录；不修改输入视频。同一视频再次运行复用缓存。
+- JSON 保留原始帧号、按实际 FPS 计算的时间、原视频/模型输入分辨率、选点坐标空间，以及各窗口用于投影的预测内参。
+
+端口、远程 SSH 转发、`--device` / `--dtype`、`--max-points` 和 `--no-show-pred-trajectory` 与 episode 推理用法一致。视频解码依赖 OpenCV（已在依赖文件中）；交互模式额外需要 Gradio/Viser。
+
+```bash
+python -m pytest -q droid_script/tests/test_inference.py droid_script/tests/test_video_inference.py
+```
+
+已通过 28 项回归测试，并使用本地 250000 步 checkpoint 在 CPU 上验证示例视频第 40–42 帧的 3 帧 / 2 窗口推理、JSON 导出及 Gradio/Viser HTTP 服务启动与关闭；未进行整段视频精度评测。

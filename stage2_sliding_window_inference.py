@@ -191,20 +191,41 @@ def resolve_device_dtype(device_name: str, dtype_name: str) -> tuple[torch.devic
 def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str | None = None):
     from arc.models.arc.arc import Arc
     from arc.models.arc.arc_action import TCPActionPolicy
+    from safetensors import safe_open
     from safetensors.torch import load_model
 
     checkpoint = checkpoint.expanduser()
     config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
     if config.get("training_stage") != 2 or config.get("normalize_geometry", False):
         raise ValueError("A metric-geometry Stage2 checkpoint is required")
+    arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
+    channels = arc.tcp_visual_query_encoder.embed_dim
+    weights_path = checkpoint / "model.safetensors"
+    # Old configs do not identify this architecture change. Inspect the saved
+    # projection shape without loading the full checkpoint twice.
+    with safe_open(str(weights_path), framework="pt", device="cpu") as weights:
+        key = "global_encoder.projection.1.weight"
+        if key not in weights.keys():
+            raise ValueError("Stage2 checkpoint has no global visual encoder; TCP-only checkpoints are unsupported")
+        shape = weights.get_slice(key).get_shape()
+    if shape == [config["action_dim"], channels]:
+        config["global_feature_mode"] = "cross_frame"
+    elif shape == [config["action_dim"], 2 * channels]:
+        config["global_feature_mode"] = "concat"
+    else:
+        raise ValueError(
+            f"Unsupported global visual projection shape {shape}; expected "
+            f"[{config['action_dim']}, {channels}] or [{config['action_dim']}, {2 * channels}]"
+        )
     policy = TCPActionPolicy(
-        Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3)),
+        arc,
         t5_model=t5_model or config["t5_model"], text_max_length=config["text_max_length"],
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
         prediction_horizon=config["prediction_horizon"],
+        global_feature_mode=config["global_feature_mode"],
     )
     # load_model restores omitted aliases of the geometry head's shared norms.
-    load_model(policy, str(checkpoint / "model.safetensors"), strict=True, device="cpu")
+    load_model(policy, str(weights_path), strict=True, device="cpu")
     if (not torch.isfinite(policy.action_position_mean).all()
             or not torch.isfinite(policy.action_position_std).all()
             or (policy.action_position_std <= 0).any()):

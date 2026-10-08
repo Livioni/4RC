@@ -46,7 +46,7 @@ class Episode:
     path: Path
     camera: str
     image_paths: list[Path]
-    intrinsics: np.ndarray
+    intrinsics: np.ndarray | None
 
     def clip(self, start_frame: int, max_frames: int = 0) -> list[Path]:
         if not 0 <= start_frame < len(self.image_paths):
@@ -253,14 +253,15 @@ def frame_clouds(depth: np.ndarray, confidence: np.ndarray, colors: list[np.ndar
 
 
 def infer_window(model: Any, paths: list[Path], query: np.ndarray, device: torch.device,
-                 dtype: torch.dtype, keep_geometry: bool, max_points: int):
+                 dtype: torch.dtype, keep_geometry: bool, max_points: int,
+                 *, return_intrinsics: bool = False):
     views, colors = load_views(paths)
     views = [{**view, "img": view["img"].to(device)} for view in views]
     query_tensor = torch.from_numpy(query + np.float32(1))[None].to(device)
     autocast = contextlib.nullcontext() if dtype == torch.float32 else torch.autocast(device_type=device.type, dtype=dtype)
     with torch.inference_mode(), autocast:
         pred = model(views, force_no_output_conversion=True, inference_track=False,
-                     decode_camera=keep_geometry, decode_motion=False, decode_tcp=True,
+                     decode_camera=keep_geometry or return_intrinsics, decode_motion=False, decode_tcp=True,
                      tcp_query_points=query_tensor, return_aux_pyramid=False, ref_view_strategy="first")
     def array(value):
         return value[0].detach().float().cpu().numpy()
@@ -272,16 +273,20 @@ def infer_window(model: Any, paths: list[Path], query: np.ndarray, device: torch
     for key, value in tcp.items():
         if value.shape != expected[key] or not np.isfinite(value).all():
             raise ValueError(f"Invalid {key} prediction: expected finite {expected[key]}, got {value.shape}")
-    clouds, c2w = None, None
-    if keep_geometry:
+    clouds, c2w, k = None, None, None
+    if keep_geometry or return_intrinsics:
         from arc.models.arc.utils.transform import pose_encoding_to_extri_intri
         with torch.inference_mode():
             cameras, k = pose_encoding_to_extri_intri(pred["pose_enc"].float(), (PADDED_HEIGHT, PADDED_WIDTH))
         c2w, k = array(cameras), array(k)
-        if not np.isfinite(c2w).all() or not np.isfinite(k).all():
+        if (not np.isfinite(c2w).all() or not np.isfinite(k).all()
+                or np.any(k[..., 0, 0] <= 0) or np.any(k[..., 1, 1] <= 0)):
             raise ValueError("Camera decoder returned non-finite absolute camera parameters")
+    if keep_geometry:
         clouds = frame_clouds(array(pred["depth"]), array(pred["depth_conf"]), colors,
                               c2w, k, max_points, _frame_index(paths[0]))
+    if return_intrinsics:
+        return tcp, clouds, c2w, k
     return tcp, clouds, c2w
 
 
@@ -301,7 +306,18 @@ def infer_episode(model: Any, episode: Episode, paths: list[Path], query: np.nda
             progress(wi / len(windows), context)
         began = time.monotonic()
         try:
-            tcp, window_clouds, c2w = infer_window(model, paths[start:end], query, device, dtype, keep_geometry, max_points)
+            if episode.intrinsics is None:
+                tcp, window_clouds, c2w, predicted_k = infer_window(
+                    model, paths[start:end], query, device, dtype, keep_geometry, max_points,
+                    return_intrinsics=True)
+                # Decoder intrinsics refer to the reflect-padded 322x182 image.
+                # Queries and displayed RGB use the unpadded 320x180 image.
+                boundary_k = predicted_k[-1].copy()
+                boundary_k[:2, 2] -= 1
+            else:
+                tcp, window_clouds, c2w = infer_window(
+                    model, paths[start:end], query, device, dtype, keep_geometry, max_points)
+                boundary_k = episode.intrinsics
         except torch.cuda.OutOfMemoryError as error:
             raise RuntimeError(f"{context}: CUDA out of memory; reduce --window-size") from error
         except (ValueError, OSError, RuntimeError) as error:
@@ -309,6 +325,9 @@ def infer_episode(model: Any, episode: Episode, paths: list[Path], query: np.nda
         records.append({"window_index": wi, "frame_indices": frame_ids,
                         "query_source": query_source, "tcp_query_points_px": query.tolist(),
                         "inference_seconds": time.monotonic() - began})
+        if episode.intrinsics is None:
+            records[-1].update(boundary_intrinsics_source="predicted camera decoder",
+                               boundary_intrinsics_rgb=boundary_k.tolist())
         skip = int(wi > 0)
         if skip:
             source_windows[-1].append(wi)
@@ -320,7 +339,7 @@ def infer_episode(model: Any, episode: Episode, paths: list[Path], query: np.nda
             cameras.append(c2w[skip:])
         if end < len(paths):
             query_source = f"window {wi} prediction at frame {frame_ids[-1]}"
-            query = project_query(tcp["position"][-1], episode.intrinsics, f"Camera {episode.camera}, {query_source}")
+            query = project_query(tcp["position"][-1], boundary_k, f"Camera {episode.camera}, {query_source}")
     if progress:
         progress(1.0, "Sliding-window inference complete")
     return Prediction({key: np.concatenate(parts) for key, parts in values.items()}, records,
