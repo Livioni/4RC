@@ -115,7 +115,7 @@ def test_history_mask_step_and_centre_encoding():
 
 
 @pytest.mark.parametrize("image_size", [(42, 42), (28, 70), (14, 14)])
-def test_global_prefix_uses_only_last_frame_global_patch_channels(image_size):
+def test_global_prefix_uses_last_frame_local_and_global_patch_channels(image_size):
     model = policy().eval()
     batch = tiny_batch(batch_size=2)
     height, width = image_size
@@ -136,21 +136,25 @@ def test_global_prefix_uses_only_last_frame_global_patch_channels(image_size):
     assert original.history_valid.shape == (2, 8, 2)
     distractors = patches.clone()
     distractors[:, :-1] = torch.randn_like(distractors[:, :-1])
-    distractors[:, -1, :, :16] = torch.randn_like(distractors[:, -1, :, :16])
     changed = condition(distractors, special + 100)
     torch.testing.assert_close(original.history[:, :count], changed.history[:, :count])
     # A per-patch encoder keeps the row-major order and every patch independently.
-    modified = patches.clone()
     index = count // 2
-    modified[0, -1, index, -16:] += torch.linspace(-2, 2, 16)
-    changed = condition(modified)
     unaffected = torch.ones(2, count, dtype=torch.bool)
     unaffected[0, index] = False
-    torch.testing.assert_close(original.history[:, :count][unaffected], changed.history[:, :count][unaffected])
-    assert not torch.allclose(original.history[0, index], changed.history[0, index])
+    for start in (0, 16):
+        modified = patches.clone()
+        modified[0, -1, index, start:start + 16] += torch.linspace(-2, 2, 16)
+        changed = condition(modified)
+        torch.testing.assert_close(original.history[:, :count][unaffected], changed.history[:, :count][unaffected])
+        assert not torch.allclose(original.history[0, index], changed.history[0, index])
+        if start == 0:
+            # Frame-local channels are added only to the global prefix.
+            torch.testing.assert_close(original.history[:, count:], changed.history[:, count:])
 
 
-def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradients():
+@pytest.mark.parametrize("channel_start", [0, 16], ids=["frame_local", "cross_frame"])
+def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradients(channel_start):
     model = policy().eval()
     batch = tiny_batch()
     batch["images"] = torch.zeros(1, 8, 3, 84, 84)
@@ -165,7 +169,7 @@ def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradien
     original = condition(patches)
     modified = patches.detach().clone()
     # Bottom-right patch lies outside both TCP sampling neighbourhoods.
-    modified[:, -1, -1, -16:] += torch.linspace(-3, 3, 16)
+    modified[:, -1, -1, channel_start:channel_start + 16] += torch.linspace(-3, 3, 16)
     changed = condition(modified)
     torch.testing.assert_close(original.history[:, 36:], changed.history[:, 36:])
     noise = torch.randn(1, 16, 20)
@@ -175,9 +179,10 @@ def test_global_patch_outside_tcp_neighbourhood_changes_actions_and_gets_gradien
     velocity = predict(original)
     assert not torch.allclose(velocity, predict(changed))
     velocity.square().mean().backward()
+    assert patches.grad[:, -1, -1, :16].abs().sum() > 0
     assert patches.grad[:, -1, -1, -16:].abs().sum() > 0
     assert patches.grad[:, :-1, -1].eq(0).all()
-    assert patches.grad[..., :16].eq(0).all()
+    assert patches.grad[:, :-1, :, :16].eq(0).all()
 
 
 def test_global_encoder_preserves_spatial_identity_and_checks_patch_grid():
@@ -234,6 +239,27 @@ def test_legacy_stage2_weights_remain_incompatible(tmp_path):
     checkpoint = tmp_path / "legacy_stage2.pt"
     torch.save(old_state, checkpoint)
     with pytest.raises(RuntimeError, match="token_type.weight"):
+        load_model_weights(model, checkpoint)
+
+
+@pytest.mark.parametrize("suffix", ["pt", "safetensors"])
+def test_cross_frame_only_stage2_weights_are_incompatible(tmp_path, suffix):
+    from train_4rc_stage2 import load_model_weights
+    model = policy()
+    old_state = model.state_dict()
+    channels = model.arc.tcp_visual_query_encoder.embed_dim
+    for name in ("weight", "bias"):
+        key = f"global_encoder.projection.0.{name}"
+        old_state[key] = old_state[key][channels:].clone()
+    key = "global_encoder.projection.1.weight"
+    old_state[key] = old_state[key][:, channels:].contiguous()
+    checkpoint = tmp_path / f"cross_frame_only.{suffix}"
+    if suffix == "safetensors":
+        from safetensors.torch import save_file
+        save_file(old_state, str(checkpoint))
+    else:
+        torch.save(old_state, checkpoint)
+    with pytest.raises(RuntimeError, match="global_encoder.projection"):
         load_model_weights(model, checkpoint)
 
 

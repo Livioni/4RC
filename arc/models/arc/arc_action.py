@@ -102,7 +102,7 @@ class TCPHistoryPool(nn.Module):
 
 
 class GlobalVisualEncoder(nn.Module):
-    """Encode every last-frame patch, preserving its row-major spatial position."""
+    """Project concatenated last-frame local/global patches in row-major order."""
 
     def __init__(self, input_dim: int, dim: int, patch_size: int = 14):
         super().__init__()
@@ -253,7 +253,7 @@ class TCPActionPolicy(nn.Module):
         )
         self.history_pool = TCPHistoryPool(arc.tcp_visual_query_encoder.embed_dim, dim, heads, self.num_arms)
         self.global_encoder = GlobalVisualEncoder(
-            arc.tcp_visual_query_encoder.embed_dim, dim, arc.tcp_visual_query_encoder.patch_size,
+            2 * arc.tcp_visual_query_encoder.embed_dim, dim, arc.tcp_visual_query_encoder.patch_size,
         )
         # This encodes step indices; retain the parameter name to load existing Stage2 weights.
         self.physical_time = ScalarTimeEncoder(dim)
@@ -320,7 +320,10 @@ class TCPActionPolicy(nn.Module):
         valid = valid.bool() & torch.isfinite(centres).all(-1)
         centres = torch.where(valid[..., None], centres.float(), torch.zeros_like(centres.float()))
         channels = self.arc.tcp_visual_query_encoder.embed_dim
-        patches = features[-1][0][..., -channels:]
+        # The backbone already concatenates [frame-local, cross-frame] channels.
+        # Keep both halves for the global prefix; TCP sampling uses cross-frame features.
+        last_layer_patches = features[-1][0]
+        patches = last_layer_patches[..., -channels:]
         # Reuse this module without registering a duplicate child/optimizer group.
         sampled, _ = self.arc.tcp_visual_query_encoder(
             patches.flatten(0, 1), centres.flatten(0, 1),
@@ -333,7 +336,7 @@ class TCPActionPolicy(nn.Module):
             image_height=height, image_width=width,
         )
         global_tokens = self.global_encoder(
-            patches[:, -1], history_time[:, -1], self.token_type.weight[2],
+            last_layer_patches[:, -1], history_time[:, -1], self.token_type.weight[2],
             image_height=height, image_width=width,
         )
         history = torch.cat((global_tokens, history), dim=1)

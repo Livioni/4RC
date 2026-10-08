@@ -567,9 +567,11 @@ Stage2 固定要求 `tcp_temporal_weight=0`，直接跳过物理速度计算。�
 物理速度。执行动作的节奏由外部控制程序决定；去掉时间条件不保证不同视觉运动跨度下
 的泛化效果，需要按部署输入评估。
 
-同时取最后一个观测帧的最后一层 backbone 全局分支特征（后 1536 维），
+同时取最后一个观测帧的最后一层 backbone 完整 patch 特征：按通道直接 concat
+`[帧内特征 1536 维 | 跨帧特征 1536 维]`，共 3072 维，复用 backbone 已有的拼接输出。
 保留整图全部 patch，按行优先排列；不池化、不包含 camera/time 特殊 tokens。
-独立的 global_encoder 使用 LayerNorm → Linear 投影到 action_dim，加入
+两路不做加权求和或额外 attention 融合，也不沿 token 维拼接，token 数不变。
+独立的 global_encoder 使用 LayerNorm → Linear 将 3072 维投影到 action_dim，加入
 patch 中心二维位置编码、当前帧序号 0 的编码及全局视觉类型 embedding，
 再经过 LayerNorm。位置编码沿用归一化 padded 图像坐标的 sin/cos 加 MLP。
 类型 embedding 共三类：0 = TCP 历史，1 = 未来动作，2 = 全局视觉。
@@ -587,9 +589,10 @@ ActionCondition.history 现在表示 `[B,G+K×A,D]` 的完整观测前缀；
 history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报告推理失败。
 全局特征复用本次 backbone 输出，采样迭代不会重复编码。
 
-仅含 TCP 历史条件、没有 global_encoder 且 token_type 只有两类的早期 Stage2
-checkpoint 与当前结构不兼容，严格加载会拒绝不匹配参数。已有全局视觉分支的
-Stage2 checkpoint 可按前述方式续训或初始化，物理时间改为序号编码不会改变权重结构。
+仅含 TCP 历史条件的早期 Stage2 checkpoint，以及全局视觉分支仅使用跨帧 1536 维
+特征的 Stage2 checkpoint，均与当前结构不兼容；严格加载会拒绝缺失或形状不匹配的参数。
+请从 Stage1 权重开始新的 Stage2 实验并使用新的输出目录。使用 3072 维 concat 输入
+训练得到的 Stage2 checkpoint 支持正常初始化、断点恢复和推理。
 
 T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
 投影进入每层 cross-attention，并传递文本 padding mask。

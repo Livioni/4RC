@@ -2,7 +2,8 @@
 
 `stage2_sliding_window_inference.py` 独立加载完整 Stage2 策略，不导入 Stage1 推理脚本或训练入口。
 默认 checkpoint 为 `checkpoints/RoboTwin-Stage2/90000`，模型结构、历史帧数和预测长度来自该目录的 `config.json`。
-当前 policy 使用最后观测帧全局 patch 前缀和三类 token embedding。旧的仅含 TCP 历史条件的 Stage2 checkpoint 与此结构不兼容；请通过 `--checkpoint` 指定新结构训练得到的 checkpoint。
+当前 policy 使用最后观测帧的帧内/跨帧特征按通道 concat（1536+1536=3072）构造全局 patch 前缀，并使用三类 token embedding。
+旧的仅含 TCP 历史条件或仅使用跨帧 1536 维全局输入的 Stage2 checkpoint 与此结构不兼容；请通过 `--checkpoint` 指定 3072 维 concat 结构训练得到的 checkpoint。
 
 ## 运行
 
@@ -70,7 +71,7 @@ Stage2 统一只编码历史和未来的序号，不规定动作执行频率。�
 预测目标秒数 `future_frame_times`。JSON `format_version=3`，采集频率记录为
 `source_frequency_hz`，不表示动作执行频率。末尾仍预测完整长度，缺失真值使用有效掩码。
 
-加载 checkpoint 时始终使用序号条件，不再切回旧物理时间模式。已有权重可通过
+加载 checkpoint 时始终使用序号条件，不再切回旧物理时间模式。结构兼容的已有权重可通过
 训练配置的 `stage2_checkpoint` 初始化后继续训练，再使用新 checkpoint 推理。
 
 初始窗口由交互或真值选点初始化；历史仍从第 0 帧开始时复用初始选点。窗口起点向前移动后，
