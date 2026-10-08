@@ -36,7 +36,7 @@ data_sources = (
 view = "third_views"
 history_frames = 8  # Include anchors 0..7; repeat the oldest frame if history is short.
 prediction_horizon = 16  # Next 16 action records, with no execution-frequency assumption; short futures are masked.
-batch_size = 1  # Per GPU; each sample contains history_frames input images.
+batch_size = 3  # Per GPU; each sample contains history_frames input images.
 # Step indices encode observation order; repeated frames keep their source timestamps.
 # The action adapter requires forward windows within one valid segment. The runner derives
 # these image budgets and intervals again from batch_size / history_frames.
@@ -60,7 +60,7 @@ batches_per_epoch = None
 recent_buffer_size = 10_000
 
 # == Validation Configuration ==
-validation_fraction = 0.1
+validation_fraction = 0
 validation_batches = 16
 validation_batch_size = 1
 validate_every_steps = 1000
