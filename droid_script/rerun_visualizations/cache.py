@@ -103,7 +103,9 @@ def _array(data, name: str, shape: tuple, *, finite: bool = True) -> np.ndarray:
 def load_cache(directory: Path, *, require_robot: bool = True):
     directory = directory.expanduser().resolve()
     metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
-    if metadata.get("schema_version") != SCHEMA_VERSION or metadata.get("frame_rate_hz") != 15:
+    rate = metadata.get("frame_rate_hz")
+    if (metadata.get("schema_version") != SCHEMA_VERSION or isinstance(rate, bool)
+            or not isinstance(rate, (int, float)) or not np.isfinite(rate) or rate <= 0):
         raise ValueError("Unsupported replay cache version or frame rate")
     filenames = ["prediction.npz"] + (["robot_states.npz"] if require_robot else [])
     for filename in filenames:
@@ -120,6 +122,11 @@ def load_cache(directory: Path, *, require_robot: bool = True):
         count = len(indices)
         if count != metadata["num_frames"]:
             raise ValueError("Cache frame count disagrees with metadata")
+        if "timestamps_seconds" in metadata:
+            times = np.asarray(metadata["timestamps_seconds"], dtype=np.float64)
+            if (times.shape != (count,) or not np.isfinite(times).all()
+                    or times[0] < 0 or np.any(np.diff(times) <= 0)):
+                raise ValueError("Invalid cached timestamps_seconds")
         tcp = {name: _array(data, f"tcp_{name}", shape) for name, shape in (
             ("position", (count, 1, 3)), ("rotation", (count, 1, 3, 3)),
             ("gripper", (count, 1)), ("confidence", (count, 1)))}
@@ -149,3 +156,13 @@ def load_cache(directory: Path, *, require_robot: bool = True):
         if not np.allclose(states["gripper_open"], tcp["gripper"][:, 0]):
             raise ValueError("Robot gripper states disagree with prediction cache")
     return metadata, prediction, indices, states
+
+
+def validate_episode_timing(metadata, episode, indices) -> None:
+    """Refuse to silently replay a cache against a different source timeline."""
+    if not np.isclose(metadata["frame_rate_hz"], episode.frame_rate):
+        raise ValueError("Cached frame rate disagrees with the source episode")
+    if "timestamps_seconds" in metadata:
+        expected = [episode.time_seconds(int(i)) for i in indices]
+        if not np.allclose(metadata["timestamps_seconds"], expected, rtol=0, atol=1e-9):
+            raise ValueError("Cached timestamps disagree with the source episode")

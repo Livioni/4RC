@@ -17,7 +17,7 @@ import torch
 
 from droid_script import infer_4rc_stage1 as inference
 from droid_script.rerun_visualizations.cache import (
-    file_digest, load_cache, save_prediction, save_robot_states,
+    file_digest, load_cache, save_prediction, save_robot_states, validate_episode_timing,
 )
 from droid_script.rerun_visualizations.data import load_ground_truth
 from droid_script.rerun_visualizations.ik import read_tcp_offset, solve_trajectory
@@ -29,7 +29,7 @@ DEFAULT_URDF = REPO_ROOT / "embodiments/franka-panda-robotiq-2f85/panda_robotiq_
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", type=Path, help="Extracted DROID episode")
+    source.add_argument("--input", type=Path, help="DROID or RoboLab episode")
     source.add_argument("--reuse-prediction", type=Path, help="Recompute IK from cached predictions")
     parser.add_argument("--output", type=Path, help="Cache directory; reuse defaults to the source cache")
     parser.add_argument("--camera", help="Camera serial; default: first sorted camera")
@@ -73,6 +73,7 @@ def run(args):
         episode = inference.load_episode(Path(metadata["episode"]), metadata["camera_id"])
         if len(episode.image_paths) != metadata["episode_num_frames"] or indices[-1] >= len(episode.image_paths):
             raise ValueError("Cached frames disagree with the source episode")
+        validate_episode_timing(metadata, episode, indices)
         paths = [episode.image_paths[int(frame)] for frame in indices]
         output = (args.output or args.reuse_prediction).expanduser().resolve()
         urdf = (args.urdf or Path(metadata["urdf"])).expanduser().resolve()
@@ -90,7 +91,7 @@ def run(args):
         read_tcp_offset(episode.path, episode.camera)
         urdf_hash = file_digest(urdf)
         model_path = inference.weight_file(args.model).resolve()
-        output = (args.output or REPO_ROOT / "outputs/droid/rerun" / episode.path.name
+        output = (args.output or REPO_ROOT / "outputs" / episode.dataset / "rerun" / episode.path.name
                   / episode.camera).expanduser().resolve()
         dtype = inference.resolve_dtype(args.dtype, device)
         print(f"Episode: {episode.path.name}; camera: {episode.camera}; "
@@ -107,7 +108,10 @@ def run(args):
             torch.cuda.empty_cache()
         metadata = dict(episode=str(episode.path), camera_id=episode.camera,
                         episode_num_frames=len(episode.image_paths), num_frames=len(paths),
-                        frame_rate_hz=15, model=str(model_path), window_size=args.window_size,
+                        dataset=episode.dataset, source_format=episode.metadata.get("format", "droid"),
+                        frame_rate_hz=episode.frame_rate,
+                        timestamps_seconds=[episode.time_seconds(int(i)) for i in indices],
+                        model=str(model_path), window_size=args.window_size,
                         initial_query=query.tolist(), query_source=query_source,
                         urdf=str(urdf), urdf_sha256=urdf_hash, max_points=args.max_points,
                         coordinate_frame="robot_base", tcp_prediction_frame="OpenCV camera")

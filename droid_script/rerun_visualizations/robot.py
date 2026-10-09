@@ -124,10 +124,10 @@ def prepare_robot(urdf_path: Path, temporary_directory: Path, *,
     return tree
 
 
-def joint_values(joint, joints: np.ndarray, gripper_open: np.ndarray) -> np.ndarray:
+def joint_values(joint, joints: np.ndarray, gripper_open: np.ndarray, *, closed_radians=0.8) -> np.ndarray:
     if joint.name in ARM_JOINT_NAMES:
         return joints[:, ARM_JOINT_NAMES.index(joint.name)]
-    closing = (1.0 - gripper_open) * 0.8
+    closing = (1.0 - gripper_open) * closed_radians
     if joint.name == "finger_joint":
         return closing
     if joint.mimic is not None:
@@ -136,10 +136,13 @@ def joint_values(joint, joints: np.ndarray, gripper_open: np.ndarray) -> np.ndar
 
 
 def log_robot(recording: rr.RecordingStream, tree: rr.urdf.UrdfTree, ground_truth=None, *,
-              prefix="ground_truth", frame_indices=None, joints=None, gripper_open=None) -> None:
+              prefix="ground_truth", frame_indices=None, joints=None, gripper_open=None,
+              timestamps=None, closed_radians=0.8) -> None:
     if ground_truth is not None:
         frame_indices, joints = ground_truth.frame_indices, ground_truth.joints
         gripper_open = ground_truth.tcp_camera[:, 6]
+        timestamps = ground_truth.timestamps
+        closed_radians = ground_truth.gripper_closed_radians
     frame_prefix = "pred_robot/" if prefix == "prediction" else ROBOT_FRAME_PREFIX
     recording.send_chunks(tree.stream(include_joint_transforms=False))
     recording.log(
@@ -149,13 +152,13 @@ def log_robot(recording: rr.RecordingStream, tree: rr.urdf.UrdfTree, ground_trut
         static=True,
     )
     indexes = [rr.TimeColumn("frame", sequence=frame_indices),
-               rr.TimeColumn(TIME_TIMELINE, duration=frame_indices / 15.0)]
+               rr.TimeColumn(TIME_TIMELINE, duration=frame_indices / 15.0 if timestamps is None else timestamps)]
     for joint in tree.joints():
         path = f"{prefix}/robot/joints/{joint.name}"
         if joint.joint_type == "fixed":
             recording.log(path, joint.compute_transform(0, clamp=False), static=True)
         else:
-            values = joint_values(joint, joints, gripper_open)
+            values = joint_values(joint, joints, gripper_open, closed_radians=closed_radians)
             # Negative mimic multipliers are intentional even when the original
             # Robotiq URDF's mimic joint limits are non-negative.
             recording.send_columns(path, indexes=indexes,

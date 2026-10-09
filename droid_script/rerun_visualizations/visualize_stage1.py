@@ -23,7 +23,7 @@ import torch
 
 from droid_script import infer_4rc_stage1 as inference
 from droid_script.rerun_visualizations.data import load_ground_truth
-from droid_script.rerun_visualizations.cache import file_digest, load_cache
+from droid_script.rerun_visualizations.cache import file_digest, load_cache, validate_episode_timing
 from droid_script.rerun_visualizations.robot import prepare_robot
 from droid_script.rerun_visualizations.viewer import (
     log_replay, make_blueprint, start_web_viewer, wait_for_web_viewer,
@@ -36,7 +36,7 @@ DEFAULT_URDF = REPO_ROOT / "embodiments/franka-panda-robotiq-2f85/panda_robotiq_
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--input", type=Path, help="Extracted DROID episode directory (legacy inference mode)")
+    source.add_argument("--input", type=Path, help="DROID or RoboLab episode directory (legacy inference mode)")
     source.add_argument("--prediction", type=Path, help="Replay cache from infer_stage1_ik.py; no inference or IK")
     parser.add_argument("--episode-root", type=Path, help="Override cached episode location after moving a dataset")
     parser.add_argument("--camera", help="Camera serial; default is the first sorted images/ directory")
@@ -104,15 +104,15 @@ def run(args) -> None:
     try:
         with tempfile.TemporaryDirectory(prefix="4rc_rerun_meshes_") as temporary_directory:
             tree = prepare_robot(args.urdf, Path(temporary_directory))
-            recording = rr.RecordingStream(f"4rc_droid_stage1_{episode.camera}")
-            blueprint = make_blueprint(episode.camera)
+            recording = rr.RecordingStream(f"4rc_{episode.dataset}_stage1_{episode.camera}")
+            blueprint = make_blueprint(episode.camera, frame_rate=episode.frame_rate)
             if args.output is None:
                 # Initialize the SDK's server before CUDA inference. The Web
                 # page is immediately accessible while the model is loading.
                 start_web_viewer(recording, args)
                 recording.send_blueprint(blueprint)
                 recording.set_time("frame", sequence=start)
-                recording.set_time("episode_time", duration=start / inference.FRAME_RATE)
+                recording.set_time("episode_time", duration=episode.time_seconds(start))
                 # Static text takes precedence over temporal text in Rerun.
                 # Use the first replay time so per-frame information replaces it.
                 recording.log("info", rr.TextDocument("Loading Stage1 model…", media_type="text/markdown"))
@@ -157,6 +157,7 @@ def run_cached(args) -> None:
     episode = inference.load_episode(args.episode_root or Path(metadata["episode"]), metadata["camera_id"])
     if len(episode.image_paths) != metadata["episode_num_frames"] or indices[-1] >= len(episode.image_paths):
         raise ValueError("Cached frames disagree with the source episode")
+    validate_episode_timing(metadata, episode, indices)
     paths = [episode.image_paths[int(frame)] for frame in indices]
     ground_truth = load_ground_truth(episode, paths)
     urdf = (args.urdf or Path(metadata["urdf"])).expanduser().resolve()
@@ -169,9 +170,9 @@ def run_cached(args) -> None:
         raise ValueError("Source TCP work point differs from the cached IK work point")
     args.model = metadata["model"]
     query = np.asarray(metadata["initial_query"], dtype=np.float32)
-    recording = rr.RecordingStream(f"4rc_droid_stage1_{episode.camera}")
+    recording = rr.RecordingStream(f"4rc_{episode.dataset}_stage1_{episode.camera}")
     try:
-        blueprint = make_blueprint(episode.camera, predicted_robot=True)
+        blueprint = make_blueprint(episode.camera, predicted_robot=True, frame_rate=episode.frame_rate)
         if args.output is None:
             start_web_viewer(recording, args)
         else:

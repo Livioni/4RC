@@ -371,7 +371,7 @@ python -m pip install "gradio==6.12.0" viser
 python droid_script/infer_4rc_stage1.py --help
 ```
 
-纯 JSON 推理无需安装 Gradio/Viser。默认 checkpoint 是当前仓库的 `checkpoints/Droid-Stage1/250000/checkpoint-250000`。其他权重通过 `--model` 指定，支持含 `model.safetensors` / `pytorch_model.bin` / `model.pt` 的目录或直接指定权重文件。
+纯 JSON 推理无需安装 Gradio/Viser。默认 checkpoint 是当前仓库的 `checkpoints/Droid-Stage1/checkpoint-250000`。其他权重通过 `--model` 指定，支持含 `model.safetensors` / `pytorch_model.bin` / `model.pt` 的目录或直接指定权重文件。
 
 必须使用**训练后的单臂 DROID Stage 1 checkpoint**。推理完整恢复 checkpoint 中的 `tcp_track_head.position_mean/std`，不重新计算训练集统计，也不执行双臂到单臂初始化迁移。推理不需要训练索引、split TXT、GT 深度或 GT 外参。
 
@@ -393,7 +393,7 @@ python droid_script/infer_4rc_stage1.py \
 python droid_script/infer_4rc_stage1.py \
   --input "datasets/droid_episodes/RAIL__Tue_Oct__3_10:06:26_2023" \
   --camera 24259877 \
-  --model checkpoints/Droid-Stage1/250000/checkpoint-250000 \
+  --model checkpoints/Droid-Stage1/checkpoint-250000 \
   --start-frame 24 --max-frames 18 \
   --output outputs/droid/example_tcp.json
 ```
@@ -430,8 +430,8 @@ ssh -L 7860:127.0.0.1:7860 -L 8020:127.0.0.1:8020 user@server
 
 默认输出：`outputs/droid/stage1_inference/<episode>/<camera>/tcp_episode.json`，交互模式会随当前选中的相机更新路径。显式传入 `--output` 时始终使用指定文件，切换相机后再次推理也会替换该文件。成功后原子替换同名文件，源数据目录不写入预测。
 
-- 顶层包含 episode、相机、checkpoint、15 Hz 帧率、覆盖起止帧、`skipped_prefix_frames`、`unprocessed_suffix_frames`、初始 query 和窗口记录。
-- `frames` 每帧包含原始 `frame_index`、`time_seconds = frame_index / 15`、RGB 路径、窗口来源和单个 `tcp` 对象。
+- 顶层包含 episode、相机、checkpoint、数据集格式及源帧率、覆盖起止帧、`skipped_prefix_frames`、`unprocessed_suffix_frames`、初始 query 和窗口记录。
+- `frames` 每帧包含原始 `frame_index`、`time_seconds`（优先读取 `timestamps.npy`，否则用帧号除以源帧率）、RGB 路径、窗口来源和单个 `tcp` 对象。
 - `tcp.xyz_m` 是 OpenCV 相机坐标 XYZ（米）；`rpy_rad` / `rpy_deg` 使用 `Rz(yaw) @ Ry(pitch) @ Rx(roll)`；`confidence` 是模型原始置信度，不是概率。
 - `tcp.gripper_open` 是 `[0,1]` 的**连续夹爪开度浮点数**，不是布尔值；不输出左右臂字段。
 
@@ -481,3 +481,55 @@ python -m pytest -q droid_script/tests/test_inference.py droid_script/tests/test
 ```
 
 已通过 28 项回归测试，并使用本地 250000 步 checkpoint 在 CPU 上验证示例视频第 40–42 帧的 3 帧 / 2 窗口推理、JSON 导出及 Gradio/Viser HTTP 服务启动与关闭；未进行整段视频精度评测。
+
+
+### 11.6 RoboLab episode 推理和可视化
+
+所有 episode 推理、Gradio/Viser、Rerun 直接推理、IK 缓存和缓存回放入口均支持
+`metadata.json` 中 `format=robolab_droid_like_v2` 的数据；自动识别并保留 DROID 兼容性。
+视频入口也接受 episode 目录，自动使用带标定/GT 的 episode 流程。
+
+```bash
+conda activate 4rc
+EPISODE=datasets/robolab/BananaInBowlTask__20261009T082516Z_449776c1_0000
+
+# 自动投影首个可见 GT TCP，推理整段，打开 Viser。
+python droid_script/infer_4rc_stage1.py --input "$EPISODE" --visualize
+
+# 在 Gradio 选择相机、帧和 TCP，再打开 Viser。
+python droid_script/infer_4rc_stage1.py --input "$EPISODE" --interactive
+
+# 视频入口同样可以直接传 episode 目录，无需转成 MP4。
+python droid_script/infer_4rc_stage1_video.py --input "$EPISODE" --visualize
+
+# 直接推理并用 Rerun 比较预测点云、GT RGB-D、TCP 和真值机器人。
+python droid_script/rerun_visualizations/visualize_stage1.py --input "$EPISODE"
+
+# 预测机器人：先推理 + IK，再独立回放。
+python droid_script/rerun_visualizations/infer_stage1_ik.py --input "$EPISODE"
+python droid_script/rerun_visualizations/visualize_stage1.py \
+  --prediction outputs/robolab/rerun/BananaInBowlTask__20261009T082516Z_449776c1_0000/third_person
+```
+
+该 episode 为 165 帧、320×180、15 fps，唯一相机为 `third_person`，默认从第 0 帧开始。
+`--camera third_person` 可显式指定；`--max-frames 3 --window-size 2` 可快速检查两个窗口。
+默认 JSON 在 `outputs/robolab/stage1_inference/<episode>/<camera>/tcp_episode.json`，
+IK 缓存在 `outputs/robolab/rerun/<episode>/<camera>/`，可用 `--output` 覆盖。
+视频入口传入目录时使用上述 episode 输出规则；`--output-root` 和 `--fps` 用于视频文件。
+
+RGB、毫米 uint16 深度、内外参、TCP、七轴关节直接从导出目录读取，不需要重新导出 HDF5。
+外参必须为 base → OpenCV camera，深度必须为光轴方向距离 `distance_to_image_plane`。
+TCP 的 `OpenCV (...)` 与 DROID 的 `OpenCV camera (...)` 视为相同坐标约定。
+JSON、Viser 时间标签、Rerun 点云/机器人时间轴和 IK 缓存均使用 `timestamps.npy` 的秒数；
+没有时间戳时依次使用 `fps`、`frequency_hz`、默认 15 Hz 计算时间。
+RoboLab 真值夹爪按 `(1 - gripper_open) × π/4` 恢复测量关节；DROID 真值与预测机器人沿用 0.8 rad。
+IK 的固定 TCP 工作点仍来自 `TCP/<camera>/metadata.json`，不会使用随夹爪开合变化的工作点。
+
+回归测试（无需 GPU 或 checkpoint）：
+
+```bash
+python -m unittest droid_script.test_robolab -v
+```
+
+已在上述 episode 完成 165 帧 / 21 窗口的实际 GPU 推理，并验证 3 帧 IK 缓存与 Rerun 录制导出。
+这验证格式和运行链路，未评估预测精度。

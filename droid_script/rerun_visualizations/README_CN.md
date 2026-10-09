@@ -1,4 +1,15 @@
-# DROID Stage1 Rerun 对照回放
+# DROID / RoboLab Stage1 Rerun 对照回放
+
+## RoboLab 数据
+
+`--input` 可直接传入
+`datasets/robolab/BananaInBowlTask__20261009T082516Z_449776c1_0000`，
+相机自动选为 `third_person`。直接推理、推理 + IK、`--reuse-prediction`、独立缓存回放
+和 `.rrd` 导出均支持此格式。[完整命令和格式说明](../README_DROID_TRAIN_CN.md#116-robolab-episode-推理和可视化)。
+
+RoboLab 默认缓存目录为 `outputs/robolab/rerun/<episode>/<camera>`。
+时间轴优先使用 `timestamps.npy` 的秒数，默认播放速率来自 `fps`/`frequency_hz`；
+缓存保存并校验源时间轴。RoboLab 真值夹爪关节按开度恢复到 π/4 rad，预测机器人仍使用模型的 0.8 rad 约定。
 
 ## 预测机械臂：推理 / IK 与回放分开运行
 
@@ -32,7 +43,7 @@ conda run --no-capture-output -n 4rc python \
   --prediction outputs/droid/rerun/AUTOLab__Fri_Aug_18_11:40:54_2023/22008760
 ```
 
-打开打印的完整 Web viewer URL。左侧新增预测机器人、蓝色 FK TCP 与目标残差线；失败时 FK TCP 变红，并在信息面板显示 **HOLD**。右侧继续使用真值关节。两套机器人使用独立坐标帧，共用原始帧号及 15 Hz 时间轴。
+打开打印的完整 Web viewer URL。左侧新增预测机器人、蓝色 FK TCP 与目标残差线；失败时 FK TCP 变红，并在信息面板显示 **HOLD**。右侧继续使用真值关节。两套机器人使用独立坐标帧，共用原始帧号及源 episode 时间轴。
 
 缓存模式仍支持点云过滤、显示大小、端口、`--renderer` 和 `--output <文件.rrd>`。数据集移动后使用 `--episode-root <新的episode目录>`；URDF 移动后可通过 `--urdf` 指定相同内容的文件。相机、query 和帧区间由缓存固定，需要改变时重新生成缓存。
 
@@ -97,7 +108,7 @@ conda run --no-capture-output -n 4rc python \
 - 左侧：预测深度、内参和绝对相机位姿生成的彩色点云；预测 TCP 位姿坐标轴与橙色轨迹。
 - 右侧：真实 RGB-D 和标定生成的点云；Franka Panda + Robotiq 2F-85 实测关节回放；真值 TCP 位姿与绿色轨迹。
 - 下方：所选相机原始 RGB，橙色/绿色分别标记预测/真值 TCP 的有效投影；白色初始 query 只在起始帧显示。旁边显示当前帧、点数和推理信息。
-- 所有内容共用原始帧号与 `episode_time = frame_index / 15`。时间面板可以播放、暂停和拖动；左右初始观察位置相同，可分别旋转和缩放。
+- 所有内容共用原始帧号与源时间戳；没有时间戳时用帧号除以源帧率。时间面板可以播放、暂停和拖动；左右初始观察位置相同，可分别旋转和缩放。
 
 两个 3D 视图都使用 robot base 坐标系，单位米。预测侧使用模型预测的相机位姿，真值侧使用数据集真实外参；对照误差包含相机位姿预测误差。显示整段推理帧区间的 TCP 轨迹，当前坐标轴随时间变化。
 

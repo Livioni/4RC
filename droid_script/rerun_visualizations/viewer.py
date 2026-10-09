@@ -21,7 +21,7 @@ GT_COLOR = [55, 205, 120]
 AXIS_COLORS = [[235, 65, 65], [65, 210, 80], [65, 130, 255]]
 
 
-def make_blueprint(camera: str, *, predicted_robot: bool = False) -> rrb.Blueprint:
+def make_blueprint(camera: str, *, predicted_robot: bool = False, frame_rate: float = 15.0) -> rrb.Blueprint:
     def spatial(name, contents):
         return rrb.Spatial3DView(
             origin="world", name=name, contents=contents,
@@ -42,7 +42,7 @@ def make_blueprint(camera: str, *, predicted_robot: bool = False) -> rrb.Bluepri
     )
     return rrb.Blueprint(
         rrb.Vertical(comparison, lower, row_shares=[3, 1]),
-        rrb.TimePanel(timeline=TIME_TIMELINE, expanded=True, fps=15,
+        rrb.TimePanel(timeline=TIME_TIMELINE, expanded=True, fps=frame_rate,
                       play_state=PlayState.Paused, loop_mode=LoopMode.All),
         auto_views=False, collapse_panels=True,
     )
@@ -146,10 +146,10 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
     if predicted_tree is not None:
         log_robot(recording, predicted_tree, prefix="prediction",
                   frame_indices=robot_states["frame_indices"], joints=robot_states["joints"],
-                  gripper_open=robot_states["gripper_open"])
+                  gripper_open=robot_states["gripper_open"], timestamps=ground_truth.timestamps)
     for slot, (frame, rgb_path, depth_path) in enumerate(zip(ground_truth.frame_indices, paths, ground_truth.depth_paths)):
         recording.set_time("frame", sequence=int(frame))
-        recording.set_time(TIME_TIMELINE, duration=float(frame) / 15.0)
+        recording.set_time(TIME_TIMELINE, duration=float(ground_truth.timestamps[slot]))
         with Image.open(rgb_path) as image:
             rgb = np.asarray(image.convert("RGB"))
         with Image.open(depth_path) as image:
@@ -194,9 +194,9 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
             recording.log("rgb/initial_query", rr.Clear(recursive=True))
         recording.log("info", rr.TextDocument(
             f"## {episode.path.name}\n\n"
-            f"Camera: **{episode.camera}** · frame **{int(frame)}** · {frame / 15:.3f} s\n\n"
+            f"Camera: **{episode.camera}** · frame **{int(frame)}** · {ground_truth.timestamps[slot]:.3f} s\n\n"
             f"{ik_info}"
-            f"Replay: {int(ground_truth.frame_indices[0])}–{int(ground_truth.frame_indices[-1])} at 15 Hz. "
+            f"Replay: {int(ground_truth.frame_indices[0])}–{int(ground_truth.frame_indices[-1])} at {episode.frame_rate:g} Hz. "
             f"Skipped prefix: {int(ground_truth.frame_indices[0])} frames.\n\n"
             f"**Orange:** predicted TCP · **Green:** GT TCP. Both scenes use robot-base coordinates (metres).\n\n"
             f"Points: prediction **{len(pred_points):,}**, GT **{len(gt_points):,}**.\n\n"

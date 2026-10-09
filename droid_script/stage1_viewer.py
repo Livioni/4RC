@@ -79,7 +79,7 @@ class Viewer:
         self.server.stop()
 
 
-def start_viewer(args, episode, prediction, paths, *, frame_rate=15.0,
+def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
                  scene_frame="robot base coordinates", load_ground_truth=True) -> Viewer:
     try:
         import viser
@@ -88,6 +88,7 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=15.0,
         raise ImportError("Viser is required: python -m pip install viser") from error
     if prediction.clouds is None or prediction.camera_to_base is None:
         raise ValueError("Viewer requires predicted depth and camera geometry")
+    frame_rate = episode.frame_rate if frame_rate is None else frame_rate
     tcp = inference.tcp_to_base(prediction.tcp, prediction.camera_to_base)
     gt_positions, gt_error = None, ""
     try:
@@ -101,7 +102,7 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=15.0,
     server = viser.ViserServer(host=args.host, port=args.port)
     stopped = threading.Event()
     lock = threading.RLock()
-    server.gui.set_panel_label(f"DROID · {episode.camera}")
+    server.gui.set_panel_label(f"{episode.dataset.upper()} · {episode.camera}")
     server.scene.set_up_direction("+z")
     with server.gui.add_folder("Playback"):
         frame = server.gui.add_slider("Frame slot", min=0, max=len(paths) - 1, step=1, initial_value=0)
@@ -185,7 +186,7 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=15.0,
             source_frame = inference._frame_index(paths[slot])
             xyz = prediction.tcp["position"][slot, 0]
             info.content = (f"**{episode.path.name} / {episode.camera}**\n\n"
-                            f"Frame **{source_frame}** · {source_frame / frame_rate:.3f} s · {slot + 1}/{len(paths)}\n\n"
+                            f"Frame **{source_frame}** · {episode.time_seconds(source_frame):.3f} s · {slot + 1}/{len(paths)}\n\n"
                             f"Pred TCP camera XYZ (m): `{np.round(xyz, 4).tolist()}`\n\n"
                             f"Gripper opening: **{tcp['gripper'][slot, 0]:.4f}** · "
                             f"confidence: **{tcp['confidence'][slot, 0]:.3f}**\n\n"
@@ -336,8 +337,8 @@ def build_interactive(args, episode, device, dtype):
 
     run.__annotations__["request"] = gr.Request
 
-    with gr.Blocks(title="DROID Stage 1 TCP Inference") as demo:
-        gr.Markdown(f"# DROID Stage 1 单臂推理\nEpisode：`{episode.path.name}`\n\n"
+    with gr.Blocks(title=f"{episode.dataset.upper()} Stage 1 TCP Inference") as demo:
+        gr.Markdown(f"# {episode.dataset.upper()} Stage 1 单臂推理\nEpisode：`{episode.path.name}`\n\n"
                     "选择相机和起始帧，点击一个 TCP 或使用 GT，然后推理到结尾。切换相机或起始帧会清除选点。")
         camera = gr.Dropdown(choices=cameras, value=episode.camera, label="相机", interactive=True)
         gt_note = gr.Markdown(f"GT 选点不可用：{gt_error}" if gt_error else "")

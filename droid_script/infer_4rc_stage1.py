@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Single-camera, single-arm DROID Stage 1 episode inference.
+"""Single-camera, single-arm Stage 1 inference for DROID and RoboLab episodes.
 
 Run from the repository root (activate the 4rc environment first)::
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import gc
 import json
 import math
@@ -47,6 +47,13 @@ class Episode:
     camera: str
     image_paths: list[Path]
     intrinsics: np.ndarray | None
+    dataset: str = field(default="droid", kw_only=True)
+    frame_rate: float = field(default=FRAME_RATE, kw_only=True)
+    timestamps: np.ndarray | None = field(default=None, kw_only=True)
+    metadata: dict = field(default_factory=dict, kw_only=True)
+
+    def time_seconds(self, index: int) -> float:
+        return float(self.timestamps[index]) if self.timestamps is not None else index / self.frame_rate
 
     def clip(self, start_frame: int, max_frames: int = 0) -> list[Path]:
         if not 0 <= start_frame < len(self.image_paths):
@@ -74,7 +81,7 @@ def load_episode(path: Path, camera: str | None = None) -> Episode:
     path = path.expanduser().resolve()
     image_root = path / "images"
     if not image_root.is_dir():
-        raise FileNotFoundError(f"Expected a DROID episode with images/: {path}")
+        raise FileNotFoundError(f"Expected a DROID or RoboLab episode with images/: {path}")
     cameras = sorted(p.name for p in image_root.iterdir() if p.is_dir() and not p.name.startswith("."))
     if not cameras:
         raise ValueError(f"No camera directories found in {image_root}")
@@ -82,18 +89,40 @@ def load_episode(path: Path, camera: str | None = None) -> Episode:
     if camera not in cameras:
         raise ValueError(f"Unknown camera {camera!r}; available cameras: {', '.join(cameras)}")
     metadata = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    dataset = "robolab" if str(metadata.get("format", "")).startswith("robolab_") else "droid"
+    if dataset == "robolab":
+        if metadata["format"] != "robolab_droid_like_v2":
+            raise ValueError(f"Unsupported RoboLab format: {metadata['format']!r}")
+        if metadata.get("extrinsics") != "base_to_camera":
+            raise ValueError("RoboLab extrinsics must map robot base to OpenCV camera")
+    rate = metadata.get("fps", metadata.get("frequency_hz", FRAME_RATE))
+    if isinstance(rate, bool) or not isinstance(rate, (int, float)) or not math.isfinite(rate) or rate <= 0:
+        raise ValueError("Episode fps/frequency_hz must be finite and positive")
     count = metadata.get("frame_count")
     if isinstance(count, bool) or not isinstance(count, int) or count < 2:
         raise ValueError(f"Expected integer frame_count >= 2 in {path / 'metadata.json'}")
     paths = collect_rgb_paths(image_root / camera, max_frames=0, start_frame=0)
     if len(paths) != count:
         raise ValueError(f"Camera {camera}: metadata declares {count} frames, found {len(paths)}")
+    if [_frame_index(p) for p in paths] != list(range(count)):
+        raise ValueError("Episode RGB frame indices must be contiguous and start at zero")
+    with Image.open(paths[0]) as image:
+        if image.size != (SOURCE_WIDTH, SOURCE_HEIGHT):
+            raise ValueError(f"Expected native 320x180 RGB, got {image.size}: {paths[0]}")
+    time_path = path / "timestamps.npy"
+    timestamps = None
+    if time_path.is_file():
+        timestamps = np.load(time_path, allow_pickle=False).astype(np.float64)
+        if (timestamps.shape != (count,) or not np.isfinite(timestamps).all()
+                or timestamps[0] < 0 or np.any(np.diff(timestamps) <= 0)):
+            raise ValueError(f"Expected {count} finite, nonnegative, increasing timestamps: {time_path}")
     k_path = path / "intrinsic" / f"{camera}.npy"
     k = np.load(k_path, allow_pickle=False).astype(np.float32)
     if (k.shape != (3, 3) or not np.isfinite(k).all() or k[0, 0] <= 0 or k[1, 1] <= 0
             or not np.allclose(k[2], [0, 0, 1])):
         raise ValueError(f"Expected finite pinhole intrinsic matrix [3,3]: {k_path}")
-    return Episode(path, camera, paths, k)
+    return Episode(path, camera, paths, k, dataset=dataset, frame_rate=float(rate),
+                   timestamps=timestamps, metadata=metadata)
 
 
 def validate_query(point: Any, source: str = "TCP query") -> np.ndarray:
@@ -352,15 +381,16 @@ def build_result(episode: Episode, paths: list[Path], prediction: Prediction,
     rpy = matrix_to_rpy(prediction.tcp["rotation"])
     frames = []
     for slot, (index, path) in enumerate(zip(indices, paths)):
-        frames.append({"frame_index": index, "time_seconds": index / FRAME_RATE,
+        frames.append({"frame_index": index, "time_seconds": episode.time_seconds(index),
                        "image": str(path), "source_windows": prediction.source_windows[slot],
                        "tcp": {"xyz_m": prediction.tcp["position"][slot, 0].tolist(),
                                "rpy_rad": rpy[slot, 0].tolist(), "rpy_deg": np.rad2deg(rpy[slot, 0]).tolist(),
                                "gripper_open": float(prediction.tcp["gripper"][slot, 0]),
                                "confidence": float(prediction.tcp["confidence"][slot, 0])}})
-    return {"schema_version": 1, "dataset": "droid", "episode": str(episode.path),
+    return {"schema_version": 1, "dataset": episode.dataset, "episode": str(episode.path),
+            "source_format": episode.metadata.get("format", episode.dataset),
             "camera_id": episode.camera, "model": str(weight_file(model).resolve()), "num_arms": 1,
-            "frame_rate_hz": FRAME_RATE, "episode_num_frames": len(episode.image_paths),
+            "frame_rate_hz": episode.frame_rate, "episode_num_frames": len(episode.image_paths),
             "num_frames": len(frames), "start_frame": indices[0], "end_frame": indices[-1],
             "skipped_prefix_frames": list(range(indices[0])),
             "unprocessed_suffix_frames": list(range(indices[-1] + 1, len(episode.image_paths))),
@@ -382,14 +412,15 @@ def run_and_save(args, episode, model, start, query, query_source, device, dtype
                                dtype=dtype, window_size=args.window_size, keep_geometry=keep_geometry,
                                max_points=args.max_points, progress=progress)
     result = build_result(episode, paths, prediction, query, query_source, args.model, args.window_size)
-    output = args.output or DEFAULT_OUTPUT_ROOT / episode.path.name / episode.camera / "tcp_episode.json"
+    root = DEFAULT_OUTPUT_ROOT if episode.dataset == "droid" else Path("outputs") / episode.dataset / "stage1_inference"
+    output = args.output or root / episode.path.name / episode.camera / "tcp_episode.json"
     saved = write_json_atomic(result, output)
     return result, prediction, paths, saved
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--input", type=Path, required=True, help="One complete DROID episode directory")
+    parser.add_argument("--input", type=Path, required=True, help="One DROID or RoboLab episode directory (auto-detected)")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="DROID Stage 1 checkpoint directory or weights")
     parser.add_argument("--camera", help="Camera serial; initial selection in interactive mode; defaults to first sorted camera")
     parser.add_argument("--output", type=Path, help="JSON destination (replaced only after successful inference)")
@@ -430,7 +461,10 @@ def parse_args(argv=None):
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    run(parse_args(argv))
+
+
+def run(args):
     episode = load_episode(args.input, args.camera)
     device = resolve_device(args.device)
     dtype = resolve_dtype(args.dtype, device)

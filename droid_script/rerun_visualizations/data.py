@@ -17,6 +17,8 @@ class GroundTruth:
     tcp_camera: np.ndarray
     tcp_poses: np.ndarray
     joints: np.ndarray
+    timestamps: np.ndarray
+    gripper_closed_radians: float = 0.8
 
 
 def poses_from_states(states: np.ndarray) -> np.ndarray:
@@ -62,6 +64,9 @@ def load_ground_truth(episode, paths: list[Path]) -> GroundTruth:
             "rpy_convention": "fixed-axis XYZ (R = Rz(yaw) @ Ry(pitch) @ Rx(roll))",
         }
         for key, value in expected.items():
+            if key == "coordinate_frame" and metadata.get(key) in (
+                    value, "OpenCV (+x right, +y down, +z forward)"):
+                continue
             if metadata.get(key) != value:
                 raise ValueError(f"Unsupported {key} in {tcp_metadata_path}")
     states = states[indices]
@@ -73,9 +78,12 @@ def load_ground_truth(episode, paths: list[Path]) -> GroundTruth:
         raise ValueError(f"Expected finite measured joints [{count},7] in {joints_path}")
     depth_metadata = episode.path / "depths" / "metadata.json"
     if depth_metadata.is_file():
-        units = json.loads(depth_metadata.read_text(encoding="utf-8")).get("units", "millimeters")
+        depth_info = json.loads(depth_metadata.read_text(encoding="utf-8"))
+        units = depth_info.get("units", "millimeters")
         if str(units).lower() not in ("mm", "millimeter", "millimeters"):
             raise ValueError(f"Expected millimeter depth PNGs, got units={units!r}")
+        if depth_info.get("depth_type", "distance_to_image_plane") != "distance_to_image_plane":
+            raise ValueError("Expected optical-axis depth (distance_to_image_plane), not ray distance")
     depth_paths = [episode.path / "depths" / episode.camera / path.name for path in paths]
     for rgb_path, depth_path in zip(paths, depth_paths):
         with Image.open(rgb_path) as image:
@@ -86,7 +94,15 @@ def load_ground_truth(episode, paths: list[Path]) -> GroundTruth:
                 raise ValueError(f"Expected 320x180 uint16 millimeter depth: {depth_path}")
     tcp_poses = camera_to_base @ poses_from_states(states)
     tcp_poses[~np.isfinite(states[:, :6]).all(axis=-1)] = np.nan
-    return GroundTruth(indices, depth_paths, camera_to_base, states, tcp_poses, joints[indices])
+    if episode.dataset == "robolab":
+        from .robot import ARM_JOINT_NAMES
+        if episode.metadata.get("arm_joint_names") != list(ARM_JOINT_NAMES):
+            raise ValueError("RoboLab arm_joint_names must follow Panda joint1–joint7 order")
+    times = np.asarray([episode.time_seconds(int(i)) for i in indices])
+    # RoboLab normalizes measured finger_joint by pi/4; DROID uses 0.8 rad.
+    closed_radians = np.pi / 4 if episode.dataset == "robolab" else 0.8
+    return GroundTruth(indices, depth_paths, camera_to_base, states, tcp_poses, joints[indices],
+                       times, closed_radians)
 
 
 def backproject_rgbd(rgb: np.ndarray, depth_mm: np.ndarray, intrinsic: np.ndarray,

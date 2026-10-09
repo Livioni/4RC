@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a single-arm DROID Stage 1 checkpoint on an uncalibrated video.
+"""Run a single-arm DROID Stage 1 checkpoint on a video or DROID/RoboLab episode.
 
     python droid_script/infer_4rc_stage1_video.py --input video.mp4 --interactive
     python droid_script/infer_4rc_stage1_video.py --input video.mp4 \
@@ -105,7 +105,8 @@ def load_video(path: Path, output_root: Path = DEFAULT_OUTPUT_ROOT,
     fps = fps_override if fps_override is not None else metadata["fps"]
     if fps is None or not math.isfinite(fps) or fps <= 0:
         raise ValueError("Video has no valid frame rate; specify --fps explicitly")
-    return VideoEpisode(path, "video", paths, None, fps, tuple(metadata["original_size"]), output_dir)
+    return VideoEpisode(path, "video", paths, None, fps, tuple(metadata["original_size"]), output_dir,
+                        dataset="in_the_wild_video", frame_rate=fps)
 
 
 def run_and_save(args, episode, model, start, query, query_source, device, dtype,
@@ -142,14 +143,15 @@ def start_viewer(args, episode, prediction, paths):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--input", type=Path, required=True, help="Video file (MP4 or another OpenCV-supported format)")
+    parser.add_argument("--input", type=Path, required=True, help="Video file or calibrated DROID/RoboLab episode directory")
+    parser.add_argument("--camera", help="Camera name for an episode directory, e.g. third_person")
     parser.add_argument("--model", type=Path, default=stage1.DEFAULT_MODEL, help="Single-arm DROID Stage 1 weights or directory")
     parser.add_argument("--output", type=Path, help="Destination JSON, replaced only after successful inference")
-    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Decoded frame cache and default result root")
-    selection = parser.add_mutually_exclusive_group(required=True)
+    parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT, help="Video files only: decoded frame cache and default result root")
+    selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--interactive", action="store_true", help="Click one TCP in Gradio, then display Viser")
     selection.add_argument("--tcp-query-point", type=float, nargs=2, metavar=("X", "Y"), help="Pixel in resized 320x180 RGB")
-    parser.add_argument("--start-frame", type=int, default=0, help="Original video frame index (zero-based)")
+    parser.add_argument("--start-frame", type=int, help="Episode: first visible GT TCP; video: frame 0")
     parser.add_argument("--max-frames", type=int, default=0, help="0: all remaining frames; otherwise a consecutive clip")
     parser.add_argument("--window-size", type=int, default=9, help="2 to 18 frames; windows share one boundary frame")
     parser.add_argument("--fps", type=float, help="Override video FPS for timestamps/playback; does not resample frames")
@@ -157,6 +159,7 @@ def parse_args(argv=None):
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
     parser.add_argument("--visualize", action="store_true", help="Start Viser after CLI inference; implicit with --interactive")
     parser.add_argument("--show-pred-trajectory", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--show-gt-trajectory", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-points", type=int, default=50_000, help="Point cap per frame; 0 keeps all")
     parser.add_argument("--confidence-percentile", type=float, default=2.5)
     parser.add_argument("--point-size", type=float, default=0.003)
@@ -165,10 +168,19 @@ def parse_args(argv=None):
     parser.add_argument("--ui-host", default="127.0.0.1", help="Gradio bind address")
     parser.add_argument("--ui-port", type=int, default=7860)
     args = parser.parse_args(argv)
-    args.show_gt_trajectory = False
+    if args.input.expanduser().is_dir():
+        if args.fps is not None:
+            parser.error("--fps only applies to video files; episode playback uses metadata/timestamps.npy")
+    else:
+        if not args.interactive and args.tcp_query_point is None:
+            parser.error("Video files require --interactive or --tcp-query-point X Y")
+        if args.camera is not None:
+            parser.error("--camera requires an episode directory")
+        args.show_gt_trajectory = False
+        args.start_frame = 0 if args.start_frame is None else args.start_frame
     if not 2 <= args.window_size <= 18:
         parser.error("--window-size must be between 2 and 18")
-    if args.start_frame < 0 or args.max_frames < 0 or args.max_frames == 1:
+    if (args.start_frame is not None and args.start_frame < 0) or args.max_frames < 0 or args.max_frames == 1:
         parser.error("--start-frame must be nonnegative; --max-frames must be 0 or at least 2")
     if args.fps is not None and (not math.isfinite(args.fps) or args.fps <= 0):
         parser.error("--fps must be finite and positive")
@@ -191,6 +203,8 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    if args.input.expanduser().is_dir():
+        return stage1.run(args)
     stage1.weight_file(args.model)
     device = stage1.resolve_device(args.device)
     dtype = stage1.resolve_dtype(args.dtype, device)
