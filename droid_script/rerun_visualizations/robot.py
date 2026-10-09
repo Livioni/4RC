@@ -12,6 +12,7 @@ import trimesh
 BASE_FRAME = "robot_base"
 ROBOT_FRAME_PREFIX = "gt_robot/"
 ROBOT_ENTITY = "gt_robot_model"
+PRED_ROBOT_ENTITY = "pred_robot_model"
 TIME_TIMELINE = "episode_time"
 ARM_JOINT_NAMES = tuple(f"panda_joint{index}" for index in range(1, 8))
 NS = {"c": "http://www.collada.org/2005/11/COLLADASchema"}
@@ -81,7 +82,8 @@ def read_dae_mesh(path: Path) -> trimesh.Scene:
     return scene
 
 
-def prepare_robot(urdf_path: Path, temporary_directory: Path) -> rr.urdf.UrdfTree:
+def prepare_robot(urdf_path: Path, temporary_directory: Path, *,
+                  prefix: str = "ground_truth") -> rr.urdf.UrdfTree:
     """Prepare temporary GLB assets; never modify the supplied embodiment."""
     source = urdf_path.expanduser().resolve()
     document = ET.parse(source)
@@ -103,11 +105,12 @@ def prepare_robot(urdf_path: Path, temporary_directory: Path) -> rr.urdf.UrdfTre
                     converted[asset] = destination
                 asset = converted[asset]
             mesh.set("filename", str(asset))
-    prepared = temporary_directory / "visual_robot.urdf"
+    prepared = temporary_directory / f"{prefix}_visual_robot.urdf"
     document.write(prepared, encoding="utf-8", xml_declaration=True)
     tree = rr.urdf.UrdfTree.from_file_path(
-        prepared, entity_path_prefix=ROBOT_ENTITY, frame_prefix=ROBOT_FRAME_PREFIX,
-        static_transform_entity_path="ground_truth/robot/static_transforms",
+        prepared, entity_path_prefix=PRED_ROBOT_ENTITY if prefix == "prediction" else ROBOT_ENTITY,
+        frame_prefix="pred_robot/" if prefix == "prediction" else ROBOT_FRAME_PREFIX,
+        static_transform_entity_path=f"{prefix}/robot/static_transforms",
     )
     joint_names = {joint.name for joint in tree.joints()}
     if not set((*ARM_JOINT_NAMES, "finger_joint")).issubset(joint_names):
@@ -132,22 +135,27 @@ def joint_values(joint, joints: np.ndarray, gripper_open: np.ndarray) -> np.ndar
     return np.zeros(len(joints))
 
 
-def log_robot(recording: rr.RecordingStream, tree: rr.urdf.UrdfTree, ground_truth) -> None:
+def log_robot(recording: rr.RecordingStream, tree: rr.urdf.UrdfTree, ground_truth=None, *,
+              prefix="ground_truth", frame_indices=None, joints=None, gripper_open=None) -> None:
+    if ground_truth is not None:
+        frame_indices, joints = ground_truth.frame_indices, ground_truth.joints
+        gripper_open = ground_truth.tcp_camera[:, 6]
+    frame_prefix = "pred_robot/" if prefix == "prediction" else ROBOT_FRAME_PREFIX
     recording.send_chunks(tree.stream(include_joint_transforms=False))
     recording.log(
-        "ground_truth/robot/root_transform",
+        f"{prefix}/robot/root_transform",
         rr.Transform3D(translation=[0, 0, 0], mat3x3=np.eye(3),
-                       parent_frame=BASE_FRAME, child_frame=ROBOT_FRAME_PREFIX + tree.root_link().name),
+                       parent_frame=BASE_FRAME, child_frame=frame_prefix + tree.root_link().name),
         static=True,
     )
-    indexes = [rr.TimeColumn("frame", sequence=ground_truth.frame_indices),
-               rr.TimeColumn(TIME_TIMELINE, duration=ground_truth.frame_indices / 15.0)]
+    indexes = [rr.TimeColumn("frame", sequence=frame_indices),
+               rr.TimeColumn(TIME_TIMELINE, duration=frame_indices / 15.0)]
     for joint in tree.joints():
-        path = f"ground_truth/robot/joints/{joint.name}"
+        path = f"{prefix}/robot/joints/{joint.name}"
         if joint.joint_type == "fixed":
             recording.log(path, joint.compute_transform(0, clamp=False), static=True)
         else:
-            values = joint_values(joint, ground_truth.joints, ground_truth.tcp_camera[:, 6])
+            values = joint_values(joint, joints, gripper_open)
             # Negative mimic multipliers are intentional even when the original
             # Robotiq URDF's mimic joint limits are non-negative.
             recording.send_columns(path, indexes=indexes,

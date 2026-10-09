@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Infer one DROID camera and compare prediction/ground truth in Rerun Web.
+"""Replay cached prediction IK or infer one DROID camera in Rerun Web.
 
 Run in the 4rc environment:
+    python droid_script/rerun_visualizations/visualize_stage1.py --prediction <cache_directory>
     python droid_script/rerun_visualizations/visualize_stage1.py --input <episode> --camera <serial>
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ import torch
 
 from droid_script import infer_4rc_stage1 as inference
 from droid_script.rerun_visualizations.data import load_ground_truth
+from droid_script.rerun_visualizations.cache import file_digest, load_cache
 from droid_script.rerun_visualizations.robot import prepare_robot
 from droid_script.rerun_visualizations.viewer import (
     log_replay, make_blueprint, start_web_viewer, wait_for_web_viewer,
@@ -33,10 +35,13 @@ DEFAULT_URDF = REPO_ROOT / "embodiments/franka-panda-robotiq-2f85/panda_robotiq_
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--input", type=Path, required=True, help="Extracted DROID episode directory")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", type=Path, help="Extracted DROID episode directory (legacy inference mode)")
+    source.add_argument("--prediction", type=Path, help="Replay cache from infer_stage1_ik.py; no inference or IK")
+    parser.add_argument("--episode-root", type=Path, help="Override cached episode location after moving a dataset")
     parser.add_argument("--camera", help="Camera serial; default is the first sorted images/ directory")
     parser.add_argument("--model", type=Path, default=REPO_ROOT / inference.DEFAULT_MODEL)
-    parser.add_argument("--urdf", type=Path, default=DEFAULT_URDF)
+    parser.add_argument("--urdf", type=Path, help="Default: bundled URDF, or the cached URDF in replay mode")
     parser.add_argument("--start-frame", type=int, help="Original frame index; default is first visible GT TCP")
     parser.add_argument("--tcp-query-point", nargs=2, type=float, metavar=("X", "Y"), help="Manual query in original 320x180 RGB")
     parser.add_argument("--max-frames", type=int, default=0, help="0: all remaining frames; otherwise at least 2")
@@ -73,10 +78,18 @@ def parse_args(argv=None):
         parser.error("--web-port and --grpc-port must differ")
     if args.output is not None and args.output.suffix.lower() != ".rrd":
         parser.error("--output must end in .rrd")
+    if args.prediction is not None and (args.camera is not None or args.start_frame is not None
+                                       or args.tcp_query_point is not None or args.max_frames):
+        parser.error("Cached playback fixes camera, query and frame interval; generate a new cache to change them")
+    if args.episode_root is not None and args.prediction is None:
+        parser.error("--episode-root requires --prediction")
     return args
 
 
 def run(args) -> None:
+    if args.prediction is not None:
+        return run_cached(args)
+    args.urdf = args.urdf or DEFAULT_URDF
     episode = inference.load_episode(args.input, args.camera)
     start, query, query_source = inference.resolve_initial_query(episode, args.start_frame, args.tcp_query_point)
     paths = episode.clip(start, args.max_frames)
@@ -135,12 +148,61 @@ def run(args) -> None:
             recording.disconnect()
 
 
+def run_cached(args) -> None:
+    """Replay numeric caches without loading a checkpoint or importing cuRobo."""
+    import json
+    import numpy as np
+
+    metadata, prediction, indices, states = load_cache(args.prediction)
+    episode = inference.load_episode(args.episode_root or Path(metadata["episode"]), metadata["camera_id"])
+    if len(episode.image_paths) != metadata["episode_num_frames"] or indices[-1] >= len(episode.image_paths):
+        raise ValueError("Cached frames disagree with the source episode")
+    paths = [episode.image_paths[int(frame)] for frame in indices]
+    ground_truth = load_ground_truth(episode, paths)
+    urdf = (args.urdf or Path(metadata["urdf"])).expanduser().resolve()
+    if file_digest(urdf) != metadata["urdf_sha256"]:
+        raise ValueError("Replay URDF differs from the IK model; regenerate IK for the new URDF")
+    tcp_metadata = json.loads((episode.path / "TCP" / episode.camera / "metadata.json").read_text())
+    tcp_offset = np.asarray(tcp_metadata.get("tcp_offset_in_robotiq_base_m"), dtype=np.float64)
+    if (tcp_offset.shape != (3,) or not np.isfinite(tcp_offset).all()
+            or not np.allclose(tcp_offset, metadata["ik"]["tcp_offset_in_robotiq_base_m"], atol=1e-9)):
+        raise ValueError("Source TCP work point differs from the cached IK work point")
+    args.model = metadata["model"]
+    query = np.asarray(metadata["initial_query"], dtype=np.float32)
+    recording = rr.RecordingStream(f"4rc_droid_stage1_{episode.camera}")
+    try:
+        blueprint = make_blueprint(episode.camera, predicted_robot=True)
+        if args.output is None:
+            start_web_viewer(recording, args)
+        else:
+            output = args.output.expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            recording.save(output)
+        recording.send_blueprint(blueprint)
+        with tempfile.TemporaryDirectory(prefix="4rc_rerun_meshes_") as temporary:
+            directory = Path(temporary)
+            tree = prepare_robot(urdf, directory)
+            predicted_tree = prepare_robot(urdf, directory, prefix="prediction")
+            log_replay(recording, args, episode, paths, prediction, ground_truth, tree, query,
+                       metadata["query_source"], predicted_tree=predicted_tree, robot_states=states)
+        print(f"Replayed {len(indices)} cached frames; IK success: {int(states['success'].sum())}/{len(indices)}",
+              flush=True)
+        del tree, predicted_tree, prediction, ground_truth, states
+        gc.collect()
+        if args.output is not None:
+            print(f"Saved {len(paths)} frames to {output}", flush=True)
+        else:
+            wait_for_web_viewer()
+    finally:
+        recording.disconnect()
+
+
 def main(argv=None) -> None:
     try:
         run(parse_args(argv))
     except KeyboardInterrupt:
         print("\nStopped Rerun Web viewer.", flush=True)
-    except (ValueError, OSError, RuntimeError) as error:
+    except (ValueError, OSError, RuntimeError, KeyError) as error:
         raise SystemExit(f"Error: {error}") from error
 
 

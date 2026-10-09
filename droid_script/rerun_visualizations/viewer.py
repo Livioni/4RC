@@ -13,7 +13,7 @@ import rerun.blueprint as rrb
 from rerun.blueprint.components import LoopMode, PlayState
 
 from .data import backproject_rgbd, project_pixel, trajectory_segments
-from .robot import BASE_FRAME, ROBOT_ENTITY, TIME_TIMELINE, log_robot
+from .robot import BASE_FRAME, ROBOT_ENTITY, PRED_ROBOT_ENTITY, TIME_TIMELINE, log_robot
 
 
 PRED_COLOR = [255, 155, 55]
@@ -21,7 +21,7 @@ GT_COLOR = [55, 205, 120]
 AXIS_COLORS = [[235, 65, 65], [65, 210, 80], [65, 130, 255]]
 
 
-def make_blueprint(camera: str) -> rrb.Blueprint:
+def make_blueprint(camera: str, *, predicted_robot: bool = False) -> rrb.Blueprint:
     def spatial(name, contents):
         return rrb.Spatial3DView(
             origin="world", name=name, contents=contents,
@@ -29,7 +29,8 @@ def make_blueprint(camera: str) -> rrb.Blueprint:
                                          look_target=[0.48, 0.0, 0.15], eye_up=[0, 0, 1]),
         )
     comparison = rrb.Horizontal(
-        spatial("Prediction · point cloud + TCP", ["world/**", "prediction/**"]),
+        spatial("Prediction · point cloud + IK URDF + TCP" if predicted_robot else "Prediction · point cloud + TCP",
+                ["world/**", "prediction/**", f"{PRED_ROBOT_ENTITY}/**"]),
         spatial("Ground truth · point cloud + URDF + TCP",
                 ["world/**", "ground_truth/**", f"{ROBOT_ENTITY}/**"]),
         column_shares=[1, 1],
@@ -112,11 +113,15 @@ def filtered_prediction_cloud(cloud, camera_to_base, args):
     if np.any(valid):
         threshold = np.percentile(confidence[valid], args.confidence_percentile)
         valid &= confidence >= threshold
-    return points[valid], colors[valid]
+    selected = np.flatnonzero(valid)
+    if args.max_points and len(selected) > args.max_points:
+        selected = selected[np.linspace(0, len(selected) - 1, args.max_points, dtype=int)]
+    return points[selected], colors[selected]
 
 
 def log_replay(recording, args, episode, paths: list[Path], prediction,
-               ground_truth, tree, query: np.ndarray, query_source: str) -> None:
+               ground_truth, tree, query: np.ndarray, query_source: str, *,
+               predicted_tree=None, robot_states=None) -> None:
     from droid_script.infer_4rc_stage1 import tcp_to_base
 
     if prediction.clouds is None or prediction.camera_to_base is None:
@@ -138,6 +143,10 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
         # inherit from the parent path. Both clouds already contain base XYZ.
         recording.log(f"{prefix}/point_cloud", rr.CoordinateFrame(BASE_FRAME), static=True)
     log_robot(recording, tree, ground_truth)
+    if predicted_tree is not None:
+        log_robot(recording, predicted_tree, prefix="prediction",
+                  frame_indices=robot_states["frame_indices"], joints=robot_states["joints"],
+                  gripper_open=robot_states["gripper_open"])
     for slot, (frame, rgb_path, depth_path) in enumerate(zip(ground_truth.frame_indices, paths, ground_truth.depth_paths)):
         recording.set_time("frame", sequence=int(frame))
         recording.set_time(TIME_TIMELINE, duration=float(frame) / 15.0)
@@ -157,6 +166,21 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
             recording.log(f"{prefix}/point_cloud", rr.Points3D(points, colors=colors, radii=args.point_size / 2))
         log_tcp(recording, "prediction", tcp["position"][slot, 0], tcp["rotation"][slot, 0],
                 PRED_COLOR, f"Pred TCP · open={tcp['gripper'][slot, 0]:.3f}")
+        ik_info = ""
+        if robot_states is not None:
+            succeeded = bool(robot_states["success"][slot])
+            actual = robot_states["fk_tcp_poses"][slot]
+            error_mm = robot_states["position_error_m"][slot] * 1000
+            error_rad = robot_states["rotation_error_rad"][slot]
+            color = [90, 175, 255] if succeeded else [255, 65, 65]
+            log_tcp(recording, "prediction/ik", actual[:3, 3], actual[:3, :3], color,
+                    f"IK {'OK' if succeeded else 'HOLD'} · {error_mm:.1f} mm")
+            recording.log("prediction/ik/residual", rr.CoordinateFrame(BASE_FRAME),
+                          rr.LineStrips3D([np.stack([actual[:3, 3], tcp['position'][slot, 0]])],
+                                          colors=color, radii=0.0015))
+            ik_info = (f"**IK: {'OK' if succeeded else 'FAILED — holding last valid arm'}**. "
+                       f"TCP residual: **{error_mm:.2f} mm / {error_rad:.4f} rad**. "
+                       "Blue=FK TCP; red=held FK TCP. Gripper uses prediction.\n\n")
         gt_pose = ground_truth.tcp_poses[slot]
         log_tcp(recording, "ground_truth", gt_pose[:3, 3], gt_pose[:3, :3],
                 GT_COLOR, f"GT TCP · open={ground_truth.tcp_camera[slot, 6]:.3f}")
@@ -171,6 +195,7 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
         recording.log("info", rr.TextDocument(
             f"## {episode.path.name}\n\n"
             f"Camera: **{episode.camera}** · frame **{int(frame)}** · {frame / 15:.3f} s\n\n"
+            f"{ik_info}"
             f"Replay: {int(ground_truth.frame_indices[0])}–{int(ground_truth.frame_indices[-1])} at 15 Hz. "
             f"Skipped prefix: {int(ground_truth.frame_indices[0])} frames.\n\n"
             f"**Orange:** predicted TCP · **Green:** GT TCP. Both scenes use robot-base coordinates (metres).\n\n"

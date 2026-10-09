@@ -1,1 +1,4 @@
 rerun-sdk==0.35.0
+-r requirements.txt
+nvidia-curobo[cu12] @ git+https://github.com/NVlabs/curobo.git@78fd485fa82d9b9a063fb4985e371814587e666a
+warp-lang==1.17.0

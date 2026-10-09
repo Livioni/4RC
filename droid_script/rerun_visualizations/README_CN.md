@@ -1,5 +1,82 @@
 # DROID Stage1 Rerun 对照回放
 
+## 预测机械臂：推理 / IK 与回放分开运行
+
+推荐使用下面的两个脚本。第一个缓存预测点云、相机位姿、完整 TCP 位姿与夹爪开合，并用 cuRobo v2 重建七轴关节；第二个直接加载缓存，在预测侧回放 Panda + Robotiq URDF。调整视图或导出录制无需再次推理，缓存回放无需 GPU、checkpoint 或 cuRobo。
+
+当前 `4rc` 已安装并验证 cuRobo `0.8.0.post1.dev43`、Warp `1.17.0`，保留 PyTorch `2.11.0+cu128`、NumPy `2.4.6` 和 Rerun `0.35.0`。在其他已有 PyTorch CUDA 12 环境复现安装：
+
+```bash
+conda run --no-capture-output -n 4rc python -m pip install \
+  -r droid_script/rerun_visualizations/requirements.txt
+```
+
+固定使用官方 cuRobo 提交 `78fd485fa82d9b9a063fb4985e371814587e666a` 的 **v2 API**，不是旧版 `curobo.wrap.reacher.IKSolver`。采用非 editable 安装，不需要其他项目的 cuRobo 目录。IK 需要 CUDA GPU；官方源码说明见 [安装指南](https://github.com/NVlabs/curobo/blob/78fd485fa82d9b9a063fb4985e371814587e666a/docs/getting-started/installation.rst)。
+
+第一步，生成预测与机器人关节缓存：
+
+```bash
+conda run --no-capture-output -n 4rc python \
+  droid_script/rerun_visualizations/infer_stage1_ik.py \
+  --input datasets/droid_episodes/AUTOLab__Fri_Aug_18_11:40:54_2023 \
+  --camera 22008760
+```
+
+默认结果目录为 `outputs/droid/rerun/<episode>/<camera>`，可通过 `--output <目录>` 修改。支持原有的 `--camera`、`--model`、`--urdf`、`--start-frame`、`--tcp-query-point`、`--max-frames`、`--window-size`、`--device`、`--dtype` 和 `--max-points` 推理参数。
+
+第二步，独立回放：
+
+```bash
+conda run --no-capture-output -n 4rc python \
+  droid_script/rerun_visualizations/visualize_stage1.py \
+  --prediction outputs/droid/rerun/AUTOLab__Fri_Aug_18_11:40:54_2023/22008760
+```
+
+打开打印的完整 Web viewer URL。左侧新增预测机器人、蓝色 FK TCP 与目标残差线；失败时 FK TCP 变红，并在信息面板显示 **HOLD**。右侧继续使用真值关节。两套机器人使用独立坐标帧，共用原始帧号及 15 Hz 时间轴。
+
+缓存模式仍支持点云过滤、显示大小、端口、`--renderer` 和 `--output <文件.rrd>`。数据集移动后使用 `--episode-root <新的episode目录>`；URDF 移动后可通过 `--urdf` 指定相同内容的文件。相机、query 和帧区间由缓存固定，需要改变时重新生成缓存。
+
+仅调整 IK，不重复神经网络推理：
+
+```bash
+conda run --no-capture-output -n 4rc python \
+  droid_script/rerun_visualizations/infer_stage1_ik.py \
+  --reuse-prediction outputs/droid/rerun/AUTOLab__Fri_Aug_18_11:40:54_2023/22008760 \
+  --ik-num-seeds 64
+```
+
+默认在源缓存目录更新 IK，也可指定不同的 `--output <目录>`。IK 参数为 `--ik-num-seeds 32`、`--ik-position-tolerance 0.005`（米）、`--ik-rotation-tolerance 0.05`（弧度）；`--ik-no-cuda-graph` 关闭 CUDA Graph。
+
+### 工作点、初始化与失败策略
+
+- 将预测 TCP 通过预测相机位姿变换到 robot base；预测机器人和预测点云使用相同坐标系。
+- TCP 工作点读取所选相机 `TCP/<camera>/metadata.json` 的 `tcp_offset_in_robotiq_base_m`。本 episode 为 Robotiq 基座沿 Z 轴 `0.1442549775197502 m`，即闭合夹爪接触面中点。IK 使用临时无网格 URDF 的固定 TCP link，不改动原始 embodiment。
+- 用 `observations/joint_position.npy[start_frame]` 初始化。**首帧也求解预测位姿**，真值仅作 IK seed；后续帧只以上一有效解为参考，从有效候选中选择关节变化最小的解。每个候选通过 FK 误差及关节限位复核。
+- 不可达或未收敛时保持上一有效七轴关节，首帧失败则保持初始化关节。夹爪始终使用预测 `gripper_open`，同步 mimic joints。残差是实际显示状态的 FK TCP 与原始预测目标之间的误差，不把保持状态标为成功。
+- 第一版只进行运动学重建，不执行场景或自碰撞检查，不对目标做平滑或改写。
+
+### 缓存内容
+
+- `metadata.json`：episode、相机、checkpoint 来源、query、滑窗、URDF SHA256、IK 参数、初始化关节及成功统计。
+- `prediction.npz`：原始帧号、相机坐标下的 TCP、预测相机到 base 的变换，以及按 offsets 拼接的点云 / 颜色 / 置信度。
+- `robot_states.npz`：原始帧号、七轴关节、预测夹爪开合、FK TCP、成功标记、实际状态的位姿残差和每帧耗时。
+
+所有 NPZ 使用数值数组，以 `allow_pickle=False` 读取；加载时检查版本、SHA256、维度和帧号一致性。预测先单独保存，IK 中断后可以 `--reuse-prediction` 恢复计算。回放仍需源 episode 的 RGB-D 与真值数据；URDF 内容改变后必须重新计算 IK。
+
+运行缓存测试及本机 CUDA / episode 回归：
+
+```bash
+conda run --no-capture-output -n 4rc python -m unittest \
+  droid_script.rerun_visualizations.test_replay -v
+
+FOUR_RC_TEST_IK=1 conda run --no-capture-output -n 4rc python -m unittest \
+  droid_script.rerun_visualizations.test_replay -v
+```
+
+`comparison.rrd` 可在相同环境通过 `rerun --web-viewer <文件.rrd>` 单独打开，用 `rerun rrd verify <文件.rrd>` 检查录制完整性。
+
+## 原有直接推理入口
+
 在 `4rc` 环境中完成 Stage1 推理，打开 Rerun Web UI，同步比较所选相机的预测与真值。
 
 ```bash
