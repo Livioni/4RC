@@ -181,7 +181,7 @@ configs/local/default.yaml
 
 *.pdf
 /outputs/
-/checkpoints/
+/checkpoints
 /glb_outputs/
 /new_datasets/
 hfd.sh
