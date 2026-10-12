@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from arc.action import project_tcp, safe_rotation_6d_to_matrix, sinusoidal
+from arc.models.arc.wrist_encoder import FrozenDINOv2Encoder
 
 
 class FrozenT5Encoder(nn.Module):
@@ -198,7 +199,7 @@ class TCPActionDiT(nn.Module):
         action = self.action_projection(noisy_actions) + future_step_embedding + future_type
         x = torch.cat((history, action), dim=1)
         count = history.shape[1]
-        # The global/TCP observation prefix cannot read future actions or noise.
+        # The global/wrist/TCP observation prefix cannot read future actions or noise.
         mask = torch.zeros(x.shape[1], x.shape[1], dtype=torch.bool, device=x.device)
         mask[:count, count:] = True
         padding_mask = None
@@ -218,7 +219,7 @@ class TCPActionDiT(nn.Module):
 
 @dataclass
 class ActionCondition:
-    """History is [global patches, TCP history]; history_valid covers only TCPs."""
+    """History is [global, optional left/right wrists, TCP]; validity covers TCPs."""
 
     history: torch.Tensor
     text: torch.Tensor
@@ -234,6 +235,9 @@ class TCPActionPolicy(nn.Module):
         dim: int = 512, depth: int = 8, heads: int = 8, prediction_horizon: int = 16,
         padding=(1, 1, 6, 6), decode_camera: bool = False,
         global_feature_mode: str = "concat",
+        use_wrist_condition: bool = False, wrist_model: str = "facebook/dinov2-giant",
+        wrist_pretrained: bool = True, wrist_encoder_config=None, wrist_cache_dir=None,
+        wrist_encoder: nn.Module | None = None,
     ):
         super().__init__()
         if prediction_horizon < 1:
@@ -245,6 +249,9 @@ class TCPActionPolicy(nn.Module):
         self.arc = arc
         self.global_feature_mode = global_feature_mode
         self.num_arms = getattr(arc.tcp_visual_query_encoder, "num_arms", 2)
+        self.use_wrist_condition = bool(use_wrist_condition)
+        if self.use_wrist_condition and self.num_arms != 2:
+            raise ValueError("Wrist conditioning requires a two-arm RoboTwin policy")
         self.decode_camera = decode_camera
         self.language_encoder = language_encoder if language_encoder is not None else FrozenT5Encoder(
             t5_model, text_max_length,
@@ -263,7 +270,19 @@ class TCPActionPolicy(nn.Module):
         # This encodes step indices; retain the parameter name to load existing Stage2 weights.
         self.physical_time = ScalarTimeEncoder(dim)
         # Preserve existing type IDs: 0 = TCP history, 1 = future, 2 = global.
-        self.token_type = nn.Embedding(3, dim)
+        # New IDs: 3 = left wrist, 4 = right wrist; old models retain three rows.
+        self.token_type = nn.Embedding(5 if self.use_wrist_condition else 3, dim)
+        self.wrist_encoder = None
+        self.wrist_visual_encoder = None
+        if self.use_wrist_condition:
+            self.wrist_encoder = wrist_encoder if wrist_encoder is not None else FrozenDINOv2Encoder(
+                wrist_model, pretrained=wrist_pretrained, model_config=wrist_encoder_config,
+                cache_dir=wrist_cache_dir,
+            )
+            self.wrist_encoder.requires_grad_(False).eval()
+            self.wrist_visual_encoder = GlobalVisualEncoder(
+                self.wrist_encoder.output_dim, dim, self.wrist_encoder.patch_size,
+            )
         self.dit = TCPActionDiT(dim, depth, heads, self.num_arms)
         self.prediction_horizon = prediction_horizon
         self.padding = tuple(padding)
@@ -273,7 +292,19 @@ class TCPActionPolicy(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         self.language_encoder.eval()
+        if self.wrist_encoder is not None:
+            self.wrist_encoder.eval()
         return self
+
+    def encode_wrist_images(self, wrist_images):
+        if not self.use_wrist_condition:
+            if wrist_images is not None:
+                raise ValueError("This policy does not use wrist conditioning")
+            return None
+        if wrist_images is None:
+            raise ValueError("Wrist-conditioned policies require left/right wrist_images")
+        with torch.no_grad():
+            return self.wrist_encoder(wrist_images)
 
     def set_action_position_stats(self, mean, std):
         if mean.shape != (self.num_arms, 3) or std.shape != (self.num_arms, 3):
@@ -307,6 +338,7 @@ class TCPActionPolicy(nn.Module):
 
     def make_condition(
         self, images, intrinsics, instructions, reconstruction, features, *, centres=None, valid=None,
+        wrist_images=None, wrist_features=None,
     ):
         batch, frames, _, height, width = images.shape
         relative = torch.arange(1 - frames, 1, device=images.device, dtype=torch.float32).expand(batch, -1)
@@ -345,7 +377,27 @@ class TCPActionPolicy(nn.Module):
             global_patches[:, -1], history_time[:, -1], self.token_type.weight[2],
             image_height=height, image_width=width,
         )
-        history = torch.cat((global_tokens, history), dim=1)
+        observation = [global_tokens]
+        if self.use_wrist_condition:
+            if wrist_images is not None and wrist_features is not None:
+                raise ValueError("Pass either wrist_images or cached wrist_features")
+            if wrist_features is None:
+                wrist_features = self.encode_wrist_images(wrist_images)
+            count = (
+                (self.wrist_encoder.image_height // self.wrist_encoder.patch_size)
+                * (self.wrist_encoder.image_width // self.wrist_encoder.patch_size)
+            )
+            if wrist_features.shape != (batch, 2, count, self.wrist_encoder.output_dim):
+                raise ValueError("Cached wrist features must match the left/right patch grid")
+            for side in range(2):
+                wrist_tokens = self.wrist_visual_encoder(
+                    wrist_features[:, side], history_time[:, -1], self.token_type.weight[3 + side],
+                    image_height=self.wrist_encoder.image_height, image_width=self.wrist_encoder.image_width,
+                )
+                observation.append(wrist_tokens.to(global_tokens))
+        elif wrist_images is not None or wrist_features is not None:
+            raise ValueError("This policy does not use wrist conditioning")
+        history = torch.cat((*observation, history), dim=1)
         text, text_valid = self.language_encoder(list(instructions))
         text = self.language_projection(text)
         future_time = self.physical_time(future_relative)
@@ -381,6 +433,7 @@ class TCPActionPolicy(nn.Module):
         condition = self.make_condition(
             batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
             centres=centres, valid=valid,
+            wrist_images=batch.get("wrist_images"),
         )
         target = self.normalize_actions(batch["future_actions"])
         future_valid = batch.get("future_action_valid")
@@ -442,8 +495,12 @@ class TCPActionPolicy(nn.Module):
     @torch.no_grad()
     def sample_actions(
         self, images, instructions, initial_query_points, intrinsics, *, steps=8, generator=None,
+        wrist_images=None,
     ):
         """Padded RGB in [-1,1]; query points and intrinsics use padded pixels.
+
+        Wrist-conditioned models also require native [B,2,3,240,320] RGBs
+        in [0,1], ordered left/right and captured at the last observation.
 
         No historical ground-truth poses or projections are accepted here.
         Returns ordered future actions without timestamps or an execution frequency.
@@ -455,5 +512,6 @@ class TCPActionPolicy(nn.Module):
         reconstruction, features = self.reconstruct(images, initial_query_points)
         condition = self.make_condition(
             images, intrinsics, instructions, reconstruction, features,
+            wrist_images=wrist_images,
         )
         return self.sample_condition(condition, steps=steps, generator=generator)

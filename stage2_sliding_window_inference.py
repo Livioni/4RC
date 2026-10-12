@@ -132,6 +132,12 @@ def prepare_images(paths: list[Path], intrinsics: np.ndarray, query_points: np.n
     return images, padded_k.expand(1, len(paths), 3, 3).clone(), queries
 
 
+def prepare_wrist_images(episode: EpisodeInputs, anchor_offset: int):
+    """Use the actual source frame number, including non-zero episode starts."""
+    from arc.datasets.utils.wrist import load_wrist_images
+    return load_wrist_images(episode.path, episode.frame_indices[anchor_offset]).unsqueeze(0)
+
+
 def validate_query_points(points: Any) -> np.ndarray:
     value = np.asarray(points, dtype=np.float32)
     if value.shape != (2, 2) or not np.isfinite(value).all():
@@ -223,6 +229,8 @@ def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str 
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
         prediction_horizon=config["prediction_horizon"],
         global_feature_mode=config["global_feature_mode"],
+        use_wrist_condition=config.get("use_wrist_condition", False),
+        wrist_pretrained=False, wrist_encoder_config=config.get("wrist_encoder_config"),
     )
     # load_model restores omitted aliases of the geometry head's shared norms.
     load_model(policy, str(weights_path), strict=True, device="cpu")
@@ -241,7 +249,8 @@ def _numpy(tensor: torch.Tensor) -> np.ndarray:
 def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
                         query_points: torch.Tensor, instruction: str,
                         *, steps: int = 8, seed: int = 42,
-                        device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32) -> dict:
+                        device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
+                        wrist_images: torch.Tensor | None = None) -> dict:
     """Infer one window, reusing reconstruction features for the action condition.
 
     Input RGB and queries use padded pixels. Returned arrays have no batch axis;
@@ -251,13 +260,17 @@ def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
     if not instruction.strip():
         raise ValueError("Instruction is required")
     images, intrinsics, query_points = [value.to(device) for value in (images, intrinsics, query_points)]
+    if wrist_images is not None:
+        wrist_images = wrist_images.to(device)
     if images.shape[0] != 1:
         raise ValueError("Standalone window inference expects batch size one")
     generator = torch.Generator(device=device).manual_seed(seed)
     context = torch.autocast(device_type=device.type, dtype=dtype) if dtype != torch.float32 else contextlib.nullcontext()
     with context:
         reconstruction, features = policy.reconstruct(images, query_points)
-        condition = policy.make_condition(images, intrinsics, [instruction], reconstruction, features)
+        condition = policy.make_condition(
+            images, intrinsics, [instruction], reconstruction, features, wrist_images=wrist_images,
+        )
         actions = policy.sample_condition(condition, steps=steps, generator=generator)
     result = {
         "depth": _numpy(reconstruction["depth"][0]),
@@ -389,9 +402,10 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             input_offsets = np.maximum(np.arange(end - config["history_frames"], end), start)
             images, intrinsics, query_tensor = prepare_images(
                 [episode.image_paths[offset] for offset in input_offsets], episode.intrinsics, queries)
+            wrists = prepare_wrist_images(episode, end - 1) if policy.use_wrist_condition else None
             prediction = infer_stage2_window(policy, images, intrinsics, query_tensor, episode.instruction,
                 steps=steps, seed=seed + number,
-                device=device, dtype=dtype)
+                device=device, dtype=dtype, wrist_images=wrists)
             # Keep only distinct observed frames for export and visualization. The
             # last padded copy represents the actual oldest observation.
             for key in ("depth", "depth_confidence", "history_position", "history_rotation",

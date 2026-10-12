@@ -599,6 +599,54 @@ history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报
 T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
 投影进入每层 cross-attention，并传递文本 padding mask。
 
+### 最后观测帧左右腕部条件（可选）
+
+使用独立配置从 Stage1 开始新的腕部条件实验：
+
+```bash
+accelerate launch train_4rc_stage2.py \
+  --config configs/train/4rc-stage2-action-ust-wrist.py
+```
+
+该配置开启 `use_wrist_condition=True`，输出到
+`outputs/4rc-stage2-action-clean-ust-wrist`。该配置独立定义所有参数，训练超参数
+与 `4rc-stage2-action-ust.py` 一致，不导入或执行原配置。第三人称分支的训练开关沿用原配置；
+左右腕部另共享一个官方预训练 `facebook/dinov2-giant`（ViT-g/14）encoder，
+始终冻结并保持 eval。首次训练下载权重到仓库内 `.cache/huggingface`；
+`wrist_model` 也支持本地 Transformers 预训练目录。
+
+仅读取历史窗口最后一个真实观测帧编号对应的
+`images/left_view/XXXXXX.png` 和 `images/right_view/XXXXXX.png`，不读取未来腕部 RGB。
+训练时三种视角复用同一组 clip 图像增强参数。缺失图片或尺寸错误直接报错。
+batch 中 `wrist_images` 为 `[B,2,3,240,320]`、RGB `[0,1]`，依次为左、右，
+与第三人称 `images` 的 padded `[-1,1]` 格式不同。
+
+训练、验证和推理共用预处理：宽×高 `320×240 → 256×192`（抗锯齿 bicubic），
+左右各反射填充 5 像素、上下各填充 2 像素，得到 `266×196`，
+使用 ImageNet mean/std 归一化，不做中心裁剪。
+取 DINOv2 最后一层归一化后的 1536 维 patch 特征，去除 CLS，
+每侧保留 `19×14=266` 个行优先 tokens。
+
+两侧共享独立的可训练腕部投影，加入各自 patch 二维位置、当前序号 0
+和类型 embedding（3=左腕、4=右腕），再经过 LayerNorm。
+腕部投影继承 `train_history_pool` / `lr_history_pool`，冻结 encoder 不进入优化器。
+主序列为 `[第三人称全图 | 左腕 patches | 右腕 patches | TCP 历史 | 未来动作]`，
+默认共 `414+266+266+16+16=978` 个 tokens。全部观测条件不能读取未来动作；
+仅未来动作接受 flow matching 监督，腕部不新增 depth、相机标定或 TCP 标签。
+
+`make_condition`、`sample_actions` 和独立滑窗推理共用腕部编码路径。
+`sample_actions(..., wrist_images=wrist_images)` 要求传入最后观测帧的两侧图片；
+采样迭代不重复编码，验证模式也共享一次腕部编码。
+滑窗推理自动按 checkpoint 的腕部开关读取锚点帧图片。
+新 checkpoint 保存冻结 encoder 权重和 `wrist_encoder_config`，严格恢复时无需再次下载。
+现有配置及旧 checkpoint 默认关闭腕部条件；不能通过旧 Stage2 权重直接启用该分支。
+
+腕部接口和梯度回归检查：
+
+```bash
+python -m pytest tests/test_wrist_condition.py -q
+```
+
 每步每臂输出 xyz（3）+ rotation 6D（6）+ gripper（1），双臂共 20 维。
 位置使用 action 统计量标准化；旋转输出转成矩阵；夹爪训练为关闭 −1、
 打开 +1，推理以零为阈值。未来位姿统一表示在当前观测相机坐标系中。

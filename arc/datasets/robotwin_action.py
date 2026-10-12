@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -10,6 +11,7 @@ import torch
 from arc.action import future_actions_in_current_camera, project_tcp
 from .robotwin import RoboTwin4RC
 from .mixture import DatasetSource, WeightedDatasetMixture
+from .utils.wrist import load_wrist_images
 
 
 class NoActionEpisodes(RuntimeError):
@@ -19,7 +21,7 @@ class NoActionEpisodes(RuntimeError):
 class RoboTwinActionDataset(RoboTwin4RC):
     def __init__(
         self, root, *, history_frames=8, prediction_horizon=16, split="train",
-        validation_fraction=0.1, split_key="robotwin", **options,
+        validation_fraction=0.1, split_key="robotwin", use_wrist_condition=False, **options,
     ):
         if history_frames < 1 or prediction_horizon < 1:
             raise ValueError("History and prediction horizons must be positive")
@@ -28,6 +30,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
         self.history_frames = int(history_frames)
         self.prediction_horizon = int(prediction_horizon)
         self.split = split
+        self.use_wrist_condition = bool(use_wrist_condition)
         super().__init__(
             # Discover short episodes/segments too; repeated oldest frames fill
             # the history. The action sampler below still returns exactly H views.
@@ -197,6 +200,12 @@ class RoboTwinActionDataset(RoboTwin4RC):
         )
         return sample
 
+    def _extra_sample_fields(self, episode, frame_indices, augmentation):
+        if not self.use_wrist_condition:
+            return {}
+        transform = None if augmentation is None else partial(self._apply_augmentation, params=augmentation)
+        return {"wrist_images": load_wrist_images(episode.path, frame_indices[-1], transform=transform)}
+
     def manifest(self):
         return [
             {"task": e.task, "episode": e.name, "path": str(e.path), "windows": len(starts)}
@@ -229,7 +238,7 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
                 root, history_frames=config["history_frames"],
                 prediction_horizon=config["prediction_horizon"], split=split,
                 validation_fraction=config.get("validation_fraction", 0.1),
-                split_key=source["name"], **options,
+                split_key=source["name"], use_wrist_condition=config.get("use_wrist_condition", False), **options,
             )
         except NoActionEpisodes:
             if split == "validation":

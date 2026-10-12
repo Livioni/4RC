@@ -533,6 +533,10 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             image = TVF.rgb_to_grayscale(image, num_output_channels=3)
         return image
 
+    def _extra_sample_fields(self, episode, frame_indices, augmentation):
+        """Allow action adapters to reuse this clip's RGB augmentation."""
+        return {}
+
     def __getitem__(
         self, index: int | tuple[int, int] | tuple[int, int, int]
     ) -> dict[str, Any]:
@@ -682,6 +686,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
             "padding": torch.tensor(
                 [self.PAD_LEFT, self.PAD_RIGHT, self.PAD_TOP, self.PAD_BOTTOM]
             ),
+            **self._extra_sample_fields(episode, frame_indices, augmentation),
         }
 
 

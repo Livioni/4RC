@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from arc.datasets import WeightedMultiSourceBatchSampler, collate_training_samples
-from arc.datasets.robotwin_action import build_action_dataset
+from arc.datasets.robotwin_action import RoboTwinActionDataset, build_action_dataset
 from arc.loss import GeometryLoss, TCPTrackingLoss
 from arc.loss.action import flow_matching_loss, action_metric_sums, finalize_action_metrics
 from arc.models.arc.arc import Arc
@@ -77,6 +77,12 @@ def load_config(args):
 def validate_config(config, *, eval_only=False):
     config = dict(config)
     config.setdefault("stage2_checkpoint", None)
+    config.setdefault("use_wrist_condition", False)
+    if not isinstance(config["use_wrist_condition"], bool):
+        raise ValueError("use_wrist_condition must be a boolean")
+    if config["use_wrist_condition"]:
+        config.setdefault("wrist_model", "facebook/dinov2-giant")
+        config.setdefault("wrist_cache_dir", ".cache/huggingface")
     if config.get("time_encoding", "index") != "index" or config.get("tcp_temporal_weight", 0) != 0:
         raise ValueError("Stage2 uses sequence indices with tcp_temporal_weight=0. "
                          "Initialize old weights with --stage2-checkpoint and the current config.")
@@ -163,16 +169,7 @@ def load_model_weights(model, checkpoint):
 
 def build_policy(config):
     stage2 = config.get("resume") or config.get("stage2_checkpoint")
-    arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
-    if not stage2:
-        # Strict loading prevents silently starting with random recovery heads.
-        LOGGER.info("Load checkpoint from stage1: %s", config["stage1_checkpoint"])
-        load_model_weights(arc, config["stage1_checkpoint"])
-    policy = TCPActionPolicy(
-        arc, t5_model=config["t5_model"], text_max_length=config["text_max_length"],
-        dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
-        prediction_horizon=config["prediction_horizon"],
-    )
+    saved = None
     if stage2:
         path = Path(stage2)
         checkpoint_config = (path if path.is_dir() else path.parent) / "config.json"
@@ -183,6 +180,30 @@ def build_policy(config):
                     raise ValueError(f"Cannot load Stage2 with changed architecture: {key}")
             if config.get("tcp_query_window_size", 3) != saved.get("tcp_query_window_size", 3):
                 raise ValueError("Cannot load Stage2 with changed architecture: tcp_query_window_size")
+            if config.get("use_wrist_condition", False) != saved.get("use_wrist_condition", False):
+                raise ValueError("Cannot change use_wrist_condition when loading Stage2; start from Stage1")
+        if config.get("use_wrist_condition", False):
+            if not saved or "wrist_encoder_config" not in saved:
+                raise ValueError("Wrist Stage2 checkpoint requires its saved wrist_encoder_config")
+            config["wrist_encoder_config"] = saved["wrist_encoder_config"]
+    arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
+    if not stage2:
+        # Strict loading prevents silently starting with random recovery heads.
+        LOGGER.info("Load checkpoint from stage1: %s", config["stage1_checkpoint"])
+        load_model_weights(arc, config["stage1_checkpoint"])
+    policy = TCPActionPolicy(
+        arc, t5_model=config["t5_model"], text_max_length=config["text_max_length"],
+        dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
+        prediction_horizon=config["prediction_horizon"],
+        use_wrist_condition=config.get("use_wrist_condition", False),
+        wrist_model=config.get("wrist_model", "facebook/dinov2-giant"),
+        wrist_pretrained=not bool(stage2), wrist_encoder_config=config.get("wrist_encoder_config"),
+        wrist_cache_dir=config.get("wrist_cache_dir"),
+    )
+    if policy.use_wrist_condition:
+        config["wrist_encoder_config"] = policy.wrist_encoder.encoder.config.to_dict()
+    if stage2:
+        if saved:
             LOGGER.info("Stage2 sequence horizon: %s -> %s",
                         saved["prediction_horizon"], config["prediction_horizon"])
         LOGGER.info("%s Stage2 checkpoint: %s",
@@ -196,13 +217,16 @@ def build_policy(config):
 def build_optimizer(policy, config):
     policy.requires_grad_(False)
     groups = []
+    history_modules = [policy.history_pool, policy.global_encoder, policy.physical_time, policy.token_type]
+    if policy.wrist_visual_encoder is not None:
+        history_modules.append(policy.wrist_visual_encoder)
     specifications = [
         ("backbone", [policy.arc.backbone], "train_backbone", "lr_backbone"),
         ("geometry_head", [policy.arc.head], "train_geometry_head", "lr_head"),
         ("motion_decoder", [policy.arc.motion_decoder], "train_motion_decoder", "lr_motion_decoder"),
         ("query_encoder", [policy.arc.tcp_visual_query_encoder], "train_query_encoder", "lr_query_encoder"),
         ("tcp_head", [policy.arc.tcp_track_head], "train_tcp_head", "lr_tcp_head"),
-        ("history_pool", [policy.history_pool, policy.global_encoder, policy.physical_time, policy.token_type], "train_history_pool", "lr_history_pool"),
+        ("history_pool", history_modules, "train_history_pool", "lr_history_pool"),
         ("action_head", [policy.dit], "train_action_head", "lr_action_head"),
         ("language_projection", [policy.language_projection], "train_language_projection", "lr_language_projection"),
     ]
@@ -305,9 +329,11 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
             torch.cuda.synchronize()
         started = time.perf_counter()
         with accelerator.autocast():
+            wrist_features = policy.encode_wrist_images(batch.get("wrist_images"))
             reconstruction, features = policy.reconstruct(batch["images"], batch["tcp_query_points"])
             recovered = policy.make_condition(
                 batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
+                wrist_features=wrist_features,
             )
         if accelerator.device.type == "cuda":
             torch.cuda.synchronize()
@@ -320,6 +346,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
                     condition = policy.make_condition(
                         batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
                         centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
+                        wrist_features=wrist_features,
                     )
                 elif mode == "shuffled_instruction":
                     from dataclasses import replace
@@ -401,6 +428,8 @@ def main():
     )
     logging.basicConfig(level=logging.INFO if accelerator.is_main_process else logging.WARNING)
     root = Path(config["output_dir"])
+    # Construct before serializing: new wrist runs also save the encoder architecture.
+    policy = build_policy(config)
     if accelerator.is_main_process:
         root.mkdir(parents=True, exist_ok=True)
         (root / "config.json").write_text(json.dumps(config, indent=2))
@@ -409,7 +438,6 @@ def main():
     if config.get("wandb_run_name"):
         init_kwargs["wandb"] = {"name": config["wandb_run_name"]}
     accelerator.init_trackers("4RC-Stage2-Action", config=tracker_config, init_kwargs=init_kwargs)
-    policy = build_policy(config)
     geometry, tcp = build_criteria(config)
     geometry, tcp = geometry.to(accelerator.device), tcp.to(accelerator.device)
     # Validation is performed on the main rank with the unwrapped DDP model.
@@ -471,11 +499,23 @@ def main():
         "Training target: %d cumulative optimizer steps; %d remaining; epoch limit=%s",
         total_steps, max(0, total_steps - global_step), num_train_epochs,
     )
+    raw_policy = accelerator.unwrap_model(policy)
+    global_tokens = (
+        (RoboTwinActionDataset.PADDED_HEIGHT // raw_policy.arc.PATCH_SIZE)
+        * (RoboTwinActionDataset.PADDED_WIDTH // raw_policy.arc.PATCH_SIZE)
+    )
+    wrist_tokens = 0
+    if raw_policy.use_wrist_condition:
+        encoder = raw_policy.wrist_encoder
+        wrist_tokens = 2 * (encoder.image_height // encoder.patch_size) * (encoder.image_width // encoder.patch_size)
     LOGGER.info(
-        "Per GPU: %d clips x %d history frames = %d images; effective batch = %d clips; DiT tokens = %d",
+        "Per GPU: %d clips x %d history frames = %d third-person images + %d wrist images; "
+        "effective batch = %d clips; DiT tokens = %d (global=%d, wrists=%d)",
         config["batch_size"], config["history_frames"], config["train_batch_images"],
+        2 * config["batch_size"] if raw_policy.use_wrist_condition else 0,
         config["batch_size"] * accelerator.num_processes * config["gradient_accumulation_steps"],
-        2 * config["history_frames"] + config["prediction_horizon"],
+        global_tokens + wrist_tokens + raw_policy.num_arms * config["history_frames"] + config["prediction_horizon"],
+        global_tokens, wrist_tokens,
     )
     LOGGER.info("Optimizer groups: %s", [(group["name"], group["lr"]) for group in optimizer.param_groups])
     next_epoch, next_batch = epoch_start, batch_start
