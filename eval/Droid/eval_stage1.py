@@ -47,12 +47,12 @@ MASK_POLICY = "GT-visible AND prediction-visible AND finite GT state (absolute a
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "datasets/droid_episodes")
-    parser.add_argument("--val-set", type=Path, default=REPO_ROOT / "droid_script/splits/val_set.txt")
+    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "datasets/droid_eval_sets")
+    parser.add_argument("--val-set", type=Path, default=REPO_ROOT / "droid_script/splits/eval_set.txt")
     parser.add_argument("--model", type=Path, default=REPO_ROOT / "checkpoints/Droid-Stage1/checkpoint-500000")
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs/droid/stage1_eval/checkpoint-500000")
     parser.add_argument("--window-size", type=int, default=9, help="Sliding windows share one frame; previous prediction wins")
-    parser.add_argument("--device", default="auto", help="auto/cuda/cuda:0/cpu; torchrun selects LOCAL_RANK")
+    parser.add_argument("--device", default="cuda", help="auto/cuda/cuda:0/cpu; torchrun selects LOCAL_RANK")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
     parser.add_argument("--episodes", nargs="+", help="Exact episode names, restricted to --val-set")
     parser.add_argument("--cameras", nargs="+", help="Only these camera serials; default: all cameras in each episode")
@@ -551,6 +551,8 @@ def run(args) -> dict | None:
     else:
         device = stage1.resolve_device(args.device)
     if device.type == "cuda":
+        if device.index is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         torch.cuda.set_device(device)
     dtype = stage1.resolve_dtype(args.dtype, device)
     torch.manual_seed(42)
