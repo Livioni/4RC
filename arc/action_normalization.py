@@ -172,19 +172,22 @@ def validate_action_norm(record, num_arms):
 
 
 def compute_action_norm(mixture, num_arms, scratch_dir):
-    """Exact pooled quantiles with bounded RAM and one temporary file per column.
+    """Exact XYZ-only quantiles with bounded RAM and one temporary file per XYZ axis.
 
     Every valid window action has equal weight, regardless of sampler weights.
     In-place partition on contiguous memory-mapped columns avoids a full RAM copy.
     """
     dimension = num_arms * 10
-    minimum, maximum = np.full(dimension, np.inf), np.full(dimension, -np.inf)
+    position_indices = np.flatnonzero(np.arange(dimension) % 10 < 3)
+    statistics_dim = len(position_indices)
+    layout = action_layout(num_arms)
+    minimum, maximum = np.full(statistics_dim, np.inf), np.full(statistics_dim, -np.inf)
     count = 0
-    mean, m2 = np.zeros(dimension), np.zeros(dimension)
+    mean, m2 = np.zeros(statistics_dim), np.zeros(statistics_dim)
     sources = []
     last_progress = time.monotonic()
     with TemporaryDirectory(prefix=".action-norm-", dir=scratch_dir) as temporary:
-        paths = [Path(temporary) / f"column-{i}.bin" for i in range(dimension)]
+        paths = [Path(temporary) / f"xyz-{i}.bin" for i in position_indices]
         with ExitStack() as stack:
             handles = [stack.enter_context(path.open("wb")) for path in paths]
             for source in mixture.sources:
@@ -194,7 +197,8 @@ def compute_action_norm(mixture, num_arms, scratch_dir):
                 if dataset.split != "train":
                     raise ActionNormalizationError("Quantile fitting may only use the training split")
                 source_count = 0
-                LOGGER.info("Fit action quantiles: source=%s, streams=%d", source.name, len(dataset))
+                LOGGER.info("Fit XYZ normalization: source=%s, streams=%d, position dimensions=%d",
+                            source.name, len(dataset), statistics_dim)
                 for values in dataset.iter_action_targets():
                     values = np.asarray(values, dtype=np.float32)
                     if values.ndim != 2 or values.shape[1] != dimension or not np.isfinite(values).all():
@@ -202,6 +206,7 @@ def compute_action_norm(mixture, num_arms, scratch_dir):
                     size = len(values)
                     if not size:
                         continue
+                    values = values[:, position_indices]
                     minimum = np.minimum(minimum, values.min(axis=0))
                     maximum = np.maximum(maximum, values.max(axis=0))
                     batch = values.astype(np.float64)
@@ -215,26 +220,37 @@ def compute_action_norm(mixture, num_arms, scratch_dir):
                     for column, handle in enumerate(handles):
                         np.ascontiguousarray(values[:, column]).tofile(handle)
                     if time.monotonic() - last_progress >= 30:
-                        LOGGER.info("Fit action quantiles: %d labels, %.2f GiB temporary columns",
-                                    count, count * dimension * 4 / 1024**3)
+                        LOGGER.info("Fit XYZ normalization: %d labels, %.2f GiB temporary XYZ columns",
+                                    count, count * statistics_dim * 4 / 1024**3)
                         last_progress = time.monotonic()
-                LOGGER.info("Fit action quantiles: source=%s, valid window actions=%d", source.name, source_count)
+                LOGGER.info("Fit XYZ normalization: source=%s, valid window actions=%d", source.name, source_count)
                 sources.append({"name": source.name, "count": source_count,
                                 "history_frames": dataset.history_frames,
                                 "prediction_horizon": dataset.prediction_horizon,
                                 "selection": dataset.manifest()})
         if count == 0:
-            raise ActionNormalizationError("No valid training actions for quantile normalization")
+            raise ActionNormalizationError("No valid training actions for XYZ normalization")
         ranks = np.array([0.01, 0.99]) * (count - 1)
         lower, upper = np.floor(ranks).astype(np.int64), np.ceil(ranks).astype(np.int64)
-        quantiles = np.empty((2, dimension), dtype=np.float64)
+        quantiles = np.empty((2, statistics_dim), dtype=np.float64)
         for column, path in enumerate(paths):
-            LOGGER.info("Select exact action quantiles: dimension %d/%d", column + 1, dimension)
+            LOGGER.info("Select exact XYZ quantiles: %s (%d/%d)",
+                        layout[position_indices[column]], column + 1, statistics_dim)
             values = np.memmap(path, mode="r+", dtype=np.float32, shape=(count,))
             values.partition(np.unique(np.r_[lower, upper]))
             lo, hi = values[lower].astype(np.float64), values[upper].astype(np.float64)
             quantiles[:, column] = lo + (hi - lo) * (ranks - lower)
             del values
+    def action_columns(values):
+        # Keep the action-aligned artifact layout. Non-XYZ slots are unused zeros,
+        # not measured statistics; their actual affine transform stays (0, 1).
+        expanded = np.zeros((*values.shape[:-1], dimension), dtype=np.float64)
+        expanded[..., position_indices] = values
+        return expanded
+
+    mean, m2 = action_columns(mean), action_columns(m2)
+    minimum, maximum = action_columns(minimum), action_columns(maximum)
+    quantiles = action_columns(quantiles)
     record = {
         "version": NORM_VERSION, "method": NORM_METHOD,
         "horizon_shared": True, "num_arms": num_arms, "action_dim": dimension,
@@ -315,6 +331,7 @@ def initialize_action_normalization(policy, dataset, config, accelerator):
         assert_action_norm_matches(policy, record)
     else:
         policy.set_action_component_stats(record["offset"], record["scale"])
-    LOGGER.info("Action normalization: %s, %d dimensions, %d valid training window actions%s",
-                record["method"], record["action_dim"], record["count"], " (reused checkpoint)" if checkpoint else "")
+    LOGGER.info("Action normalization: %s, %d XYZ dimensions scaled; rotation6D/gripper unchanged; "
+                "%d valid training window actions%s", record["method"], policy.num_arms * 3,
+                record["count"], " (reused checkpoint)" if checkpoint else "")
     return record

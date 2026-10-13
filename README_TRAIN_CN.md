@@ -537,7 +537,9 @@ Safetensors 加载会恢复 DualDPT 共享参数别名，真实缺失或结构�
   分位数跨度小于 `1e-4 m` 时使用 min/max；最终跨度下限 `1e-3 m`，范围外数值不裁剪。
 - rotation6D 和已经映射至 `[-1,1]` 的夹爪使用 offset=0、scale=1。
 - 使用 `(action-offset)/scale` 归一化；所有未来步共享 `[1,D]` 统计。
-  `action_norm.json` 保存统计与实际 offset/scale，严格核对 checkpoint 中的对应 buffers。
+  统计阶段只计算 XYZ（双臂 6 维、单臂 3 维），仅为这些维度写临时列文件。
+  `action_norm.json` 保持动作对齐的数组格式，非 XYZ 统计槽为未使用的零占位；
+  实际 offset/scale 在这些维度恒为 0/1，并严格核对 checkpoint 中的对应 buffers。
 - 不包含旧 v1 归一化实现或权重迁移路径。修改任务集合后，从 Stage1 初始化才能重新拟合统计。
 
 全部 Stage2 配置设置 `color_augment=False`：关闭亮度、对比度、饱和度、色相及灰度增强，
