@@ -54,20 +54,24 @@ max_tcp_linear_speed = 3.0  # Metres per second; None disables the check.
 max_tcp_angular_speed = 4.0 * 3.141592653589793  # Radians per second.
 max_episodes = None
 augment = True
+color_augment = False  # Keep blur; disable jitter and grayscale.
 normalize_geometry = False  # Action targets require metric geometry.
 num_workers = 8
 batches_per_epoch = None
 recent_buffer_size = 10_000
 
 # == Validation Configuration ==
-validation_fraction = 0.1
+enable_validation = False
+validation_fraction = 0
 validation_batches = 16
 validation_batch_size = 1
-validate_every_steps = 1000
+validate_every_steps = 0
 # Stage-one overlap must be audited before claiming unseen-episode generalization.
 stage1_validation_overlap = "unknown"
 
 # == Model Configuration ==
+language_conditioning = "film"
+action_normalization = "componentwise"
 train_backbone = True
 train_geometry_head = True
 train_motion_decoder = True  # Shared sparse TCP decoder; dense tracking is not run.
@@ -81,7 +85,7 @@ tcp_query_window_size = 3
 
 t5_model = "google-t5/t5-base"  # Frozen encoder; a local pretrained directory also works.
 text_max_length = 128
-# About 297M parameters in the Action DiT (excluding conditioning modules).
+# About 262M parameters in the Action DiT (excluding conditioning modules).
 action_dim = 768
 action_depth = 20
 action_heads = 12

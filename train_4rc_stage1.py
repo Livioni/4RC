@@ -25,6 +25,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from arc.checkpoint import save_checkpoint
 from arc.models.arc.arc import Arc
 from arc.datasets import (
     WeightedMultiSourceBatchSampler,
@@ -331,29 +332,6 @@ def save_depth_preview(path: Path, batch: dict[str, Any], predictions: dict) -> 
     preview = np.concatenate((image, depth_image(target), depth_image(pred)), axis=1)
     path.parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(preview).save(path)
-
-
-def save_checkpoint(
-    accelerator: Accelerator,
-    output_dir: Path,
-    name: str,
-    *,
-    epoch: int,
-    batch_in_epoch: int,
-    global_step: int,
-) -> None:
-    checkpoint_dir = output_dir / name
-    accelerator.wait_for_everyone()
-    accelerator.save_state(str(checkpoint_dir))
-    if accelerator.is_main_process:
-        state = {
-            "epoch": epoch,
-            "batch_in_epoch": batch_in_epoch,
-            "global_step": global_step,
-        }
-        with (checkpoint_dir / "trainer_state.json").open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2)
-    accelerator.wait_for_everyone()
 
 
 def main() -> None:

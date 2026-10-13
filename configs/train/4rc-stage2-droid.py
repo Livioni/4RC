@@ -43,6 +43,7 @@ max_tcp_linear_speed = 3.0  # Metres per second; None disables the check.
 max_tcp_angular_speed = 4.0 * 3.141592653589793  # Radians per second.
 max_episodes = None
 augment = True
+color_augment = False  # Keep blur; disable jitter and grayscale.
 normalize_geometry = False  # Action targets require metric geometry.
 geometry_frame = "robot_base"
 tcp_frame = "camera"
@@ -55,14 +56,17 @@ batches_per_epoch = 2000  # Sampling epoch length, independent of total frame co
 recent_buffer_size = 10_000
 
 # == Validation Configuration ==
+enable_validation = False
 # Split membership comes only from train_set/val_set TXT; preparation defaults to 90/10.
 validation_batches = 16
 validation_batch_size = 1
-validate_every_steps = 1000
+validate_every_steps = 0
 # Both stages enforce identical split file hashes.
 stage1_validation_overlap = "none: shared DROID episode TXT splits"
 
 # == Model Configuration ==
+language_conditioning = "film"
+action_normalization = "componentwise"
 num_arms = 1
 train_backbone = True
 train_geometry_head = True
@@ -78,7 +82,7 @@ tcp_query_window_size = 3
 
 t5_model = "google-t5/t5-base"  # Frozen encoder; a local pretrained directory also works.
 text_max_length = 128
-# About 297M parameters in the Action DiT (excluding conditioning modules).
+# About 262M parameters in the Action DiT (excluding conditioning modules).
 action_dim = 768
 action_depth = 20
 action_heads = 12

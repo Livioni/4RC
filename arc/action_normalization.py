@@ -1,4 +1,4 @@
-"""Shared Stage2 quantile statistics, portable artifacts, and initialization."""
+"""Componentwise Stage2 action statistics, portable artifacts, and initialization."""
 from __future__ import annotations
 
 from contextlib import ExitStack
@@ -16,9 +16,10 @@ from arc.action import future_actions_in_current_camera
 
 LOGGER = logging.getLogger(__name__)
 NORM_FILENAME = "action_norm.json"
-NORM_METHOD = "quantile"
-NORM_VERSION = 1
-QUANTILE_EPSILON = 1e-6
+NORM_METHOD = "componentwise"
+NORM_VERSION = 2
+POSITION_FALLBACK_SPAN = 1e-4
+POSITION_MIN_SPAN = 1e-3
 STAT_NAMES = ("mean", "std", "q01", "q99")
 ACTION_COMPONENTS = ["x", "y", "z", "rotation6d_0", "rotation6d_1", "rotation6d_2",
                      "rotation6d_3", "rotation6d_4", "rotation6d_5", "gripper"]
@@ -26,52 +27,6 @@ ACTION_COMPONENTS = ["x", "y", "z", "rotation6d_0", "rotation6d_1", "rotation6d_
 
 class ActionNormalizationError(ValueError):
     """Invalid action shapes, normalization parameters, or checkpoint metadata."""
-
-
-def _quantile_parameters(action, q01, q99, epsilon):
-    is_tensor = torch.is_tensor(action)
-    action = action.float() if is_tensor and action.is_floating_point() else action
-    if not is_tensor:
-        action = np.asarray(action)
-    if action.ndim < 2 or min(action.shape[-2:]) < 1:
-        raise ActionNormalizationError(f"Action must have shape [...,H,D], got {action.shape}")
-    if is_tensor:
-        if not action.is_floating_point():
-            raise ActionNormalizationError("Action must use a floating dtype")
-        q01 = torch.as_tensor(q01, dtype=torch.float32, device=action.device)
-        q99 = torch.as_tensor(q99, dtype=torch.float32, device=action.device)
-    else:
-        if not np.issubdtype(action.dtype, np.floating):
-            raise ActionNormalizationError("Action must use a floating dtype")
-        q01, q99 = np.asarray(q01, dtype=np.float32), np.asarray(q99, dtype=np.float32)
-    if q01.ndim != 2 or q01.shape != q99.shape or q01.shape[-1] != action.shape[-1]:
-        raise ActionNormalizationError("q01/q99 must have matching [1,D] or [H,D] shapes")
-    if q01.shape[0] != 1:
-        if q01.shape[0] < action.shape[-2]:
-            raise ActionNormalizationError("Action horizon exceeds quantile statistics horizon")
-        q01, q99 = q01[:action.shape[-2]], q99[:action.shape[-2]]
-    # Epsilon is applied exactly once, to q99 before subtraction; no clipping.
-    scale = (q99 + float(epsilon)) - q01
-    finite = torch.isfinite if is_tensor else np.isfinite
-    if not bool(finite(q01).all() & finite(scale).all() & (q99 >= q01).all() & (scale > 0).all()):
-        raise ActionNormalizationError("Quantiles must be finite with positive effective q99-q01")
-    return action, q01, scale
-
-
-def quantile_normalize(action, q01, q99, *, epsilon=QUANTILE_EPSILON):
-    """Map raw [...,H,D] actions to nominal [-1,1], preserving outliers.
-
-    Shared [1,D] statistics broadcast over any horizon. Torch tensors remain
-    on their device and preserve gradients; tensor arithmetic uses float32.
-    """
-    action, q01, scale = _quantile_parameters(action, q01, q99, epsilon)
-    return 2.0 * ((action - q01) / scale) - 1.0
-
-
-def quantile_unnormalize(action, q01, q99, *, epsilon=QUANTILE_EPSILON):
-    """Invert quantile_normalize before decoding positions, rotations or grippers."""
-    action, q01, scale = _quantile_parameters(action, q01, q99, epsilon)
-    return ((action + 1.0) / 2.0) * scale + q01
 
 
 def configure_action_normalization(config):
@@ -84,16 +39,69 @@ def configure_action_normalization(config):
     timeout = config["distributed_timeout_seconds"]
     if not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("distributed_timeout_seconds must be finite and positive")
-    require_quantile_config(config)
+    require_action_normalization_config(config)
 
 
-def require_quantile_config(config):
-    if (config.get("action_normalization") != NORM_METHOD
-            or config.get("action_normalization_version") != NORM_VERSION):
+def require_action_normalization_config(config):
+    pair = (config.get("action_normalization"), config.get("action_normalization_version"))
+    if pair != (NORM_METHOD, NORM_VERSION):
         raise ActionNormalizationError(
-            "Stage2 requires quantile normalization (version 1). "
-            "Old mean/std Stage2 checkpoints are unsupported; start a new run from Stage1."
+            "Stage2 requires componentwise action normalization v2; "
+            "start new componentwise runs from Stage1."
         )
+
+
+def assert_stage2_contract(config, saved):
+    """Reject semantic changes before constructing or loading a Stage2 model."""
+    for key in ("language_conditioning", "action_normalization", "action_normalization_version"):
+        if config.get(key) != saved.get(key):
+            raise ValueError(f"Cannot load Stage2 with changed {key}; start from Stage1")
+
+
+def componentwise_parameters(q01, q99, minimum, maximum):
+    """XYZ affine parameters; rotation columns and gripper retain their units."""
+    q01, q99, minimum, maximum = [np.asarray(v, dtype=np.float64) for v in (q01, q99, minimum, maximum)]
+    if (q01.ndim != 2 or q01.shape[0] != 1 or q01.shape[1] not in (10, 20)
+            or any(v.shape != q01.shape or not np.isfinite(v).all() for v in (q01, q99, minimum, maximum))
+            or (minimum > q01).any() or (q01 > q99).any() or (q99 > maximum).any()):
+        raise ActionNormalizationError("Invalid componentwise action statistics")
+    fallback = q99 - q01 < POSITION_FALLBACK_SPAN
+    low, high = np.where(fallback, minimum, q01), np.where(fallback, maximum, q99)
+    position = np.arange(q01.shape[1]) % 10 < 3
+    offset, scale = np.zeros_like(q01), np.ones_like(q01)
+    offset[:, position] = (low[:, position] + high[:, position]) / 2
+    scale[:, position] = np.maximum(high[:, position] - low[:, position], POSITION_MIN_SPAN) / 2
+    return offset, scale
+
+
+def _affine_parameters(action, offset, scale):
+    if torch.is_tensor(action):
+        if not action.is_floating_point():
+            raise ActionNormalizationError("Actions must use a floating dtype")
+        action = action.float()
+        offset = torch.as_tensor(offset, dtype=torch.float32, device=action.device)
+        scale = torch.as_tensor(scale, dtype=torch.float32, device=action.device)
+        finite = torch.isfinite
+    else:
+        action = np.asarray(action)
+        if not np.issubdtype(action.dtype, np.floating):
+            raise ActionNormalizationError("Actions must use a floating dtype")
+        offset, scale = np.asarray(offset, dtype=np.float32), np.asarray(scale, dtype=np.float32)
+        finite = np.isfinite
+    if (action.ndim < 2 or offset.shape != (1, action.shape[-1]) or scale.shape != offset.shape
+            or not bool(finite(offset).all() & finite(scale).all() & (scale > 0).all())):
+        raise ActionNormalizationError("Expected finite affine [1,D] parameters with positive scales")
+    return action, offset, scale
+
+
+def componentwise_normalize(action, offset, scale):
+    action, offset, scale = _affine_parameters(action, offset, scale)
+    return (action - offset) / scale
+
+
+def componentwise_unnormalize(action, offset, scale):
+    action, offset, scale = _affine_parameters(action, offset, scale)
+    return action * scale + offset
 
 
 def action_layout(num_arms):
@@ -129,16 +137,19 @@ def iter_future_action_rows(states, extrinsics, anchors, segment_ends, horizon, 
 
 
 def validate_action_norm(record, num_arms):
-    expected = {"version": NORM_VERSION, "method": NORM_METHOD, "epsilon": QUANTILE_EPSILON,
-                "horizon_shared": True, "num_arms": num_arms, "action_dim": num_arms * 10,
+    require_action_normalization_config({"action_normalization": record.get("method"),
+                                         "action_normalization_version": record.get("version")})
+    expected = {"horizon_shared": True, "num_arms": num_arms, "action_dim": num_arms * 10,
                 "layout": action_layout(num_arms), "statistics_scope": "train_valid_window_actions"}
+    expected.update(position_fallback_span=POSITION_FALLBACK_SPAN, position_min_span=POSITION_MIN_SPAN,
+                    component_rules=["quantile_xyz", "identity_rotation6d", "identity_gripper"])
     for key, value in expected.items():
         if record.get(key) != value:
             raise ActionNormalizationError(f"Invalid action normalization {key}: expected {value!r}")
     if not isinstance(record.get("count"), int) or record["count"] < 1:
         raise ActionNormalizationError("Action normalization requires a positive sample count")
     stats = {}
-    for name in STAT_NAMES:
+    for name in (*STAT_NAMES, "min", "max", "offset", "scale"):
         try:
             value = np.asarray(record[name], dtype=np.float64)
         except (KeyError, TypeError, ValueError) as exc:
@@ -148,9 +159,15 @@ def validate_action_norm(record, num_arms):
         stats[name] = value
     if (stats["std"] < 0).any() or (stats["q99"] < stats["q01"]).any():
         raise ActionNormalizationError("Invalid standard deviation or reversed quantiles")
-    scale = (stats["q99"].astype(np.float32) + np.float32(QUANTILE_EPSILON)) - stats["q01"].astype(np.float32)
+    offset, scale = componentwise_parameters(stats["q01"], stats["q99"], stats["min"], stats["max"])
+    for name, value in (("offset", offset), ("scale", scale)):
+        if not np.array_equal(stats[name].astype(np.float32), value.astype(np.float32)):
+            raise ActionNormalizationError(f"Saved {name} disagrees with componentwise rules")
+    scale = scale.astype(np.float32)
+    if not np.isfinite(offset.astype(np.float32)).all():
+        raise ActionNormalizationError("Float32 offset must be finite")
     if not np.isfinite(scale).all() or not (scale > 0).all():
-        raise ActionNormalizationError("Float32 effective q99-q01 must be finite and positive")
+        raise ActionNormalizationError("Float32 normalization scale must be finite and positive")
     return stats
 
 
@@ -161,6 +178,7 @@ def compute_action_norm(mixture, num_arms, scratch_dir):
     In-place partition on contiguous memory-mapped columns avoids a full RAM copy.
     """
     dimension = num_arms * 10
+    minimum, maximum = np.full(dimension, np.inf), np.full(dimension, -np.inf)
     count = 0
     mean, m2 = np.zeros(dimension), np.zeros(dimension)
     sources = []
@@ -184,6 +202,8 @@ def compute_action_norm(mixture, num_arms, scratch_dir):
                     size = len(values)
                     if not size:
                         continue
+                    minimum = np.minimum(minimum, values.min(axis=0))
+                    maximum = np.maximum(maximum, values.max(axis=0))
                     batch = values.astype(np.float64)
                     batch_mean = batch.mean(axis=0)
                     delta = batch_mean - mean
@@ -216,13 +236,18 @@ def compute_action_norm(mixture, num_arms, scratch_dir):
             quantiles[:, column] = lo + (hi - lo) * (ranks - lower)
             del values
     record = {
-        "version": NORM_VERSION, "method": NORM_METHOD, "epsilon": QUANTILE_EPSILON,
+        "version": NORM_VERSION, "method": NORM_METHOD,
         "horizon_shared": True, "num_arms": num_arms, "action_dim": dimension,
         "layout": action_layout(num_arms), "statistics_scope": "train_valid_window_actions",
         "count": count, "sources": sources,
         "mean": mean[None].tolist(), "std": np.sqrt(np.maximum(m2 / count, 0))[None].tolist(),
         "q01": quantiles[0:1].tolist(), "q99": quantiles[1:2].tolist(),
     }
+    offset, scale = componentwise_parameters(quantiles[0:1], quantiles[1:2], minimum[None], maximum[None])
+    record.update(min=minimum[None].tolist(), max=maximum[None].tolist(),
+                  offset=offset.tolist(), scale=scale.tolist(),
+                  position_fallback_span=POSITION_FALLBACK_SPAN, position_min_span=POSITION_MIN_SPAN,
+                  component_rules=["quantile_xyz", "identity_rotation6d", "identity_gripper"])
     validate_action_norm(record, num_arms)
     return record
 
@@ -240,19 +265,22 @@ def load_checkpoint_action_norm(checkpoint, num_arms):
     directory = path if path.is_dir() else path.parent
     config_path = directory / "config.json"
     if not config_path.is_file():
-        raise ActionNormalizationError(f"Quantile Stage2 checkpoint requires {config_path}")
-    require_quantile_config(json.loads(config_path.read_text(encoding="utf-8")))
+        raise ActionNormalizationError(f"Componentwise Stage2 checkpoint requires {config_path}")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    require_action_normalization_config(config)
     path = directory / NORM_FILENAME
     if not path.is_file():
-        raise ActionNormalizationError(f"Quantile Stage2 checkpoint requires {path}")
+        raise ActionNormalizationError(f"Componentwise Stage2 checkpoint requires {path}")
     record = json.loads(path.read_text(encoding="utf-8"))
+    if (record.get("method"), record.get("version")) != (config["action_normalization"], config["action_normalization_version"]):
+        raise ActionNormalizationError("Checkpoint config and action_norm.json versions disagree")
     validate_action_norm(record, num_arms)
     return record
 
 
 def assert_action_norm_matches(policy, record):
     stats = validate_action_norm(record, policy.num_arms)
-    for name in ("q01", "q99"):
+    for name in ("offset", "scale"):
         actual = getattr(policy, f"action_{name}").detach().float().cpu()
         expected = torch.tensor(stats[name], dtype=torch.float32)
         if actual.shape != expected.shape or not torch.equal(actual, expected):
@@ -286,7 +314,7 @@ def initialize_action_normalization(policy, dataset, config, accelerator):
     if checkpoint:
         assert_action_norm_matches(policy, record)
     else:
-        policy.set_action_quantile_stats(record["q01"], record["q99"])
+        policy.set_action_component_stats(record["offset"], record["scale"])
     LOGGER.info("Action normalization: %s, %d dimensions, %d valid training window actions%s",
-                NORM_METHOD, record["action_dim"], record["count"], " (reused checkpoint)" if checkpoint else "")
+                record["method"], record["action_dim"], record["count"], " (reused checkpoint)" if checkpoint else "")
     return record

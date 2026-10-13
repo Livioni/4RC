@@ -206,6 +206,8 @@ def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str 
     if config.get("training_stage") != 2 or config.get("normalize_geometry", False):
         raise ValueError("A metric-geometry Stage2 checkpoint is required")
     action_norm = load_checkpoint_action_norm(checkpoint, 2)
+    if config.get("language_conditioning") != "film":
+        raise ValueError("Stage2 requires a FiLM checkpoint; start from Stage1")
     arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
     channels = arc.tcp_visual_query_encoder.embed_dim
     weights_path = checkpoint / "model.safetensors"

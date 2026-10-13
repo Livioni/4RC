@@ -20,7 +20,7 @@ def flow_matching_loss(predictions, *, position_weight=1.0, rotation_weight=1.0,
     ).square().unflatten(-1, (velocity.shape[-1] // 10, 10))
     def masked_mean(value):
         per_step = value.reshape(*valid.shape, -1).mean(-1)
-        return (per_step.sum(1) / valid.sum(1)).mean()
+        return (per_step.sum(1) / valid.sum(1).clamp_min(1)).mean()
     position = masked_mean(error[..., :3])
     rotation = masked_mean(error[..., 3:9])
     gripper = masked_mean(error[..., 9])

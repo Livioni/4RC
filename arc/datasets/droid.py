@@ -71,7 +71,7 @@ class DroidDataset(torch.utils.data.Dataset):
     def __init__(self, root, *, index_path=DEFAULT_INDEX, train_set=DEFAULT_TRAIN, val_set=DEFAULT_VAL,
                  split="train", stage=1, min_views=2, max_views=18, min_interval=1, max_interval=5,
                  reverse_probability=0.5, history_frames=8, prediction_horizon=16, frame_rate=15,
-                 max_depth=3.0, seed=42, augment=True, max_episodes=None, cache_size=8,
+                 max_depth=3.0, seed=42, augment=True, color_augment=True, max_episodes=None, cache_size=8,
                  max_tcp_linear_speed=3.0, max_tcp_angular_speed=4 * math.pi, **unused):
         if unused:
             raise TypeError(f"Unknown DROID options: {sorted(unused)}")
@@ -112,6 +112,7 @@ class DroidDataset(torch.utils.data.Dataset):
         self.reverse_probability = reverse_probability if stage == 1 else 0
         self.max_depth = max_depth
         self.augment = augment and split == "train"
+        self.color_augment = color_augment
         self.cache_size = int(cache_size)
         self._cache, self._connection, self._pid = OrderedDict(), None, None
         self.profile = digest({"index": meta["uuid"], "episodes": names, "stage": stage,
@@ -245,7 +246,7 @@ class DroidDataset(torch.utils.data.Dataset):
         k[:2, 2] += 1
         ext = torch.tensor(record["extrinsics"], dtype=torch.float32)
         state = torch.from_numpy(np.asarray(record["state"][indices]).copy()).float()[:, None]
-        augmentation = RoboTwin4RC._sample_augmentation(rng) if self.augment else None
+        augmentation = RoboTwin4RC._sample_augmentation(rng, color_augment=self.color_augment) if self.augment else None
         images, depths, masks, originals = [], [], [], []
         for frame in indices.tolist():
             rgb = self.root / episode / "images" / camera / f"{frame:06d}.png"
@@ -331,6 +332,8 @@ def _adapter(spec, config, *, stage=1, split="train"):
     options.update(spec.get("options", {}))
     if config.get("max_episodes") is not None:
         options["max_episodes"] = config["max_episodes"]
+    if stage == 2:
+        options["color_augment"] = bool(config.get("color_augment", False))
     return DroidDataset(stage=stage, split=split, **options)
 
 

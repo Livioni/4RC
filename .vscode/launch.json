@@ -10,7 +10,8 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}"
+                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}",
+                "WANDB_MODE": "offline"
             },
             "args": [
                 "--config",
@@ -34,13 +35,14 @@
             "console": "integratedTerminal",
             "justMyCode": true,
             "env": {
-                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}"
+                "LD_LIBRARY_PATH": "${env:HOME}/miniconda3/envs/4rc/lib:${env:LD_LIBRARY_PATH}",
+                "WANDB_MODE": "offline"
             },
             "args": [
                 "--config",
                 "${workspaceFolder}/configs/train/4rc-stage2-droid.py",
                 "--stage1-checkpoint",
-                "${workspaceFolder}/droid_script/outputs/stage1_debug/final_checkpoint",
+                "${workspaceFolder}/outputs/droid/stage1_debug/final_checkpoint",
                 "--num-workers",
                 "0",
                 "--max-episodes",
@@ -69,7 +71,7 @@
             },
             "args": [
                 "--config",
-                "${workspaceFolder}/configs/train/4rc-stage2-action.py",
+                "${workspaceFolder}/configs/train/4rc-stage2-action-debug.py",
                 "--num-workers",
                 "0",
                 "--max-episodes",

@@ -458,7 +458,7 @@ tasks = None  # 默认使用全部任务
 筛选发生在读取 episode 内容、应用每个数据源的 `max_episodes` 上限和划分
 训练/验证集之前。保留原有排序及哈希划分，因此同一个 episode 不会因任务列表
 变化而切换划分。动作窗口、当前数据统计和 `data_manifest.json` 仅包含所选任务；
-已有 Stage2 checkpoint 的归一化统计仍按原规则保留。
+同版本 Stage2 checkpoint 的 v2 归一化统计会原样保留。
 
 `tasks` 可以是非空字符串列表或元组，重复名称自动去重；空列表、错误格式，或
 任一启用数据源缺少指定任务时会报错。权重为零的数据源跳过检查。未配置或设为
@@ -475,6 +475,11 @@ accelerate launch train_4rc_stage2.py \
 ```
 
 ### 启动、初始化与恢复
+
+RoboTwin / DROID 的 Stage1、Stage2 均只保留当前输出目录下最新的一组训练 checkpoint。
+按步数、按 epoch 和最终保存共用此规则：先在临时目录写完权重、优化器、随机状态及元数据，
+成功发布后再删除旧 checkpoint。Stage2 同时保存动作归一化统计，DROID 同时保存 split 快照。
+保存失败时保留此前完整 checkpoint；日志、可视化和其他目录不参与清理。
 
 ```bash
 # 第一阶段
@@ -499,7 +504,10 @@ stage2_checkpoint = None  # Stage2 权重文件或目录；重新开始优化器
 resume = None             # 完整 Stage2 checkpoint 目录；恢复全部训练状态
 ```
 
-从 Stage1 初始化时，加载重建模型并创建新的动作模块；从 Stage2 初始化时，
+当前 Stage2 仅支持 FiLM + componentwise v2。旧 cross-attention / v1 权重不再支持，
+请从 Stage1 checkpoint 开始新训练，并使用新的输出目录。
+
+从 Stage1 初始化时，加载重建模型并创建新的动作模块；从同版本 Stage2 初始化时，
 严格加载完整策略，包括动作头和归一化统计，不需要读取 Stage1 文件。
 `stage2_checkpoint` 不恢复优化器、scheduler、随机状态或累计步数，GT 条件比例
 也按新训练配置从头执行。可使用 `--stage2-checkpoint` 覆盖配置：
@@ -511,15 +519,29 @@ accelerate launch train_4rc_stage2.py \
 ```
 
 Stage2 统一使用序号编码，默认 8 帧历史、16 个未来动作，关闭 TCP 物理速度损失。
-无需指定时间模式或频率参数。`stage2_checkpoint` 只读取权重；旧 checkpoint 的时间配置、
-损失权重和训练进度不会覆盖当前配置。旧权重结构相容时可以直接用于初始化新训练。
-
-`resume` 仍可恢复使用当前配置训练的完整 checkpoint；旧物理时间训练请通过
-`stage2_checkpoint` 初始化。新训练的优化器、scheduler、随机状态和累计步数从头开始。
+无需指定时间模式或频率参数。`stage2_checkpoint` 只读取同版本权重及归一化统计；
+损失权重和训练进度不会覆盖当前配置。`resume` 恢复当前版本的完整训练状态。
 
 TCP recovery head 的 position mean/std 始终保留。只有从 Stage1 创建新的动作头时，
 才使用当前训练集计算动作归一化统计；Stage2 初始化及 resume 均保留已训练的尺度。
 Safetensors 加载会恢复 DualDPT 共享参数别名，真实缺失或结构不匹配仍会报错。
+
+### 动作归一化与颜色增强
+
+每臂动作是 `[xyz, R[:,0], R[:,1], 2*gripper-1]`，双臂共 20 维，DROID 单臂 10 维。
+未来 TCP 的绝对 pose 统一表达在最后观测帧相机系；rotation6D 使用旋转矩阵前两列。
+
+`action_normalization="componentwise"`、`action_normalization_version=2`：
+
+- XYZ 按训练集中有效未来标签计算每维 q01/q99，以中点为 offset、半跨度为 scale。
+  分位数跨度小于 `1e-4 m` 时使用 min/max；最终跨度下限 `1e-3 m`，范围外数值不裁剪。
+- rotation6D 和已经映射至 `[-1,1]` 的夹爪使用 offset=0、scale=1。
+- 使用 `(action-offset)/scale` 归一化；所有未来步共享 `[1,D]` 统计。
+  `action_norm.json` 保存统计与实际 offset/scale，严格核对 checkpoint 中的对应 buffers。
+- 不包含旧 v1 归一化实现或权重迁移路径。修改任务集合后，从 Stage1 初始化才能重新拟合统计。
+
+全部 Stage2 配置设置 `color_augment=False`：关闭亮度、对比度、饱和度、色相及灰度增强，
+保留 `augment=True` 控制的随机模糊。第三视角与腕部图像共享窗口增强参数；Stage1 默认设置不变。
 
 ### 历史长度与每卡 batch size
 
@@ -560,7 +582,7 @@ token，8 帧共 16 个历史 tokens。
 及帧序号编码。二维位置和序号均使用 sin/cos 编码加 MLP；
 历史输入为 `[-7,...,0]`，未来为 `[1,...,16]`，这些数字表示先后顺序，不表示秒数。
 模型不接收时间戳或频率，因此重复时间戳无需虚拟补位。
-编码 MLP 保留已有权重的参数名称，加载旧 Stage2 权重后也只编码序号。
+编码 MLP 使用序号，不接收机器人执行时间。
 
 Stage2 固定要求 `tcp_temporal_weight=0`，直接跳过物理速度计算。位置、旋转、夹爪和
 几何监督继续生效；flow-matching 的生成时间与向量场损失仍保留，它们不是机器人
@@ -576,7 +598,7 @@ patch 中心二维位置编码、当前帧序号 0 的编码及全局视觉类�
 再经过 LayerNorm。位置编码沿用归一化 padded 图像坐标的 sin/cos 加 MLP。
 类型 embedding 共三类：0 = TCP 历史，1 = 未来动作，2 = 全局视觉。
 
-Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 297M 参数（不含条件编码模块）。
+Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 262M 参数（不含条件编码模块）。
 主序列固定为 `[最后观测帧全局 patches | TCP 局部历史 | 未来动作]`。
 默认 252×322 图像、14×14 patch 对应 18×23 = 414 个全局 tokens，
 加上 16 个 TCP 历史和 16 个未来动作，共 446 个 tokens；显存和计算量相应增加。
@@ -592,12 +614,15 @@ history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报
 仅含 TCP 历史条件的早期 Stage2 checkpoint，以及全局视觉分支仅使用跨帧 1536 维
 特征的 Stage2 checkpoint，均与当前默认训练结构不兼容；严格加载会拒绝缺失或形状不匹配的参数。
 请从 Stage1 权重开始新的 Stage2 实验并使用新的输出目录。使用 3072 维 concat 输入
-训练得到的 Stage2 checkpoint 支持正常初始化、断点恢复和推理。
-独立滑窗推理和 RoboTwin FourRC 评测按权重形状自动兼容 1536 维跨帧与 3072 维 concat
-两种结构，此兼容路径不改变新训练的默认结构，也不转换旧权重。
+且采用 FiLM + componentwise v2 训练得到的 Stage2 checkpoint 支持初始化、断点恢复和推理。
+RoboTwin FourRC 评测要求 3072 维 concat 和腕部输入；旧 cross-attention / v1 checkpoint 会被拒绝。
 
-T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→768
-投影进入每层 cross-attention，并传递文本 padding mask。
+T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练投影后，屏蔽 padding 并做均值池化。
+每层 DiT 的 self-attention 和 MLP 分支分别用语言向量生成逐通道 FiLM 参数：
+`(1+gamma)*LayerNorm(x)+beta`，同一参数广播到全局、腕部、TCP 和动作 tokens。
+FiLM 投影零初始化，随后仅对动作 tokens 施加 flow-time 的 AdaLN 调制。
+动作头仅保留 FiLM，语言 cross-attention 已删除；FiLM 参数属于 `train_action_head` 优化器组。
+局部 3×3 patch 原有九个相对位置 embedding、池化后 TCP 中心二维位置编码继续保留。
 
 ### 最后观测帧左右腕部条件（可选）
 
@@ -605,11 +630,11 @@ T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练 768→
 
 ```bash
 accelerate launch train_4rc_stage2.py \
-  --config configs/train/4rc-stage2-action-ust-wrist.py
+  --config configs/train/4rc-stage2-action-wrist.py
 ```
 
 该配置开启 `use_wrist_condition=True`，输出到
-`outputs/4rc-stage2-action-clean-ust-wrist`。该配置独立定义所有参数，训练超参数
+`outputs/4rc-stage2-action-clean-wrist`。该配置独立定义所有参数，训练超参数
 与 `4rc-stage2-action-ust.py` 一致，不导入或执行原配置。第三人称分支的训练开关沿用原配置；
 左右腕部另共享一个官方预训练 `facebook/dinov2-giant`（ViT-g/14）encoder，
 始终冻结并保持 eval。首次训练下载权重到仓库内 `.cache/huggingface`；
@@ -688,9 +713,12 @@ GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head �
 
 ### 验证与推理接口
 
-默认按完整 episode 确定性留出 10% 验证数据，划分写入 data_manifest.json。
-stage1_validation_overlap 默认 unknown；需审计第一阶段是否使用过这些
-episode，才能将结果解释为未见 episode 泛化。
+全部 Stage2 配置默认 `enable_validation=False`、`validate_every_steps=0`。
+RoboTwin 设置 `validation_fraction=0`；训练不构建验证集/loader，也不运行周期或结束验证。
+DROID 保留已有训练 TXT 的成员范围，不将 val TXT 合并进训练。效果使用 RoboTwin 闭环任务成功率评估。
+
+以下独立 `--eval-only` 接口仅供显式评测使用：需另外提供有验证划分的配置
+（RoboTwin 要求 `validation_fraction>0`）。
 
 ```bash
 python train_4rc_stage2.py \

@@ -8,7 +8,9 @@ import torch
 from torch import nn
 
 from arc.action import project_tcp, safe_rotation_6d_to_matrix, sinusoidal
-from arc.action_normalization import quantile_normalize, quantile_unnormalize, QUANTILE_EPSILON
+from arc.action_normalization import (
+    componentwise_normalize, componentwise_unnormalize,
+)
 from arc.models.arc.wrist_encoder import FrozenDINOv2Encoder
 
 
@@ -141,18 +143,19 @@ class GlobalVisualEncoder(nn.Module):
 
 
 class ActionDiTBlock(nn.Module):
+    """Language modulates channels; flow time modulates only future actions."""
+
     def __init__(self, dim: int, heads: int, mlp_ratio: int = 4):
         super().__init__()
-        self.norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(3)])
+        self.norms = nn.ModuleList([nn.LayerNorm(dim, elementwise_affine=False) for _ in range(2)])
         self.self_attention = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=0.0)
-        self.text_attention = nn.MultiheadAttention(dim, heads, batch_first=True, dropout=0.0)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, mlp_ratio * dim), nn.GELU(approximate="tanh"),
-            nn.Linear(mlp_ratio * dim, dim),
-        )
-        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 9 * dim))
-        nn.init.zeros_(self.modulation[-1].weight)
-        nn.init.zeros_(self.modulation[-1].bias)
+        self.mlp = nn.Sequential(nn.Linear(dim, mlp_ratio * dim), nn.GELU(approximate="tanh"),
+                                 nn.Linear(mlp_ratio * dim, dim))
+        self.language_modulation = nn.Linear(dim, 4 * dim)
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        for projection in (self.language_modulation, self.modulation[-1]):
+            nn.init.zeros_(projection.weight)
+            nn.init.zeros_(projection.bias)
 
     @staticmethod
     def _modulate(x, count, shift, scale):
@@ -162,17 +165,17 @@ class ActionDiTBlock(nn.Module):
     def _residual(x, update, count, gate):
         return x + torch.cat((update[:, :count], gate[:, None] * update[:, count:]), 1)
 
-    def forward(self, x, time_condition, history_count, mask, text, text_valid, padding_mask=None):
-        modulation = self.modulation(time_condition).chunk(9, dim=-1)
-        for i in range(3):
-            shift, scale, gate = modulation[3 * i:3 * i + 3]
-            q = self._modulate(self.norms[i](x), history_count, shift, scale)
+    def forward(self, x, time_condition, history_count, mask, language, padding_mask=None):
+        language_parameters = self.language_modulation(language).chunk(4, dim=-1)
+        time_parameters = self.modulation(time_condition).chunk(6, dim=-1)
+        for i in range(2):
+            beta, gamma = language_parameters[2 * i:2 * i + 2]
+            q = self.norms[i](x) * (1 + gamma[:, None]) + beta[:, None]
+            shift, scale, gate = time_parameters[3 * i:3 * i + 3]
+            q = self._modulate(q, history_count, shift, scale)
             if i == 0:
-                update, _ = self.self_attention(q, q, q, attn_mask=mask, key_padding_mask=padding_mask, need_weights=False)
-            elif i == 1:
-                update, _ = self.text_attention(
-                    q, text, text, key_padding_mask=~text_valid, need_weights=False,
-                )
+                update, _ = self.self_attention(q, q, q, attn_mask=mask,
+                                               key_padding_mask=padding_mask, need_weights=False)
             else:
                 update = self.mlp(q)
             x = self._residual(x, update, history_count, gate)
@@ -210,8 +213,12 @@ class TCPActionDiT(nn.Module):
                 ~future_valid.bool(),
             ), dim=1)
         condition = self.flow_time(flow_time)
+        # Recompute from valid tokens so counterfactual/shuffled text also uses FiLM.
+        text_valid = text_valid.bool()
+        language = text.masked_fill(~text_valid[..., None], 0).sum(1)
+        language = language / text_valid.sum(1, keepdim=True).clamp_min(1)
         for block in self.blocks:
-            x = block(x, condition, count, mask, text, text_valid, padding_mask)
+            x = block(x, condition, count, mask, language, padding_mask)
         shift, scale = self.output_modulation(condition).chunk(2, dim=-1)
         future = self.output_norm(x[:, count:]) * (1 + scale[:, None]) + shift[:, None]
         velocity = self.output_projection(future)
@@ -289,8 +296,8 @@ class TCPActionPolicy(nn.Module):
         self.padding = tuple(padding)
         # Shared over future steps, so checkpoints are independent of the horizon.
         # NaNs make an uninitialized policy fail instead of silently using a scale.
-        self.register_buffer("action_q01", torch.full((1, self.num_arms * 10), float("nan")))
-        self.register_buffer("action_q99", torch.full((1, self.num_arms * 10), float("nan")))
+        for name in ("offset", "scale"):
+            self.register_buffer(f"action_{name}", torch.full((1, self.num_arms * 10), float("nan")))
 
     def train(self, mode=True):
         super().train(mode)
@@ -309,25 +316,23 @@ class TCPActionPolicy(nn.Module):
         with torch.no_grad():
             return self.wrist_encoder(wrist_images)
 
-    def set_action_quantile_stats(self, q01, q99):
-        q01 = torch.as_tensor(q01, dtype=torch.float32, device=self.action_q01.device)
-        q99 = torch.as_tensor(q99, dtype=torch.float32, device=self.action_q99.device)
-        if q01.shape != self.action_q01.shape or q99.shape != self.action_q99.shape:
-            raise ValueError(f"Action quantile statistics must be [1,{self.num_arms * 10}]")
-        scale = (q99 + QUANTILE_EPSILON) - q01
-        if not bool(torch.isfinite(q01).all() & torch.isfinite(q99).all()
-                    & (q99 >= q01).all() & torch.isfinite(scale).all() & (scale > 0).all()):
-            raise ValueError("Action quantiles must be finite with positive effective q99-q01")
-        self.action_q01.copy_(q01)
-        self.action_q99.copy_(q99)
+    def set_action_component_stats(self, offset, scale):
+        offset = torch.as_tensor(offset, dtype=torch.float32, device=self.action_offset.device)
+        scale = torch.as_tensor(scale, dtype=torch.float32, device=self.action_scale.device)
+        componentwise_normalize(torch.zeros_like(self.action_offset), offset, scale)
+        identity = torch.arange(self.num_arms * 10, device=offset.device) % 10 >= 3
+        if not bool((offset[:, identity] == 0).all() & (scale[:, identity] == 1).all()):
+            raise ValueError("Rotation6D and gripper require identity normalization")
+        self.action_offset.copy_(offset)
+        self.action_scale.copy_(scale)
 
     def normalize_actions(self, actions):
         if actions.shape[-2:] != (self.num_arms, 10):
             raise ValueError(f"Expected actions [...,H,{self.num_arms},10]")
-        return quantile_normalize(actions.float().flatten(-2), self.action_q01, self.action_q99)
+        return componentwise_normalize(actions.float().flatten(-2), self.action_offset, self.action_scale)
 
     def denormalize_actions(self, actions):
-        value = quantile_unnormalize(actions.float(), self.action_q01, self.action_q99)
+        value = componentwise_unnormalize(actions.float(), self.action_offset, self.action_scale)
         return value.unflatten(-1, (self.num_arms, 10))
 
     def reconstruct(self, images, initial_query_points):

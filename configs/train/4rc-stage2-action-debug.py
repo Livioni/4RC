@@ -2,7 +2,7 @@
 import runpy as _runpy
 from pathlib import Path as _Path
 
-_base = _runpy.run_path(str(_Path(__file__).with_name("4rc-stage2-action.py")))
+_base = _runpy.run_path(str(_Path(__file__).with_name("4rc-stage2-action-wrist.py")))
 globals().update({k: v for k, v in _base.items() if not k.startswith("_")})
 
 # Keep reconstruction heads and the action modules trainable within GPU memory.

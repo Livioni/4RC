@@ -28,6 +28,7 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
+from arc.checkpoint import save_checkpoint as save_training_checkpoint
 from arc.models.arc.arc import Arc
 from arc.datasets import (
     WeightedMultiSourceBatchSampler,
@@ -246,32 +247,19 @@ def save_depth_preview(path: Path, batch: dict[str, Any], predictions: dict) -> 
     Image.fromarray(preview).save(path)
 
 
-def save_checkpoint(
-    accelerator: Accelerator,
-    output_dir: Path,
-    name: str,
-    *,
-    epoch: int,
-    batch_in_epoch: int,
-    global_step: int,
-) -> None:
-    checkpoint_dir = output_dir / name
-    accelerator.wait_for_everyone()
-    accelerator.save_state(str(checkpoint_dir))
-    if accelerator.is_main_process:
-        state = {
-            "epoch": epoch,
-            "batch_in_epoch": batch_in_epoch,
-            "global_step": global_step,
-        }
-        config_path = output_dir / "config.json"
+def save_checkpoint(accelerator, output_dir, name, *, epoch, batch_in_epoch, global_step,
+                    metadata_writer=None):
+    def write_metadata(directory):
+        config_path = directory / "config.json"
         if config_path.is_file():
-            saved_config = json.loads(config_path.read_text())
-            (checkpoint_dir / "config.json").write_text(json.dumps(saved_config, indent=2))
-            snapshot_splits(saved_config, checkpoint_dir)
-        with (checkpoint_dir / "trainer_state.json").open("w", encoding="utf-8") as handle:
-            json.dump(state, handle, indent=2)
-    accelerator.wait_for_everyone()
+            snapshot_splits(json.loads(config_path.read_text()), directory)
+        if metadata_writer is not None:
+            metadata_writer(directory)
+
+    save_training_checkpoint(
+        accelerator, output_dir, name, epoch=epoch, batch_in_epoch=batch_in_epoch,
+        global_step=global_step, metadata_writer=write_metadata,
+    )
 
 
 def main() -> None:

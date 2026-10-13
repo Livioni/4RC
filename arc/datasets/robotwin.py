@@ -73,6 +73,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         max_tcp_angular_speed: float | None = 4.0 * math.pi,
         seed: int = 42,
         augment: bool = True,
+        color_augment: bool = True,
         max_episodes: int | None = None,
         tasks: list[str] | tuple[str, ...] | None = None,
     ) -> None:
@@ -93,6 +94,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         )
         self.seed = seed
         self.augment = augment
+        self.color_augment = color_augment
         self.epoch = 0
 
         if view not in self.TCP_DIRECTORIES:
@@ -503,17 +505,17 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         return frame_indices, interval
 
     @staticmethod
-    def _sample_augmentation(rng: np.random.Generator) -> dict[str, Any]:
+    def _sample_augmentation(rng: np.random.Generator, *, color_augment: bool = True) -> dict[str, Any]:
         return {
             "blur": bool(rng.random() < 0.2),
             "blur_radius": float(rng.uniform(0.1, 2.0)),
-            "jitter": bool(rng.random() < 0.1),
+            "jitter": bool(rng.random() < 0.1) and color_augment,
             "brightness": float(rng.uniform(0.8, 1.2)),
             "contrast": float(rng.uniform(0.8, 1.2)),
             "saturation": float(rng.uniform(0.8, 1.2)),
             "hue": float(rng.uniform(-0.05, 0.05)),
             "jitter_order": rng.permutation(4).tolist(),
-            "grayscale": bool(rng.random() < 0.05),
+            "grayscale": bool(rng.random() < 0.05) and color_augment,
         }
 
     @staticmethod
@@ -555,7 +557,7 @@ class RoboTwin4RC(Dataset[dict[str, Any]]):
         frame_indices, interval = self.sample_frame_indices(
             episode, rng, requested_views
         )
-        augmentation = self._sample_augmentation(rng) if self.augment else None
+        augmentation = self._sample_augmentation(rng, color_augment=self.color_augment) if self.augment else None
 
         intrinsics = np.load(episode.path / "intrinsics" / f"{self.view}.npy").astype(
             np.float32, copy=True

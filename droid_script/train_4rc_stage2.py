@@ -34,7 +34,7 @@ from arc.loss.action import flow_matching_loss, action_metric_sums, finalize_act
 from arc.models.arc.arc import Arc
 from arc.models.arc.arc_action import TCPActionPolicy
 from arc.action_normalization import (
-    configure_action_normalization, load_checkpoint_action_norm,
+    configure_action_normalization, load_checkpoint_action_norm, assert_stage2_contract,
     assert_action_norm_matches, initialize_action_normalization, save_action_norm,
 )
 from droid_script.train_4rc_stage1 import (
@@ -76,9 +76,19 @@ def load_config(args):
 def validate_config(config, *, eval_only=False):
     config = dict(config)
     configure_action_normalization(config)
-    for key in ("batch_size", "history_frames", "prediction_horizon", "sampling_steps", "action_dim", "action_depth", "action_heads", "text_max_length", "validation_batches", "validation_batch_size"):
+    config.setdefault("language_conditioning", "film")
+    if config["language_conditioning"] != "film":
+        raise ValueError("Stage2 requires FiLM language conditioning; start from Stage1")
+    config.setdefault("enable_validation", False)
+    if not isinstance(config["enable_validation"], bool):
+        raise ValueError("enable_validation must be a boolean")
+    for key in ("batch_size", "history_frames", "prediction_horizon", "sampling_steps", "action_dim", "action_depth", "action_heads", "text_max_length"):
         if not isinstance(config[key], int) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
+    if config["enable_validation"] or eval_only:
+        for key in ("validation_batches", "validation_batch_size"):
+            if not isinstance(config.get(key), int) or config[key] < 1:
+                raise ValueError(f"{key} must be a positive integer")
     for key, default in (("history_tcp_gt_initial_ratio", 1.0), ("history_tcp_gt_final_ratio", 0.5)):
         value = float(config.get(key, default))
         if not math.isfinite(value) or not 0 <= value <= 1:
@@ -160,6 +170,12 @@ def load_model_weights(model, checkpoint):
 
 def build_policy(config):
     action_norm = load_checkpoint_action_norm(config["resume"], 1) if config.get("resume") else None
+    if config.get("resume"):
+        saved = json.loads((Path(config["resume"]) / "config.json").read_text())
+        assert_stage2_contract(config, saved)
+        for key in ("action_dim", "action_depth", "action_heads", "prediction_horizon"):
+            if config[key] != saved[key]:
+                raise ValueError(f"Cannot resume with changed architecture: {key}")
     arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3), num_arms=1)
     if not config.get("resume"):
         checkpoint = Path(config["stage1_checkpoint"]).expanduser()
@@ -181,12 +197,6 @@ def build_policy(config):
         padding=config["padding"], decode_camera=True,
     )
     if config.get("resume"):
-        checkpoint_config = Path(config["resume"]) / "config.json"
-        if checkpoint_config.is_file():
-            saved = json.loads(checkpoint_config.read_text())
-            for key in ("action_dim", "action_depth", "action_heads", "prediction_horizon"):
-                if config[key] != saved[key]:
-                    raise ValueError(f"Cannot resume with changed architecture: {key}")
         load_model_weights(policy, config["resume"])
         assert_action_norm_matches(policy, action_norm)
     return policy
@@ -358,13 +368,14 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
 
 
 def save_stage2(accelerator, config, name, *, epoch, batch_in_epoch, global_step, action_norm):
-    root = Path(config["output_dir"])
+    def write_metadata(directory):
+        save_action_norm(directory, action_norm)
+        (directory / "config.json").write_text(json.dumps(config, indent=2))
+
     save_checkpoint(
-        accelerator, root, name, epoch=epoch, batch_in_epoch=batch_in_epoch, global_step=global_step,
+        accelerator, Path(config["output_dir"]), name, epoch=epoch,
+        batch_in_epoch=batch_in_epoch, global_step=global_step, metadata_writer=write_metadata,
     )
-    if accelerator.is_main_process:
-        save_action_norm(root / name, action_norm)
-        (root / name / "config.json").write_text(json.dumps(config, indent=2))
 
 
 def run_validation(model, validation_loader, geometry, tcp, config, accelerator, step):
@@ -418,7 +429,8 @@ def main():
     geometry, tcp = build_criteria(config)
     geometry, tcp = geometry.to(accelerator.device), tcp.to(accelerator.device)
     # Validation is performed on the main rank with the unwrapped DDP model.
-    validation_dataset = build_action_dataset(config, "validation") if accelerator.is_main_process else None
+    validation_enabled = config["enable_validation"] or args.eval_only
+    validation_dataset = build_action_dataset(config, "validation") if validation_enabled and accelerator.is_main_process else None
     validation_loader = make_loader(validation_dataset, config, validation=True)[0] if validation_dataset else None
     if args.eval_only:
         initialize_action_normalization(policy, None, config, accelerator)
@@ -523,7 +535,7 @@ def main():
                     progress.set_postfix(loss=f"{metrics['objective']:.4f}")
                 if accelerator.is_main_process and config["visualize_every_steps"] > 0 and global_step % config["visualize_every_steps"] == 0:
                     save_depth_preview(root / "visuals" / f"step-{global_step:08d}.png", batch, prediction["reconstruction"])
-                if config["validate_every_steps"] > 0 and global_step % config["validate_every_steps"] == 0:
+                if validation_enabled and config["validate_every_steps"] > 0 and global_step % config["validate_every_steps"] == 0:
                     run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
                 if config["checkpointing_steps"] > 0 and global_step % config["checkpointing_steps"] == 0:
                     save_stage2(accelerator, config, f"checkpoint-{global_step}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
@@ -532,7 +544,8 @@ def main():
         batch_start = 0
         if config.get("save_each_epoch") and global_step < total_steps:
             save_stage2(accelerator, config, f"epoch-{epoch + 1}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
-    run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
+    if validation_enabled:
+        run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
     save_stage2(accelerator, config, "final_checkpoint", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
     accelerator.end_training()
 

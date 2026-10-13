@@ -245,6 +245,7 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
         if config.get("max_episodes") is not None:
             options["max_episodes"] = config["max_episodes"]
         options["augment"] = bool(config.get("augment", True)) and split == "train"
+        options["color_augment"] = bool(config.get("color_augment", False))
         try:
             dataset = RoboTwinActionDataset(
                 root, history_frames=config["history_frames"],

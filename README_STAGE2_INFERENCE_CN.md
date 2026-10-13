@@ -2,11 +2,11 @@
 
 `stage2_sliding_window_inference.py` 独立加载完整 Stage2 策略，不导入 Stage1 推理脚本或训练入口。
 默认 checkpoint 为 `checkpoints/RoboTwin-Stage2/90000`，模型结构、历史帧数和预测长度来自该目录的 `config.json`。
-加载器根据 `global_encoder.projection.1.weight` 的实际形状自动识别全局视觉结构：旧 checkpoint
-使用最后观测帧的跨帧 1536 维特征，新 checkpoint 使用帧内/跨帧按通道 concat 的 3072 维特征。
-两种结构均保持原有 token 数和严格权重校验，无需转换 checkpoint 或修改配置文件。
-RoboTwin 的 FourRC 评测适配器复用此加载器，同样自动兼容两种结构。
-更早的仅含 TCP 历史、没有全局视觉分支的 checkpoint 仍不支持。
+加载器只接受 `language_conditioning="film"`、`action_normalization="componentwise"`、
+`action_normalization_version=2` 的 checkpoint。旧 cross-attention / v1 模型需从 Stage1 重新训练。
+`action_norm.json` 中的 offset/scale 必须与模型 buffers 一致：XYZ 使用带跨度保护的分位数缩放，
+rotation6D 和夹爪不做额外缩放。RoboTwin FourRC 评测要求腕部条件和 3072 维 concat 全局特征。
+运行时请用 `--checkpoint` 指定新训练的模型目录。
 
 ## 运行
 

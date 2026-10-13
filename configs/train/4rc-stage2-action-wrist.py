@@ -34,8 +34,8 @@ data_sources = (
     },
 )
 view = "third_views"
-history_frames = 8  # Include anchors 0..7; repeat the oldest frame if history is short.
-prediction_horizon = 16  # Next 16 action records, with no execution-frequency assumption; short futures are masked.
+history_frames = 4  # Include anchors 0..3; repeat the oldest frame if history is short.
+prediction_horizon = 40  # Next 40 action records, with no execution-frequency assumption; short futures are masked.
 batch_size = 4  # Per GPU; each sample contains history_frames input images.
 # Step indices encode observation order; repeated frames keep their source timestamps.
 # The action adapter requires forward windows within one valid segment. The runner derives
@@ -53,21 +53,25 @@ max_depth = 3.0  # Metric z-depth cap; None disables the cap.
 max_tcp_linear_speed = 3.0  # Metres per second; None disables the check.
 max_tcp_angular_speed = 4.0 * 3.141592653589793  # Radians per second.
 max_episodes = None
-augment = True
+augment = False
+color_augment = False  # Keep blur; disable jitter and grayscale.
 normalize_geometry = False  # Action targets require metric geometry.
 num_workers = 8
 batches_per_epoch = None
 recent_buffer_size = 10_000
 
 # == Validation Configuration ==
+enable_validation = False
 validation_fraction = 0
 validation_batches = 16
 validation_batch_size = 1
-validate_every_steps = 1000
+validate_every_steps = 0
 # Stage-one overlap must be audited before claiming unseen-episode generalization.
 stage1_validation_overlap = "unknown"
 
 # == Model Configuration ==
+language_conditioning = "film"
+action_normalization = "componentwise"
 # Independent UST wrist-view experiment; all training hyperparameters match UST.
 use_wrist_condition = True
 wrist_model = "facebook/dinov2-giant"  # Shared left/right ViT-g/14 encoder; always frozen.
@@ -89,7 +93,7 @@ tcp_query_window_size = 3
 
 t5_model = "google-t5/t5-base"  # Frozen encoder; a local pretrained directory also works.
 text_max_length = 128
-# About 297M parameters in the Action DiT (excluding conditioning modules).
+# About 262M parameters in the Action DiT (excluding conditioning modules).
 action_dim = 768
 action_depth = 20
 action_heads = 12
@@ -99,7 +103,7 @@ sampling_steps = 8
 # == History TCP Condition Curriculum ==
 # Choose GT/recovered history per clip. Linearly interpolate over optimizer
 # updates from 100% GT to 50% GT / 50% recovered; resume uses cumulative steps.
-history_tcp_gt_initial_ratio = 1.0
+history_tcp_gt_initial_ratio = 0.5
 history_tcp_gt_final_ratio = 0.5
 
 # == Training Configuration ==
@@ -155,7 +159,7 @@ action_gripper_weight = 1.0
 # == Logging and Checkpoint Configuration ==
 log_every_steps = 10
 visualize_every_steps = 5_000
-checkpointing_steps = 10_000
+checkpointing_steps = 5_000
 save_each_epoch = False
-report_to = ["tensorboard"]
+report_to = ["tensorboard", "wandb"]
 
