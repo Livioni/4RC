@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from arc.action import project_tcp, safe_rotation_6d_to_matrix, sinusoidal
+from arc.action_normalization import quantile_normalize, quantile_unnormalize, QUANTILE_EPSILON
 from arc.models.arc.wrist_encoder import FrozenDINOv2Encoder
 
 
@@ -286,8 +287,10 @@ class TCPActionPolicy(nn.Module):
         self.dit = TCPActionDiT(dim, depth, heads, self.num_arms)
         self.prediction_horizon = prediction_horizon
         self.padding = tuple(padding)
-        self.register_buffer("action_position_mean", torch.zeros(self.num_arms, 3))
-        self.register_buffer("action_position_std", torch.ones(self.num_arms, 3))
+        # Shared over future steps, so checkpoints are independent of the horizon.
+        # NaNs make an uninitialized policy fail instead of silently using a scale.
+        self.register_buffer("action_q01", torch.full((1, self.num_arms * 10), float("nan")))
+        self.register_buffer("action_q99", torch.full((1, self.num_arms * 10), float("nan")))
 
     def train(self, mode=True):
         super().train(mode)
@@ -306,23 +309,26 @@ class TCPActionPolicy(nn.Module):
         with torch.no_grad():
             return self.wrist_encoder(wrist_images)
 
-    def set_action_position_stats(self, mean, std):
-        if mean.shape != (self.num_arms, 3) or std.shape != (self.num_arms, 3):
-            raise ValueError(f"Action position statistics must be [{self.num_arms},3]")
-        if not torch.isfinite(mean).all() or not torch.isfinite(std).all() or (std <= 0).any():
-            raise ValueError("Action statistics must be finite with positive standard deviations")
-        self.action_position_mean.copy_(mean.to(self.action_position_mean))
-        self.action_position_std.copy_(std.to(self.action_position_std))
+    def set_action_quantile_stats(self, q01, q99):
+        q01 = torch.as_tensor(q01, dtype=torch.float32, device=self.action_q01.device)
+        q99 = torch.as_tensor(q99, dtype=torch.float32, device=self.action_q99.device)
+        if q01.shape != self.action_q01.shape or q99.shape != self.action_q99.shape:
+            raise ValueError(f"Action quantile statistics must be [1,{self.num_arms * 10}]")
+        scale = (q99 + QUANTILE_EPSILON) - q01
+        if not bool(torch.isfinite(q01).all() & torch.isfinite(q99).all()
+                    & (q99 >= q01).all() & torch.isfinite(scale).all() & (scale > 0).all()):
+            raise ValueError("Action quantiles must be finite with positive effective q99-q01")
+        self.action_q01.copy_(q01)
+        self.action_q99.copy_(q99)
 
     def normalize_actions(self, actions):
-        value = actions.float().clone()
-        value[..., :3] = (value[..., :3] - self.action_position_mean) / self.action_position_std
-        return value.flatten(-2)
+        if actions.shape[-2:] != (self.num_arms, 10):
+            raise ValueError(f"Expected actions [...,H,{self.num_arms},10]")
+        return quantile_normalize(actions.float().flatten(-2), self.action_q01, self.action_q99)
 
     def denormalize_actions(self, actions):
-        value = actions.float().reshape(*actions.shape[:2], self.num_arms, 10).clone()
-        value[..., :3] = value[..., :3] * self.action_position_std + self.action_position_mean
-        return value
+        value = quantile_unnormalize(actions.float(), self.action_q01, self.action_q99)
+        return value.unflatten(-1, (self.num_arms, 10))
 
     def reconstruct(self, images, initial_query_points):
         if images.ndim != 5 or initial_query_points.shape != (images.shape[0], self.num_arms, 2):

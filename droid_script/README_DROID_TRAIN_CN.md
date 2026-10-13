@@ -20,6 +20,21 @@
 
 外参和 ray 都在机器人基座坐标下监督，不将首帧外参归一化为单位矩阵。相机 head 内部沿用原模型的 `camera-to-world` 编码，计算损失时转换成 `world-to-camera`。TCP 标签则直接读取对应相机的 `TCP/<camera>/state.npy`，避免重复坐标变换。
 
+Stage2 的单臂动作统一使用 `arc/action_normalization.py` 的 quantile 归一化：
+XYZ、6D 旋转和连续夹爪共 10 维，所有未来步共享 `[1,10]` 的 q01/q99。
+从 Stage1 新训练时，主进程遍历所选训练 episode 的全部有效相机窗口，
+每个有效未来动作等权统计，排除验证集与 padding，不读取 RGB／深度图像。
+临时统计文件位于输出目录，占用约 `有效窗口动作条目数 × 10 × 4` 字节，完成后清理。
+多进程等待超时默认 86400 秒，可用 `distributed_timeout_seconds` 调整。
+
+输出目录及每个 checkpoint 都包含 `action_norm.json`，模型权重也保存原始 q01/q99。
+恢复训练和评估时检查两者一致并复用参数，不重新拟合；推理在旋转、夹爪解码之前
+自动反归一化。单独还原 `[B,H,10]` 动作时，使用
+`load_checkpoint_action_norm(checkpoint, num_arms=1)` 加载参数，再调用
+`quantile_unnormalize(actions, stats["q01"], stats["q99"])`。
+两者均来自 `arc.action_normalization`。旧 mean/std Stage2 权重不再支持，
+需从 Stage1 开始新训练；Stage1 和历史 TCP 重建分支保持原有尺度处理。
+
 ## 2. 代码位置
 
 ```text

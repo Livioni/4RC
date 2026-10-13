@@ -199,11 +199,13 @@ def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str 
     from arc.models.arc.arc_action import TCPActionPolicy
     from safetensors import safe_open
     from safetensors.torch import load_model
+    from arc.action_normalization import load_checkpoint_action_norm, assert_action_norm_matches
 
     checkpoint = checkpoint.expanduser()
     config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
     if config.get("training_stage") != 2 or config.get("normalize_geometry", False):
         raise ValueError("A metric-geometry Stage2 checkpoint is required")
+    action_norm = load_checkpoint_action_norm(checkpoint, 2)
     arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
     channels = arc.tcp_visual_query_encoder.embed_dim
     weights_path = checkpoint / "model.safetensors"
@@ -234,10 +236,7 @@ def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str 
     )
     # load_model restores omitted aliases of the geometry head's shared norms.
     load_model(policy, str(weights_path), strict=True, device="cpu")
-    if (not torch.isfinite(policy.action_position_mean).all()
-            or not torch.isfinite(policy.action_position_std).all()
-            or (policy.action_position_std <= 0).any()):
-        raise ValueError("Checkpoint has invalid action normalization statistics")
+    assert_action_norm_matches(policy, action_norm)
     return policy.eval().requires_grad_(False).to(device), config
 
 

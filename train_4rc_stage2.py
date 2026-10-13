@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from datetime import timedelta
 from itertools import count
 import json
 import logging
@@ -17,7 +18,7 @@ import time
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
+from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs, ProjectConfiguration, set_seed
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -27,6 +28,10 @@ from arc.loss import GeometryLoss, TCPTrackingLoss
 from arc.loss.action import flow_matching_loss, action_metric_sums, finalize_action_metrics
 from arc.models.arc.arc import Arc
 from arc.models.arc.arc_action import TCPActionPolicy
+from arc.action_normalization import (
+    configure_action_normalization, load_checkpoint_action_norm,
+    assert_action_norm_matches, initialize_action_normalization, save_action_norm,
+)
 from train_4rc_stage1 import (
     cosine_warmup_scheduler, distributed_scheduler_steps, prepare_geometry_batch,
     save_checkpoint, save_depth_preview, training_total_steps, align_resumed_scheduler,
@@ -76,6 +81,7 @@ def load_config(args):
 
 def validate_config(config, *, eval_only=False):
     config = dict(config)
+    configure_action_normalization(config)
     config.setdefault("stage2_checkpoint", None)
     config.setdefault("use_wrist_condition", False)
     if not isinstance(config["use_wrist_condition"], bool):
@@ -169,6 +175,7 @@ def load_model_weights(model, checkpoint):
 
 def build_policy(config):
     stage2 = config.get("resume") or config.get("stage2_checkpoint")
+    action_norm = load_checkpoint_action_norm(stage2, 2) if stage2 else None
     saved = None
     if stage2:
         path = Path(stage2)
@@ -209,8 +216,7 @@ def build_policy(config):
         LOGGER.info("%s Stage2 checkpoint: %s",
                     "Resume" if config.get("resume") else "Initialize weights from", stage2)
         load_model_weights(policy, stage2)
-        # Validate the loaded action scale without replacing it with new stats.
-        policy.set_action_position_stats(policy.action_position_mean, policy.action_position_std)
+        assert_action_norm_matches(policy, action_norm)
     return policy
 
 
@@ -381,12 +387,13 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
     return metrics
 
 
-def save_stage2(accelerator, config, name, *, epoch, batch_in_epoch, global_step):
+def save_stage2(accelerator, config, name, *, epoch, batch_in_epoch, global_step, action_norm):
     root = Path(config["output_dir"])
     save_checkpoint(
         accelerator, root, name, epoch=epoch, batch_in_epoch=batch_in_epoch, global_step=global_step,
     )
     if accelerator.is_main_process:
+        save_action_norm(root / name, action_norm)
         (root / name / "config.json").write_text(json.dumps(config, indent=2))
 
 
@@ -424,7 +431,10 @@ def main():
         gradient_accumulation_steps=config["gradient_accumulation_steps"],
         log_with=config["report_to"] or None,
         project_config=ProjectConfiguration(project_dir=config["output_dir"], logging_dir=str(Path(config["output_dir"]) / config.get("logging_dir", "logs"))),
-        kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=config.get("find_unused_parameters", True))],
+        kwargs_handlers=[
+            DistributedDataParallelKwargs(find_unused_parameters=config.get("find_unused_parameters", True)),
+            InitProcessGroupKwargs(timeout=timedelta(seconds=config["distributed_timeout_seconds"])),
+        ],
     )
     logging.basicConfig(level=logging.INFO if accelerator.is_main_process else logging.WARNING)
     root = Path(config["output_dir"])
@@ -444,6 +454,7 @@ def main():
     validation_dataset = build_action_dataset(config, "validation") if accelerator.is_main_process else None
     validation_loader = make_loader(validation_dataset, config, validation=True)[0] if validation_dataset else None
     if args.eval_only:
+        initialize_action_normalization(policy, None, config, accelerator)
         policy.to(accelerator.device)
         if accelerator.is_main_process and validation_loader is None:
             raise ValueError("No validation episodes; check validation_fraction and max_episodes")
@@ -452,8 +463,7 @@ def main():
         return
 
     dataset = build_action_dataset(config, "train")
-    if not (config.get("resume") or config.get("stage2_checkpoint")):
-        policy.set_action_position_stats(dataset.tcp_position_mean, dataset.tcp_position_std)
+    action_norm = initialize_action_normalization(policy, dataset, config, accelerator)
     # Never overwrite policy.arc.tcp_track_head.position_mean/std here.
     if accelerator.is_main_process:
         manifest = {"stage1_validation_overlap": config["stage1_validation_overlap"]}
@@ -478,6 +488,7 @@ def main():
     epoch_start = batch_start = global_step = 0
     if config.get("resume"):
         accelerator.load_state(config["resume"])
+        assert_action_norm_matches(accelerator.unwrap_model(policy), action_norm)
         state = json.loads((Path(config["resume"]) / "trainer_state.json").read_text())
         epoch_start, batch_start, global_step = state["epoch"], state["batch_in_epoch"], state["global_step"]
         LOGGER.info("Resumed epoch=%d batch=%d step=%d", epoch_start, batch_start, global_step)
@@ -559,14 +570,14 @@ def main():
                 if config["validate_every_steps"] > 0 and global_step % config["validate_every_steps"] == 0:
                     run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
                 if config["checkpointing_steps"] > 0 and global_step % config["checkpointing_steps"] == 0:
-                    save_stage2(accelerator, config, f"checkpoint-{global_step}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step)
+                    save_stage2(accelerator, config, f"checkpoint-{global_step}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
                 if global_step >= total_steps:
                     break
         batch_start = 0
         if config.get("save_each_epoch") and global_step < total_steps:
-            save_stage2(accelerator, config, f"epoch-{epoch + 1}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step)
+            save_stage2(accelerator, config, f"epoch-{epoch + 1}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
     run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
-    save_stage2(accelerator, config, "final_checkpoint", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step)
+    save_stage2(accelerator, config, "final_checkpoint", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
     accelerator.end_training()
 
 
@@ -576,4 +587,3 @@ if __name__ == "__main__":
     finally:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
-

@@ -15,6 +15,7 @@ import torch
 from torch.nn import functional as F
 
 from arc.action import future_actions_in_current_camera, project_tcp
+from arc.action_normalization import iter_future_action_rows
 from arc.datasets.robotwin import RoboTwin4RC
 from arc.datasets.mixture import DatasetSource, WeightedDatasetMixture
 from arc.datasets.droid_index import (DEFAULT_INDEX, DEFAULT_TRAIN, DEFAULT_VAL, FPS, INDEX_VERSION,
@@ -305,6 +306,21 @@ class DroidDataset(torch.utils.data.Dataset):
     def manifest(self):
         return {"split": self.split, "train_set": self.train_set, "val_set": self.val_set,
                 "profile": self.profile, "camera_streams": len(self), "fps": FPS}
+
+    def iter_action_targets(self):
+        """All Stage2 camera-stream windows from the selected index profile."""
+        if self.stage != 2:
+            raise ValueError("Action quantiles require a Stage2 DROID dataset")
+        for index in range(len(self)):
+            record = self._record(index)
+            anchors = np.concatenate([np.arange(start, end, dtype=np.int64)
+                                      for start, end in record["starts"]]) + self.history_frames - 1
+            ends = np.asarray([end for _, end in record["segments"]], dtype=np.int64)
+            segment_ends = ends[np.searchsorted(ends, anchors, side="right")]
+            yield from iter_future_action_rows(
+                record["state"][:, None], np.asarray(record["extrinsics"]),
+                anchors, segment_ends, self.prediction_horizon,
+            )
 
 
 def _adapter(spec, config, *, stage=1, split="train"):

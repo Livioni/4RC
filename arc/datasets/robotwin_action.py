@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from arc.action import future_actions_in_current_camera, project_tcp
+from arc.action_normalization import iter_future_action_rows
 from .robotwin import RoboTwin4RC
 from .mixture import DatasetSource, WeightedDatasetMixture
 from .utils.wrist import load_wrist_images
@@ -109,6 +110,17 @@ class RoboTwinActionDataset(RoboTwin4RC):
             np.load(episode.path / self.tcp_directory / name, mmap_mode="r")
             for name in ("left_state.npy", "right_state.npy")
         ], axis=1)
+
+    def iter_action_targets(self):
+        """All eligible window labels, with no image loading or padding."""
+        for episode, starts in zip(self.episodes, self.starts):
+            anchors = starts + self.history_frames - 1
+            ends = np.asarray([end for _, end in episode.valid_segments], dtype=np.int64)
+            segment_ends = ends[np.searchsorted(ends, anchors, side="right")]
+            extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r")
+            yield from iter_future_action_rows(
+                self._read_states(episode), extrinsics, anchors, segment_ends, self.prediction_horizon,
+            )
 
     def _action_moments(self, states, extrinsics, starts, segments):
         anchors = starts + self.history_frames - 1
