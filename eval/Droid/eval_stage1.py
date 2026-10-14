@@ -45,16 +45,21 @@ SCHEMA_VERSION = 3
 MASK_POLICY = "GT-visible AND prediction-visible AND finite GT state (absolute and Sim(3) metric families)"
 
 
-def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "datasets/droid_eval_sets")
-    parser.add_argument("--val-set", type=Path, default=REPO_ROOT / "droid_script/splits/eval_set.txt")
+def build_parser(*, dataset="droid", description=__doc__):
+    """Shared CLI; only DROID uses a validation split file."""
+    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / f"datasets/{dataset}_eval_sets")
+    if dataset == "droid":
+        parser.add_argument("--val-set", type=Path, default=REPO_ROOT / "droid_script/splits/eval_set.txt")
+    else:
+        parser.set_defaults(val_set=None)
     parser.add_argument("--model", type=Path, default=REPO_ROOT / "checkpoints/Droid-Stage1/checkpoint-500000")
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "outputs/droid/stage1_eval/checkpoint-500000")
+    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / f"outputs/{dataset}/stage1_eval/checkpoint-500000")
     parser.add_argument("--window-size", type=int, default=9, help="Sliding windows share one frame; previous prediction wins")
     parser.add_argument("--device", default="cuda", help="auto/cuda/cuda:0/cpu; torchrun selects LOCAL_RANK")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
-    parser.add_argument("--episodes", nargs="+", help="Exact episode names, restricted to --val-set")
+    parser.add_argument("--episodes", nargs="+", help=("Exact episode names, restricted to --val-set" if dataset == "droid"
+                                                     else "Exact episode directory names within --data-root"))
     parser.add_argument("--cameras", nargs="+", help="Only these camera serials; default: all cameras in each episode")
     parser.add_argument("--max-episodes", type=int, default=0, help="0 means all; limit selected episodes for a smoke run")
     parser.add_argument("--max-frames", type=int, default=0, help="0 means all; limit frames after the first visible TCP")
@@ -63,6 +68,11 @@ def parse_args(argv=None):
                         help="Recompute TCP Sim(3) and projected 2D tracking metrics from cached predictions, without model inference; use a new output directory")
     parser.add_argument("--resume", action="store_true", help="Reuse matching complete/skipped camera results; retry failures")
     parser.add_argument("--dry-run", action="store_true", help="Discover validation cameras without loading the model or writing results")
+    return parser
+
+
+def parse_args(argv=None, *, parser=None):
+    parser = build_parser() if parser is None else parser
     args = parser.parse_args(argv)
     if not 2 <= args.window_size <= 18:
         parser.error("--window-size must be between 2 and 18")
@@ -71,7 +81,8 @@ def parse_args(argv=None):
     if args.rpe_delta_frames < 1:
         parser.error("--rpe-delta-frames must be >= 1")
     for key in ("data_root", "val_set", "model", "output_dir"):
-        setattr(args, key, getattr(args, key).expanduser().resolve())
+        if getattr(args, key) is not None:
+            setattr(args, key, getattr(args, key).expanduser().resolve())
     if args.recompute_tcp_metrics_from is not None:
         args.recompute_tcp_metrics_from = args.recompute_tcp_metrics_from.expanduser().resolve()
         if args.resume or args.dry_run or args.episodes or args.cameras or args.max_episodes or args.max_frames:
@@ -131,12 +142,13 @@ def digest(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
-def make_config(args, dtype) -> dict:
+def make_config(args, dtype, jobs=None) -> dict:
     sources = (Path(__file__).resolve(), Path(__file__).resolve().with_name("metrics.py"),
                REPO_ROOT / "droid_script/infer_4rc_stage1.py", REPO_ROOT / "tcp_sliding_window_inference.py",
                REPO_ROOT / "arc/models/arc/arc.py", REPO_ROOT / "arc/models/arc/utils/transform.py")
     return {"schema_version": SCHEMA_VERSION, "data_root": str(args.data_root),
-            "val_set": str(args.val_set), "val_set_sha256": hashlib.sha256(args.val_set.read_bytes()).hexdigest(),
+            "val_set": str(args.val_set) if args.val_set is not None else None,
+            "val_set_sha256": hashlib.sha256(args.val_set.read_bytes()).hexdigest() if args.val_set is not None else None,
             "model": file_identity(stage1.weight_file(args.model)), "window_size": args.window_size,
             "max_frames": args.max_frames, "max_episodes": args.max_episodes,
             "episodes": sorted(set(args.episodes or [])), "cameras": sorted(set(args.cameras or [])),
@@ -191,6 +203,12 @@ def read_labels(episode) -> tuple[np.ndarray, np.ndarray]:
     for key, value in expected.items():
         if metadata.get(key) != value:
             raise ValueError(f"Unsupported TCP {key}: {metadata.get(key)!r}")
+    return read_label_arrays(episode)
+
+
+def read_label_arrays(episode) -> tuple[np.ndarray, np.ndarray]:
+    """Common camera-coordinate TCP, rigid extrinsic and optical-axis depth checks."""
+    path = episode.path / "TCP" / episode.camera
     states = np.load(path / "state.npy", allow_pickle=False, mmap_mode="r")
     if states.shape != (len(episode.image_paths), 7):
         raise ValueError(f"Expected TCP [{len(episode.image_paths)},7], got {states.shape}")
@@ -531,10 +549,16 @@ def recompute_tcp_metrics(args) -> dict:
     return summary
 
 
-def run(args) -> dict | None:
+def run(args, *, discover_jobs_fn=None, read_labels_fn=None,
+        make_config_fn=None, camera_fingerprint_fn=None) -> dict | None:
+    """Run the shared evaluator with optional dataset adapters; DROID is the default."""
+    discover_jobs_fn = discover_jobs if discover_jobs_fn is None else discover_jobs_fn
+    read_labels_fn = read_labels if read_labels_fn is None else read_labels_fn
+    make_config_fn = make_config if make_config_fn is None else make_config_fn
+    camera_fingerprint_fn = camera_fingerprint if camera_fingerprint_fn is None else camera_fingerprint_fn
     if args.recompute_tcp_metrics_from is not None:
         return recompute_tcp_metrics(args)
-    jobs = discover_jobs(args)
+    jobs = discover_jobs_fn(args)
     rank, world_size = int(os.environ.get("RANK", "0")), int(os.environ.get("WORLD_SIZE", "1"))
     if args.dry_run:
         if rank == 0:
@@ -556,7 +580,7 @@ def run(args) -> dict | None:
         torch.cuda.set_device(device)
     dtype = stage1.resolve_dtype(args.dtype, device)
     torch.manual_seed(42)
-    config = make_config(args, dtype)
+    config = make_config_fn(args, dtype, jobs)
     # Initialize before loading weights so an early error propagates to other ranks.
     if world_size > 1:
         torch.distributed.init_process_group("nccl", timeout=timedelta(hours=24))
@@ -581,24 +605,24 @@ def run(args) -> dict | None:
             try:
                 if "discovery_error" in job:
                     raise ValueError(job["discovery_error"])
-                fingerprint = camera_fingerprint(job, config)
+                fingerprint = camera_fingerprint_fn(job, config)
                 if args.resume and result_path.is_file():
-                    saved = json.loads(result_path.read_text())
-                    if saved.get("fingerprint") == fingerprint and saved.get("status") in ("complete", "skipped"):
-                        if saved["status"] == "skipped":
-                            print(f"{tag}: cached skip", flush=True)
-                            continue
-                        try:
+                    try:
+                        saved = json.loads(result_path.read_text())
+                        if saved.get("fingerprint") == fingerprint and saved.get("status") in ("complete", "skipped"):
+                            if saved["status"] == "skipped":
+                                print(f"{tag}: cached skip", flush=True)
+                                continue
                             with np.load(directory / "frames.npz", allow_pickle=False) as cached:
                                 # Touch every array so corrupt/incomplete ZIP members trigger a retry.
                                 for key in cached.files:
                                     cached[key]
                             print(f"{tag}: cached", flush=True)
                             continue
-                        except (OSError, ValueError, EOFError, BadZipFile):
-                            pass
+                    except (OSError, ValueError, EOFError, BadZipFile):
+                        pass
                 episode = stage1.load_episode(Path(job["path"]), job["camera"])
-                states, extrinsic = read_labels(episode)
+                states, extrinsic = read_labels_fn(episode)
                 _, visible = project_positions(states[:, :3], episode.intrinsics)
                 if np.any(visible[:-1]) and model is None:
                     print(f"{tag}: loading {args.model}", flush=True)
