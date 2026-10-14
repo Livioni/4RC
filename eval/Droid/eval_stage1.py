@@ -35,13 +35,13 @@ from droid_script import infer_4rc_stage1 as stage1
 from eval.Droid.metrics import (
     DEPTH_COLUMNS, DEPTH_RANGES, RAY_COLUMNS, TCP_TRACKING_SAMPLE_KEYS, TCP_TRAJECTORY_KEYS,
     camera_macro, depth_statistics, frame_errors,
-    project_positions, ray_statistics, ray_target, summarize_depth, summarize_errors, summarize_ray,
+    project_positions, ray_statistics, ray_target, summarize_depth, summarize_median_aligned_depth, summarize_errors, summarize_ray,
     summarize_tcp_trajectory, tcp_trajectory_definitions, tcp_trajectory_errors,
     summarize_tcp_tracking, tcp_tracking_definitions, tcp_tracking_samples,
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 MASK_POLICY = "GT-visible AND prediction-visible AND finite GT state (absolute and Sim(3) metric families)"
 
 
@@ -300,6 +300,7 @@ def evaluate_camera(model, episode, states, extrinsic, args, device, dtype, prog
               "gt_tcp_uv": gt_uv[frame_indices], "ray_stats": np.zeros((n, len(RAY_COLUMNS)))}
     for name in DEPTH_RANGES:
         arrays[f"depth_stats_{name}"] = np.zeros((n, len(DEPTH_COLUMNS)))
+        arrays[f"depth_median_align_stats_{name}"] = np.zeros((n, len(DEPTH_COLUMNS)))
     query = stage1.validate_query(gt_uv[first]).copy()
     initial_query = query.copy()
     query_source = {"kind": "initial_gt", "frame_index": first}
@@ -339,6 +340,7 @@ def evaluate_camera(model, episode, states, extrinsic, args, device, dtype, prog
             cropped = prediction["depth"][local, 1:-1, 1:-1]
             for name, limit in DEPTH_RANGES.items():
                 arrays[f"depth_stats_{name}"][slot] = depth_statistics(cropped, depth, limit)
+                arrays[f"depth_median_align_stats_{name}"][slot] = depth_statistics(cropped, depth, limit, median_align=True)
             ray_gt, ray_mask = ray_targets[ray_shape]
             arrays["ray_stats"][slot] = ray_statistics(prediction["ray"][local], ray_gt, ray_mask)
         records.append({"window_index": wi, "frame_indices": frame_indices[start:end].tolist(),
@@ -379,7 +381,9 @@ def evaluate_camera(model, episode, states, extrinsic, args, device, dtype, prog
               "initial_query": {"frame_index": first, "source": "projected GT TCP", "tcp_query_points_px": initial_query.tolist()},
               "windows": records, "frame_metrics": metrics, "tcp_trajectory_alignment": alignment,
               "tracking_metrics": summarize_tcp_tracking(tracking_arrays),
-              "depth_metrics": {name: summarize_depth(arrays[f"depth_stats_{name}"]) for name in DEPTH_RANGES},
+              "depth_metrics": {name: {**summarize_depth(arrays[f"depth_stats_{name}"]),
+                  **summarize_median_aligned_depth(arrays[f"depth_median_align_stats_{name}"],
+                                                   arrays[f"depth_stats_{name}"])} for name in DEPTH_RANGES},
               "ray_metrics": summarize_ray(arrays["ray_stats"])}
     return result, arrays
 
@@ -398,6 +402,7 @@ def summarize_run(args, jobs, config, source_output_dir: Path | None = None) -> 
     trajectory_alignments = []
     tracking_samples = {key: [] for key in TCP_TRACKING_SAMPLE_KEYS}
     depth_stats = {name: [] for name in DEPTH_RANGES}
+    aligned_depth_stats = {name: [] for name in DEPTH_RANGES}
     ray_stats = []
     for index, job in enumerate(jobs, 1):
         directory = (source_output_dir or args.output_dir) / "cameras" / job["episode"] / job["camera"]
@@ -434,6 +439,8 @@ def summarize_run(args, jobs, config, source_output_dir: Path | None = None) -> 
                         pooled_errors.setdefault(key[6:], []).append(arrays[key].copy())
                 for name in DEPTH_RANGES:
                     depth_stats[name].append(arrays[f"depth_stats_{name}"].copy())
+                    if f"depth_median_align_stats_{name}" in arrays:
+                        aligned_depth_stats[name].append(arrays[f"depth_median_align_stats_{name}"].copy())
                 ray_stats.append(arrays["ray_stats"].copy())
         if source_output_dir is not None:
             stage1.write_json_atomic(record, args.output_dir / "cameras" / job["episode"] / job["camera"] / "metrics.json")
@@ -460,6 +467,10 @@ def summarize_run(args, jobs, config, source_output_dir: Path | None = None) -> 
         for aggregation in ("camera_macro", "pixel_micro"):
             metrics = (camera_macro([r["depth_metrics"][name] for r in complete]) if aggregation == "camera_macro"
                        else summarize_depth(concatenate(depth_stats[name], len(DEPTH_COLUMNS))))
+            if aggregation == "pixel_micro" and len(aligned_depth_stats[name]) == len(complete):
+                metrics.update(summarize_median_aligned_depth(
+                    concatenate(aligned_depth_stats[name], len(DEPTH_COLUMNS)),
+                    concatenate(depth_stats[name], len(DEPTH_COLUMNS))))
             global_depth.append({"depth_range": name, "aggregation": aggregation, **metrics})
     global_ray = [{"aggregation": "camera_macro", **camera_macro([r["ray_metrics"] for r in complete])},
                   {"aggregation": "ray_micro", **summarize_ray(concatenate(ray_stats, len(RAY_COLUMNS)))}]
@@ -505,6 +516,7 @@ def summarize_run(args, jobs, config, source_output_dir: Path | None = None) -> 
                    "gripper": "continuous [0,1], accuracy threshold=0.5", "initial_frame_included": True,
                    "visibility": "geometric projection with GT K into 320x180 RGB; not an occlusion test",
                    "depth_log_epsilon_m": 1e-5, "silog": "100 * sqrt(mean(log_error^2) - mean(log_error)^2)",
+                   "depth_median_alignment": "per frame and depth range: scale = median(GT) / median(pred) over GT-valid pixels; nonpositive prediction median is undefined; median_align_* scores exclude undefined frames",
                    "depth_delta": "max(pred/GT, GT/pred) < 1.25**k; nonpositive predictions fail",
                    "depth_stat_columns": list(DEPTH_COLUMNS), "ray_stat_columns": list(RAY_COLUMNS),
                    "macro": "equal camera-stream weight; counts sum; null metrics excluded",

@@ -72,7 +72,7 @@ TCP 元数据中的 `OpenCV (...)` 和 `OpenCV camera (...)` 视为相同坐标�
 
 ## 与 Droid 一致的指标
 
-直接复用 [Droid 指标实现](../Droid/metrics.py) 和测评主流程。
+直接复用 [Droid 指标实现](../Droid/metrics.py) 和测评主流程，包含逐帧深度中位数尺度对齐的 `median_align_*` 指标；计算口径见 [Droid Depth 说明](../Droid/README_CN.md#depth)。
 完整字段、公式、阈值和边界条件见 [Droid 指标说明](../Droid/README_CN.md#指标与单位)：
 
 - TCP 相机/基座位置与姿态、各轴误差、重投影、夹爪开度/准确率、联合位姿阈值和 confidence。

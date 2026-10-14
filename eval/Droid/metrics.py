@@ -257,7 +257,8 @@ def rotation_error_deg(prediction: np.ndarray, target: np.ndarray) -> np.ndarray
     return np.rad2deg(np.arctan2(np.linalg.norm(skew, axis=-1) / 2, cosine))
 
 
-def depth_statistics(prediction: np.ndarray, target: np.ndarray, max_depth: float | None) -> np.ndarray:
+def depth_statistics(prediction: np.ndarray, target: np.ndarray, max_depth: float | None,
+                     *, median_align: bool = False) -> np.ndarray:
     """Sufficient statistics over GT-valid pixels; negative predictions stay in errors."""
     prediction, target = np.asarray(prediction, dtype=np.float64), np.asarray(target, dtype=np.float64)
     if prediction.shape != target.shape:
@@ -268,6 +269,13 @@ def depth_statistics(prediction: np.ndarray, target: np.ndarray, max_depth: floa
     p, g = prediction[mask], target[mask]
     if not np.isfinite(p).all():
         raise ValueError("Nonfinite depth prediction at a GT-valid pixel")
+    if median_align and len(g):
+        median = float(np.median(p))
+        if median <= 0:
+            return np.zeros(len(DEPTH_COLUMNS), dtype=np.float64)
+        p = p * (np.median(g) / median)
+        if not np.isfinite(p).all():
+            raise ValueError("Nonfinite median-aligned depth prediction")
     error = p - g
     safe_p = np.maximum(p, LOG_EPS)
     log_error = np.log(safe_p) - np.log(g)
@@ -279,6 +287,14 @@ def depth_statistics(prediction: np.ndarray, target: np.ndarray, max_depth: floa
         *[np.count_nonzero((p > 0) & (ratio < 1.25**k)) for k in (1, 2, 3)],
         np.count_nonzero(p <= 0),
     ], dtype=np.float64)
+
+
+def summarize_median_aligned_depth(statistics: np.ndarray, absolute: np.ndarray) -> dict:
+    """Prefix aligned scores and expose frames with an undefined positive scale."""
+    result = {f"median_align_{key}": value for key, value in summarize_depth(statistics).items()}
+    result["median_align_undefined_frame_count"] = int(
+        np.count_nonzero(np.asarray(absolute)[:, 0]) - result["median_align_valid_frame_count"])
+    return result
 
 
 def summarize_depth(statistics: np.ndarray) -> dict:

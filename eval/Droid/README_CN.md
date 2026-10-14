@@ -113,6 +113,17 @@ GT 来自 `depths/<camera>/<frame>.png`，毫米除以 1000 转为米；
 `all_valid`（有限 `GT > 0`）。非正预测不从误差中删除，delta 判为失败，
 仅对数计算将其截到 `1e-5m`。没有有效像素时，误差为 `null`。
 
+另外默认输出 `median_align_*` 指标（如 `median_align_abs_rel`、
+`median_align_rmse_m`、`median_align_delta1/2/3`），覆盖上表所有深度指标。
+每个有效帧、每个深度范围独立在同一组 GT 有效像素上计算
+`scale = median(GT) / median(pred)`，再用 `pred * scale` 计分。
+预测中位数非正时，该帧不参与对齐指标，并计入
+`median_align_undefined_frame_count`；无有效像素时不计为对齐失败。
+对齐后仍保留非正预测的误差。相机内及 `pixel_micro` 合并对齐后的像素累计量，
+`camera_macro` 对各相机指标等权平均。JSON 和现有 depth CSV 均包含新增字段，
+`frames.npz` 保存 `depth_median_align_stats_<range>`。
+旧缓存没有这些累计量，不能通过 TCP 离线补算获得对齐深度指标，需要重新推理。
+
 ### Camera
 
 - `camera_translation_m_*`：预测和 GT 的 **world-to-camera** 平移向量 L2 误差，符合训练监督约定。
