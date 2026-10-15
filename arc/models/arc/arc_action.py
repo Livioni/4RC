@@ -263,6 +263,7 @@ class TCPActionPolicy(nn.Module):
             raise ValueError("global_token_grid must contain two positive dimensions")
         self.arc, self.num_arms = arc, 2
         self.decode_camera = False
+        self.decode_geometry = True
         self.prediction_horizon, self.padding = prediction_horizon, tuple(padding)
         self.language_encoder = language_encoder if language_encoder is not None else FrozenT5Encoder(t5_model, text_max_length)
         self.language_encoder.requires_grad_(False).eval()
@@ -341,6 +342,7 @@ class TCPActionPolicy(nn.Module):
         prediction = self.arc(
             [{"img": frame} for frame in images.unbind(1)],
             inference_track=False, decode_camera=self.decode_camera, decode_motion=False,
+            decode_geometry=self.decode_geometry,
             decode_tcp=True, tcp_query_points=initial_query_points,
             return_aux_pyramid=False, return_backbone_features=True,
             force_no_output_conversion=True, ref_view_strategy="first",

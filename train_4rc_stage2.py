@@ -85,6 +85,11 @@ def validate_config(config, *, eval_only=False):
     config = dict(config)
     configure_action_normalization(config)
     require_action_head_config(config)
+    config.setdefault("decode_geometry", True)
+    if not isinstance(config["decode_geometry"], bool):
+        raise ValueError("decode_geometry must be a boolean")
+    if not config["decode_geometry"] and config["geometry_loss_weight"] != 0:
+        raise ValueError("decode_geometry=False requires geometry_loss_weight=0")
     config.setdefault("enable_validation", False)
     if not isinstance(config["enable_validation"], bool):
         raise ValueError("enable_validation must be a boolean")
@@ -203,6 +208,7 @@ def build_policy(config):
         wrist_pretrained=not bool(resume), wrist_encoder_config=config.get("wrist_encoder_config"),
         wrist_cache_dir=config.get("wrist_cache_dir"),
     )
+    policy.decode_geometry = config.get("decode_geometry", True)
     config["wrist_encoder_config"] = policy.wrist_encoder.encoder.config.to_dict()
     if resume:
         load_model_weights(policy, resume)
@@ -295,8 +301,10 @@ def compute_losses(prediction, batch, geometry, tcp, config):
     reconstruction = prediction["reconstruction"]
     # Camera inverses and geometry supervision must not inherit BF16 autocast.
     with torch.autocast(device_type=batch["images"].device.type, enabled=False):
-        geometry_batch = prepare_geometry_batch(dict(batch), reconstruction, normalize=False)
-        geometry_loss = geometry(reconstruction, geometry_batch)
+        geometry_loss = {"objective": batch["images"].new_zeros(())}
+        if config["geometry_loss_weight"] != 0:
+            geometry_batch = prepare_geometry_batch(dict(batch), reconstruction, normalize=False)
+            geometry_loss = geometry(reconstruction, geometry_batch)
         tcp_loss = tcp(reconstruction, batch)
         action_loss = flow_matching_loss(
             prediction, position_weight=config["action_position_weight"],
@@ -374,7 +382,9 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
                     for name, value in action_metric_sums(prediction, batch["future_actions"], batch.get("future_action_valid")).items():
                         totals[label][name] += float(value)
         with torch.autocast(device_type=accelerator.device.type, enabled=False):
-            geometry_loss = geometry(reconstruction, prepare_geometry_batch(dict(batch), reconstruction))
+            geometry_loss = {}
+            if config.get("decode_geometry", True):
+                geometry_loss = geometry(reconstruction, prepare_geometry_batch(dict(batch), reconstruction))
             tcp_loss = tcp(reconstruction, batch)
         for prefix, losses in (("geometry", geometry_loss), ("tcp", tcp_loss)):
             for name, value in losses.items():
@@ -564,7 +574,7 @@ def main():
                 accelerator.log(metrics, step=global_step)
                 if global_step % config["log_every_steps"] == 0:
                     progress.set_postfix(loss=f"{metrics['objective']:.4f}")
-                if accelerator.is_main_process and config["visualize_every_steps"] > 0 and global_step % config["visualize_every_steps"] == 0:
+                if config.get("decode_geometry", True) and accelerator.is_main_process and config["visualize_every_steps"] > 0 and global_step % config["visualize_every_steps"] == 0:
                     save_depth_preview(root / "visuals" / f"step-{global_step:08d}.png", batch, prediction["reconstruction"])
                 if validation_enabled and config["validate_every_steps"] > 0 and global_step % config["validate_every_steps"] == 0:
                     run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)

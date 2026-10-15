@@ -1,19 +1,16 @@
-"""V2 adjust-bottle: independent full configuration, 4 history frames and 32 actions."""
-
 # ======================================================
-# 4RC Geometry + TCP Tracking + Action Configuration
+# 4RC TCP Tracking + Action Configuration (no geometry decoding)
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-stage2-action-adjust-bottle"
-wandb_run_name = "4rc-stage2-action-adjust-bottle"
+output_dir = "outputs/4rc-stage2-gr00t"
+wandb_run_name = "4rc-stage2-gr00t"
 logging_dir = "logs"
 stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"  # Shared visual/TCP initialization for every new run.
 resume = None  # Full-state resume of a V2 run only.
 
 # == Dataset Configuration ==
-tasks = ["adjust_bottle"]  # All tasks; applies to every enabled source, for training and validation.
-# tasks = ["adjust_bottle", "stack_blocks_two"]  # Exact task directory names.
+tasks = ["adjust_bottle"]  # Applies to every enabled source, for training and validation.
 # Relative sampling weights are normalized over enabled sources. A zero weight
 # skips the source entirely, including task-directory checks.
 # To mix standard/randomized RoboTwin at 1:2, set their weights to 1.0 / 2.0.
@@ -35,7 +32,7 @@ data_sources = (
 view = "third_views"
 history_frames = 4  # Repeat the oldest observed frame if history is short.
 prediction_horizon = 32  # Future padding is masked in attention and loss.
-batch_size = 3  # Per GPU; each sample contains history_frames input images.
+batch_size = 8  # Per GPU; each sample contains history_frames input images.
 # Step indices encode observation order; repeated frames keep their source timestamps.
 # The action adapter requires forward windows within one valid segment. The runner derives
 # these image budgets and intervals again from batch_size / history_frames.
@@ -81,7 +78,8 @@ wrist_cache_dir = ".cache/huggingface"
 action_normalization = "componentwise"
 action_normalization_version = 2
 train_backbone = True
-train_geometry_head = True
+train_geometry_head = False
+decode_geometry = False  # Skip the geometry head in training and validation.
 train_motion_decoder = True  # Shared sparse TCP decoder; dense tracking is not run.
 train_query_encoder = True
 train_tcp_head = True
@@ -103,7 +101,7 @@ sampling_steps = 4
 # == History TCP Condition Curriculum ==
 # Choose GT/recovered history per clip. Linearly interpolate over optimizer
 # updates from 100% GT to 50% GT / 50% recovered; resume uses cumulative steps.
-history_tcp_gt_initial_ratio = 1.0
+history_tcp_gt_initial_ratio = 0.5
 history_tcp_gt_final_ratio = 0.5
 
 # == Training Configuration ==
@@ -117,8 +115,8 @@ find_unused_parameters = True
 
 # == Optimizer Configuration ==
 # Each module has an independent rate. A False train flag or zero LR freezes it.
-lr_backbone = 1e-5
-lr_head = 2e-5
+lr_backbone = 1e-4
+lr_head = 0.0
 lr_motion_decoder = 1e-5
 lr_query_encoder = 1e-4
 lr_tcp_head = 1e-4
@@ -135,8 +133,8 @@ warmup_steps = 1000
 eta_min_factor = 0.1
 
 # == Loss Configuration ==
-geometry_loss_weight = 0.5
-tcp_loss_weight = 0.5
+geometry_loss_weight = 0.0
+tcp_loss_weight = 0.2
 action_loss_weight = 1.0
 
 depth_loss_weight = 1.0
@@ -158,7 +156,7 @@ action_gripper_weight = 1.0
 
 # == Logging and Checkpoint Configuration ==
 log_every_steps = 10
-visualize_every_steps = 5_000
+visualize_every_steps = 0  # No decoded depth to visualize.
 checkpointing_steps = 10_000
 save_each_epoch = False
-report_to = ["tensorboard"]
+report_to = ["tensorboard","wandb"]
