@@ -10,6 +10,7 @@ import torch
 
 from arc.action import future_actions_in_current_camera, project_tcp
 from arc.action_normalization import iter_future_action_rows
+from arc.state_normalization import read_robot_states, validate_robot_states
 from .robotwin import RoboTwin4RC
 from .mixture import DatasetSource, WeightedDatasetMixture
 from .utils.wrist import load_wrist_images
@@ -21,8 +22,8 @@ class NoActionEpisodes(RuntimeError):
 
 class RoboTwinActionDataset(RoboTwin4RC):
     def __init__(
-        self, root, *, history_frames=8, prediction_horizon=16, split="train",
-        validation_fraction=0.1, split_key="robotwin", use_wrist_condition=False, **options,
+        self, root, *, history_frames=4, prediction_horizon=32, split="train",
+        validation_fraction=0.1, split_key="robotwin", **options,
     ):
         if history_frames < 1 or prediction_horizon < 1:
             raise ValueError("History and prediction horizons must be positive")
@@ -31,7 +32,6 @@ class RoboTwinActionDataset(RoboTwin4RC):
         self.history_frames = int(history_frames)
         self.prediction_horizon = int(prediction_horizon)
         self.split = split
-        self.use_wrist_condition = bool(use_wrist_condition)
         super().__init__(
             # Discover short episodes/segments too; repeated oldest frames fill
             # the history. The action sampler below still returns exactly H views.
@@ -40,7 +40,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
             **options,
         )
         self.min_views = self.max_views = self.history_frames
-        kept, starts, instructions, moments = [], [], [], []
+        kept, starts, instructions = [], [], []
         for episode in self.episodes:
             key = f"{split_key}/{episode.task}/{episode.name}"
             fraction = int(hashlib.sha256(key.encode()).hexdigest()[:16], 16) / 2**64
@@ -80,7 +80,9 @@ class RoboTwinActionDataset(RoboTwin4RC):
             extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy")
             if not np.isfinite(extrinsics).all():
                 raise ValueError(f"Invalid camera extrinsics in {episode.path}")
-            moments.append(self._action_moments(states, extrinsics, possible, episode.valid_segments))
+            robot_states = read_robot_states(episode.path, episode.num_frames)
+            anchors = possible + history_frames - 1
+            validate_robot_states(robot_states[anchors])
             kept.append(episode)
             starts.append(possible)
             instructions.append(texts)
@@ -88,15 +90,6 @@ class RoboTwinActionDataset(RoboTwin4RC):
             raise NoActionEpisodes(f"No {split} action episodes below {self.root}")
         self.episodes, self.starts, self.instructions = kept, starts, instructions
         self._episode_indices = {episode.path: i for i, episode in enumerate(kept)}
-        # The sampler draws episodes uniformly within a source. Statistics use
-        # the same distribution over episodes, anchors and future offsets.
-        mean = np.mean([item[0] for item in moments], axis=0)
-        second = np.mean([item[1] for item in moments], axis=0)
-        self.tcp_position_mean = torch.tensor(mean, dtype=torch.float32)
-        self.tcp_position_std = torch.tensor(
-            np.maximum(second - mean**2, 1e-6) ** 0.5, dtype=torch.float32,
-        )
-        # These adapter statistics belong ONLY to the new action head.
         self.invalid_transition_count = sum(e.invalid_transition_count for e in kept)
         self.segmented_episode_count = sum(e.invalid_transition_count > 0 for e in kept)
         task_text = {episode.task: texts[0] for episode, texts in zip(kept, instructions)}
@@ -111,6 +104,13 @@ class RoboTwinActionDataset(RoboTwin4RC):
             for name in ("left_state.npy", "right_state.npy")
         ], axis=1)
 
+    def iter_current_robot_states(self):
+        for episode, starts in zip(self.episodes, self.starts):
+            states = read_robot_states(episode.path, episode.num_frames)
+            anchors = np.unique(starts + self.history_frames - 1)
+            for begin in range(0, len(anchors), 8192):
+                yield np.asarray(states[anchors[begin:begin + 8192]], dtype=np.float32)
+
     def iter_action_targets(self):
         """All eligible window labels, with no image loading or padding."""
         for episode, starts in zip(self.episodes, self.starts):
@@ -121,28 +121,6 @@ class RoboTwinActionDataset(RoboTwin4RC):
             yield from iter_future_action_rows(
                 self._read_states(episode), extrinsics, anchors, segment_ends, self.prediction_horizon,
             )
-
-    def _action_moments(self, states, extrinsics, starts, segments):
-        anchors = starts + self.history_frames - 1
-        ends = np.array([next(end for start, end in segments if start <= anchor < end)
-                         for anchor in anchors])
-        lengths = np.minimum(ends - anchors - 1, self.prediction_horizon)
-        total = np.zeros((len(anchors), 2, 3), dtype=np.float64)
-        square = np.zeros_like(total)
-        for offset in range(1, self.prediction_horizon + 1):
-            valid = offset <= lengths
-            selected = anchors[valid]
-            current = extrinsics[selected].astype(np.float64)
-            future = extrinsics[selected + offset].astype(np.float64)
-            rotation = current[:, :3, :3] @ future[:, :3, :3].transpose(0, 2, 1)
-            translation = current[:, :3, 3] - np.einsum("nij,nj->ni", rotation, future[:, :3, 3])
-            position = np.einsum(
-                "nij,naj->nai", rotation, states[selected + offset, :, :3],
-            ) + translation[:, None]
-            total[valid] += position
-            square[valid] += np.square(position)
-        # Match uniform anchor sampling; each anchor averages only real offsets.
-        return (total / lengths[:, None, None]).mean(0), (square / lengths[:, None, None]).mean(0)
 
     def _rng(self, index, sample_seed=None):
         # Sampler seeds already encode the epoch. Persistent workers must not
@@ -213,10 +191,11 @@ class RoboTwinActionDataset(RoboTwin4RC):
         return sample
 
     def _extra_sample_fields(self, episode, frame_indices, augmentation):
-        if not self.use_wrist_condition:
-            return {}
         transform = None if augmentation is None else partial(self._apply_augmentation, params=augmentation)
-        return {"wrist_images": load_wrist_images(episode.path, frame_indices[-1], transform=transform)}
+        state = np.array(read_robot_states(episode.path, episode.num_frames)[frame_indices[-1]], dtype=np.float32)
+        validate_robot_states(state[None])
+        return {"wrist_images": load_wrist_images(episode.path, frame_indices[-1], transform=transform),
+                "current_robot_state": torch.from_numpy(state)}
 
     def manifest(self):
         return [
@@ -251,7 +230,7 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
                 root, history_frames=config["history_frames"],
                 prediction_horizon=config["prediction_horizon"], split=split,
                 validation_fraction=config.get("validation_fraction", 0.1),
-                split_key=source["name"], use_wrist_condition=config.get("use_wrist_condition", False), **options,
+                split_key=source["name"], **options,
             )
         except NoActionEpisodes:
             if split == "validation":

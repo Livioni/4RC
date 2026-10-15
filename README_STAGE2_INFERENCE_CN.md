@@ -1,12 +1,12 @@
 # Stage2 整段滑窗推理
 
 `stage2_sliding_window_inference.py` 独立加载完整 Stage2 策略，不导入 Stage1 推理脚本或训练入口。
-默认 checkpoint 为 `checkpoints/RoboTwin-Stage2/90000`，模型结构、历史帧数和预测长度来自该目录的 `config.json`。
-加载器只接受 `language_conditioning="film"`、`action_normalization="componentwise"`、
-`action_normalization_version=2` 的 checkpoint。旧 cross-attention / v1 模型需从 Stage1 重新训练。
-`action_norm.json` 中的 offset/scale 必须与模型 buffers 一致：XYZ 使用带跨度保护的分位数缩放，
-rotation6D 和夹爪不做额外缩放。RoboTwin FourRC 评测要求腕部条件和 3072 维 concat 全局特征。
-运行时请用 `--checkpoint` 指定新训练的模型目录。
+默认 checkpoint 为 `outputs/4rc-stage2-v2/final_checkpoint`，模型结构、历史帧数和预测长度来自该目录的 `config.json`。
+加载器只接受 `action_head_type="groot_tcp_v1"` 的新版双臂策略，旧 Stage2 需从 Stage1 重新训练。
+必须保留 `action_norm.json`、`state_norm.json`，其中 offset/scale 与模型 buffers 一致。
+动作仅缩放 XYZ，真实关节 state 独立归一化。每次推理均读取最后观测帧的真实
+`robot_state.npy [T,14]`，顺序为左臂 6 关节、左夹爪、右臂 6 关节、右夹爪。
+缺失或非有限 state 明确报错；两个 state 夹爪必须在 `[0,1]`。
 
 ## 运行
 
@@ -30,7 +30,7 @@ python stage2_sliding_window_inference.py \
   --headless --output-dir outputs/stage2_shoes
 ```
 
-输入 episode 需要 `images/<view>/`、`intrinsics/<view>.npy`、`extrinsics/<view>.npy`、`metadata.json`。
+输入 episode 需要 `images/<view>/`、`intrinsics/<view>.npy`、`extrinsics/<view>.npy`、`metadata.json`、`robot_state.npy` 和当前左右腕图像。
 RGB 必须为 320×240，文件名以连续帧号结尾。元数据提供正数 `frequency_hz`；任务文字默认取
 `instructions` 第一条非空字符串，也可用 `--instruction` 覆盖。脚本不读取真实 depth。
 
@@ -41,9 +41,9 @@ RGB 必须为 320×240，文件名以连续帧号结尾。元数据提供正数 
 
 | 参数 | 默认值 / 含义 |
 | --- | --- |
-| `--checkpoint` | `checkpoints/RoboTwin-Stage2/90000`，包含完整权重与配置 |
+| `--checkpoint` | `outputs/4rc-stage2-v2/final_checkpoint`，包含完整权重与配置 |
 | `--window-stride` | 默认 1，每帧预测；范围 1～历史长度减一。大于 1 时只播放实际预测帧 |
-| `--sampling-steps` | checkpoint 配置，当前为 8 |
+| `--sampling-steps` | checkpoint 配置，默认 4；可设 8 比较 |
 | `--seed` | 42；第 i 个窗口使用 seed+i |
 | `--device` / `--dtype` | auto；CUDA 自动选择 BF16/FP16，CPU 使用 FP32 |
 | `--t5-model` | 可指定本地 T5-base 目录；默认使用配置中的模型及本地缓存 |
@@ -63,26 +63,26 @@ RGB 必须为 320×240，文件名以连续帧号结尾。元数据提供正数 
 
 ## 时间、坐标和真值
 
-当 checkpoint 的 `use_wrist_condition=True` 时，每个窗口还会读取最后观测帧
+每个窗口读取最后观测帧
 对应的 `images/left_view/XXXXXX.png` 和 `images/right_view/XXXXXX.png`（320×240）。
 冻结 DINOv2 Giant 编码后，将每侧 266 个 patches 放在第三人称全图条件之后。
 预处理与训练一致：缩至 256×192，再反射填充到 266×196；不读取未来腕部图片。
 encoder 权重和架构从 checkpoint 恢复，无需额外下载。缺图或尺寸错误会报错。
-现有未开启腕部条件的 checkpoint 沿用原输入方式。
 
-窗口和预测长度来自 checkpoint 配置，新训练默认输入 8 帧、预测后续 16 条动作记录。
-默认从第 0 帧开始逐帧预测，每次仅使用当前帧及之前的观测，与训练一样重复最早帧补足 8 帧：
-第 0 帧输入 `[0,0,0,0,0,0,0,0]`，预测 1～16；第 1 帧输入 `[0,0,0,0,0,0,0,1]`，
-预测 2～17；第 7 帧输入 0～7，预测 8～23。单帧 episode 也可推理，历史断帧仍会报错。
-`--window-stride 7` 可改为在 0、7、14……帧预测，并补上 episode 末帧；播放也只显示这些预测帧。
+默认输入 4 帧、预测后续 32 条动作记录。从第 0 帧开始逐帧预测，每次只使用当前帧及历史：
+第 0 帧输入 `[0,0,0,0]`，预测 1～32；第 1 帧输入 `[0,0,0,1]`，预测 2～33；
+第 3 帧输入 0～3，预测 4～35。短历史重复最早帧；真实 state 与左右腕始终取当前锚点。
+`--window-stride 3` 可在 0、3、6……帧预测，并补上末帧。
 
-Stage2 统一只编码历史和未来的序号，不规定动作执行频率。返回
-`future_step_indices`（1～16）及用于真值对齐的 `future_frame_indices`，不返回
-预测目标秒数 `future_frame_times`。JSON `format_version=3`，采集频率记录为
-`source_frequency_hz`，不表示动作执行频率。末尾仍预测完整长度，缺失真值使用有效掩码。
+DiT 主序列为 `[state ×1 | 历史 TCP ×72 | noisy action ×32]`，形状 `[B,105,1280]`。
+独立条件为 `[第三人称 ×266 | 左腕 ×266 | 右腕 ×266 | T5 ×L]`，形状 `[B,798+L,2048]`。
+12 层交替 cross/self attention，所有有效主序列 token 双向交互。
+同一次策略调用复用图像/T5 和条件 K/V，主序列每个去噪步重新计算。
 
-加载 checkpoint 时始终使用序号条件，不再切回旧物理时间模式。推理自动兼容 1536/3072 维
-全局输入；训练入口仍默认使用 3072 维 concat，1536 维旧权重不能直接用于新结构训练或 resume。
+返回 `future_step_indices`（1～32）与用于真值对齐的 `future_frame_indices`。
+JSON `format_version=3`，采集频率记录为 `source_frequency_hz`，不表示执行频率。
+末尾仍预测完整长度，缺失真值使用有效掩码。共享 backbone 始终使用 3072 维拼接全局特征，
+仅 action 条件分支空间降采样到 14×19，不保留旧输入结构的自动兼容逻辑。
 
 初始窗口由交互或真值选点初始化；历史仍从第 0 帧开始时复用初始选点。窗口起点向前移动后，
 使用上一窗口对新起始帧恢复出的 TCP，按相机内参投影传递；不会用预测的未来动作替代恢复结果，

@@ -28,7 +28,7 @@ import torch
 import torch.nn.functional as F
 
 
-DEFAULT_CHECKPOINT = Path("checkpoints/RoboTwin-Stage2-no-temporal/250000")
+DEFAULT_CHECKPOINT = Path("outputs/4rc-stage2-v2/final_checkpoint")
 WIDTH, HEIGHT = 320, 240
 PADDING = (1, 1, 6, 6)
 ARMS = ("left", "right")
@@ -99,7 +99,7 @@ def load_episode(input_path: Path, view: str, instruction: str | None = None) ->
                          extrinsics, float(rate), instruction.strip())
 
 
-def build_windows(num_frames: int, history_frames: int = 8, stride: int = 1) -> list[tuple[int, int]]:
+def build_windows(num_frames: int, history_frames: int = 4, stride: int = 1) -> list[tuple[int, int]]:
     """Schedule causal observation ranges, including the first and last frames."""
     if history_frames < 2 or not 1 <= stride < history_frames:
         raise ValueError("window stride must be between 1 and history_frames - 1")
@@ -196,49 +196,31 @@ def resolve_device_dtype(device_name: str, dtype_name: str) -> tuple[torch.devic
 
 def load_stage2_policy(checkpoint: Path, device: torch.device, *, t5_model: str | None = None):
     from arc.models.arc.arc import Arc
-    from arc.models.arc.arc_action import TCPActionPolicy
-    from safetensors import safe_open
+    from arc.models.arc.arc_action import TCPActionPolicy, require_action_head_config
     from safetensors.torch import load_model
     from arc.action_normalization import load_checkpoint_action_norm, assert_action_norm_matches
+    from arc.state_normalization import load_checkpoint_state_norm, assert_state_norm_matches
 
     checkpoint = checkpoint.expanduser()
     config = json.loads((checkpoint / "config.json").read_text(encoding="utf-8"))
+    require_action_head_config(config)
     if config.get("training_stage") != 2 or config.get("normalize_geometry", False):
-        raise ValueError("A metric-geometry Stage2 checkpoint is required")
+        raise ValueError("A metric-geometry V2 Stage2 checkpoint is required")
     action_norm = load_checkpoint_action_norm(checkpoint, 2)
-    if config.get("language_conditioning") != "film":
-        raise ValueError("Stage2 requires a FiLM checkpoint; start from Stage1")
-    arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
-    channels = arc.tcp_visual_query_encoder.embed_dim
-    weights_path = checkpoint / "model.safetensors"
-    # Old configs do not identify this architecture change. Inspect the saved
-    # projection shape without loading the full checkpoint twice.
-    with safe_open(str(weights_path), framework="pt", device="cpu") as weights:
-        key = "global_encoder.projection.1.weight"
-        if key not in weights.keys():
-            raise ValueError("Stage2 checkpoint has no global visual encoder; TCP-only checkpoints are unsupported")
-        shape = weights.get_slice(key).get_shape()
-    if shape == [config["action_dim"], channels]:
-        config["global_feature_mode"] = "cross_frame"
-    elif shape == [config["action_dim"], 2 * channels]:
-        config["global_feature_mode"] = "concat"
-    else:
-        raise ValueError(
-            f"Unsupported global visual projection shape {shape}; expected "
-            f"[{config['action_dim']}, {channels}] or [{config['action_dim']}, {2 * channels}]"
-        )
+    state_norm = load_checkpoint_state_norm(checkpoint)
+    arc = Arc(tcp_query_window_size=config["tcp_query_window_size"])
     policy = TCPActionPolicy(
-        arc,
-        t5_model=t5_model or config["t5_model"], text_max_length=config["text_max_length"],
+        arc, t5_model=t5_model or config["t5_model"], text_max_length=config["text_max_length"],
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
+        condition_dim=config["condition_dim"], output_dim=config["action_output_dim"],
+        dropout=config["action_dropout"], global_token_grid=config["global_token_grid"],
+        gradient_checkpointing=config["action_gradient_checkpointing"],
         prediction_horizon=config["prediction_horizon"],
-        global_feature_mode=config["global_feature_mode"],
-        use_wrist_condition=config.get("use_wrist_condition", False),
-        wrist_pretrained=False, wrist_encoder_config=config.get("wrist_encoder_config"),
+        wrist_pretrained=False, wrist_encoder_config=config["wrist_encoder_config"],
     )
-    # load_model restores omitted aliases of the geometry head's shared norms.
-    load_model(policy, str(weights_path), strict=True, device="cpu")
+    load_model(policy, str(checkpoint / "model.safetensors"), strict=True, device="cpu")
     assert_action_norm_matches(policy, action_norm)
+    assert_state_norm_matches(policy, state_norm)
     return policy.eval().requires_grad_(False).to(device), config
 
 
@@ -249,7 +231,7 @@ def _numpy(tensor: torch.Tensor) -> np.ndarray:
 @torch.inference_mode()
 def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
                         query_points: torch.Tensor, instruction: str,
-                        *, steps: int = 8, seed: int = 42,
+                        *, current_robot_state: torch.Tensor, steps: int = 4, seed: int = 42,
                         device: torch.device = torch.device("cpu"), dtype: torch.dtype = torch.float32,
                         wrist_images: torch.Tensor | None = None) -> dict:
     """Infer one window, reusing reconstruction features for the action condition.
@@ -261,6 +243,9 @@ def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
     if not instruction.strip():
         raise ValueError("Instruction is required")
     images, intrinsics, query_points = [value.to(device) for value in (images, intrinsics, query_points)]
+    if current_robot_state is None:
+        raise ValueError("V2 inference requires current_robot_state [B,14]")
+    current_robot_state = current_robot_state.to(device)
     if wrist_images is not None:
         wrist_images = wrist_images.to(device)
     if images.shape[0] != 1:
@@ -270,7 +255,7 @@ def infer_stage2_window(policy, images: torch.Tensor, intrinsics: torch.Tensor,
     with context:
         reconstruction, features = policy.reconstruct(images, query_points)
         condition = policy.make_condition(
-            images, intrinsics, [instruction], reconstruction, features, wrist_images=wrist_images,
+            images, intrinsics, [instruction], reconstruction, features, current_robot_state=current_robot_state, wrist_images=wrist_images,
         )
         actions = policy.sample_condition(condition, steps=steps, generator=generator)
     result = {
@@ -373,9 +358,14 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
     queries = validate_query_points(initial_queries)
     projected_queries = queries.copy()
     query_clipped = np.zeros(2, dtype=bool)
-    steps = config.get("sampling_steps", 8) if steps is None else steps
+    steps = config["sampling_steps"] if steps is None else steps
     if steps < 1:
         raise ValueError("sampling steps must be positive")
+    from arc.state_normalization import read_robot_states, validate_robot_states
+    robot_states = read_robot_states(episode.path)
+    if len(robot_states) <= episode.frame_indices[-1]:
+        raise ValueError("Real robot_state.npy does not cover episode RGB frames")
+    validate_robot_states(robot_states[episode.frame_indices])
     truth = load_tcp_truth(episode)
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -403,9 +393,10 @@ def infer_episode_sliding_windows(policy, episode: EpisodeInputs, initial_querie
             input_offsets = np.maximum(np.arange(end - config["history_frames"], end), start)
             images, intrinsics, query_tensor = prepare_images(
                 [episode.image_paths[offset] for offset in input_offsets], episode.intrinsics, queries)
-            wrists = prepare_wrist_images(episode, end - 1) if policy.use_wrist_condition else None
+            wrists = prepare_wrist_images(episode, end - 1)
+            current_state = torch.tensor(robot_states[episode.frame_indices[end - 1]], dtype=torch.float32)[None]
             prediction = infer_stage2_window(policy, images, intrinsics, query_tensor, episode.instruction,
-                steps=steps, seed=seed + number,
+                current_robot_state=current_state, steps=steps, seed=seed + number,
                 device=device, dtype=dtype, wrist_images=wrists)
             # Keep only distinct observed frames for export and visualization. The
             # last padded copy represents the actual oldest observation.
@@ -524,13 +515,6 @@ class Stage2Viewer:
         self.result, self.episode = result, episode
         self.max_points, self.max_depth = max_points, max_depth
         self.frame_slots = build_playback_frames(result)
-        # Older in-memory results may predate the saved historical labels.
-        if any("history_ground_truth" not in record for record in result["windows"]):
-            truth = load_tcp_truth(episode)
-            for record in result["windows"]:
-                if "history_ground_truth" not in record:
-                    record["history_ground_truth"] = tcp_truth_in_anchor_camera(
-                        episode, truth, np.arange(record["start"], record["end"]), record["end"] - 1)
         if not math.isfinite(fps) or not 0.25 <= fps <= 30:
             raise ValueError("FPS must be between 0.25 and 30")
         if not math.isfinite(point_size) or point_size <= 0:

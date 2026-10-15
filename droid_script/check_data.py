@@ -27,24 +27,22 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(2)
     summary = []
-    for stage in (1, 2):
-        for split in ("train", "validation"):
-            started = time.monotonic()
-            dataset = DroidDataset(args.data_root, index_path=args.index_path, train_set=args.train_set,
-                                    val_set=args.val_set, max_episodes=args.max_episodes,
-                                    stage=stage, split=split, augment=False)
-            for i in range(min(args.samples, len(dataset))):
-                sample = dataset.get_sample(i, 3 if stage == 1 else 8, 42 + i)
-                validate_training_sample(sample, "droid")
-                if not torch.isfinite(sample["tcp_state"]).all():
-                    raise ValueError("Non-finite TCP labels")
-                summary.append({"stage": stage, "split": split, "episode": sample["episode"],
-                    "camera": sample["camera_id"], "images": list(sample["images"].shape),
-                    "tcp": list(sample["tcp_state"].shape), "fps": sample["frame_rate"],
-                    "valid_depth_pixels": int(sample["valid_mask"].sum()),
-                    "query_valid": sample["tcp_query_valid"].tolist(),
-                    "future_frames": int(sample["future_action_valid"].sum()) if stage == 2 else None,
-                    "elapsed_seconds": round(time.monotonic() - started, 3)})
+    for split in ("train", "validation"):
+        started = time.monotonic()
+        dataset = DroidDataset(args.data_root, index_path=args.index_path, train_set=args.train_set,
+                                val_set=args.val_set, max_episodes=args.max_episodes,
+                                split=split, augment=False)
+        for i in range(min(args.samples, len(dataset))):
+            sample = dataset.get_sample(i, 3, 42 + i)
+            validate_training_sample(sample, "droid")
+            if not torch.isfinite(sample["tcp_state"]).all():
+                raise ValueError("Non-finite TCP labels")
+            summary.append({"stage": 1, "split": split, "episode": sample["episode"],
+                "camera": sample["camera_id"], "images": list(sample["images"].shape),
+                "tcp": list(sample["tcp_state"].shape), "fps": sample["frame_rate"],
+                "valid_depth_pixels": int(sample["valid_mask"].sum()),
+                "query_valid": sample["tcp_query_valid"].tolist(),
+                "elapsed_seconds": round(time.monotonic() - started, 3)})
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 
 

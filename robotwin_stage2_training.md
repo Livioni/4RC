@@ -43,7 +43,6 @@ checkpoints/dinov2-giant/
 在 `configs/train/4rc-stage2-action-wrist.py` 中设置：
 
 ```python
-use_wrist_condition = True
 wrist_model = "checkpoints/dinov2-giant"
 wrist_cache_dir = ".cache/huggingface"
 ```
@@ -67,7 +66,6 @@ hf download facebook/dinov2-giant config.json model.safetensors \
 对应配置为：
 
 ```python
-use_wrist_condition = True
 wrist_model = "facebook/dinov2-giant"
 wrist_cache_dir = ".cache/huggingface"
 ```
@@ -109,11 +107,11 @@ Stage1 checkpoint 和数据集也应按上面的步骤提前下载到本地。
 在[4rc-stage2-action-wrist](configs/train/4rc-stage2-action-wrist.py) 中 修改下面的参数
 
 - batch_size = 4  # Per GPU; each sample contains history_frames input images. 我这默认4，我也不知道H20能开多少，可以试下；
-- output_dir = "outputs/4rc-stage2-action-clean-wrist" 这里是输出logs， checkpoints保存放的地方
+- output_dir = "outputs/4rc-stage2-v2-wrist" 这里是输出logs， checkpoints保存放的地方
 
 ## 启动训练
 
-使用 accelerate 启动训练，下面以单卡为例：
+使用 accelerate 启动训练，下面以四卡为例：
 
 ```bash
 conda activate 4rc
@@ -121,39 +119,28 @@ accelerate launch --num_processes 4 train_4rc_stage2.py \
   --config configs/train/4rc-stage2-action-wrist.py
 ```
 
-`--num_processes 4` 表示使用张 GPU；单机多卡时改为实际使用的 GPU 数量。
+`--num_processes 4` 表示使用四张 GPU；单机多卡时改为实际使用的 GPU 数量。
 首次从 Stage1 启动需要上述 DINOv2 预训练文件。新腕部 Stage2 checkpoint 已保存
-冻结 DINOv2 的权重和架构，使用其初始化或 resume 时不会重新下载 DINOv2；
+冻结 DINOv2 的权重和架构，使用其 resume 时不会重新下载 DINOv2；
 T5 模型及 tokenizer 仍需本地目录或完整缓存。
 
-## Stage2 动作归一化与推理还原
+## V2 数据与归一化
 
-Stage2 使用 `arc/action_normalization.py` 中独立实现的 quantile 归一化。
-从 Stage1 新训练时，主进程遍历配置选中的全部训练动作窗口，排除验证集、
-无效片段和未来 padding；XYZ、6D 旋转、夹爪共 20 维分别统计 q01/q99，
-所有未来步共用 `[1,20]` 参数。统计对象是当前相机坐标系中的动作标签，
-每个有效窗口动作等权计入，数据源的采样权重不参与分位数计算。
+每个 episode 额外要求同帧真实 `robot_state.npy [T,14]`：左臂 6 关节、左夹爪、右臂 6 关节、右夹爪。
+所有 Stage2 配置都是独立完整文件，默认 4 帧历史和 32 步预测。
+主序列 `[B,105,1280]`，图像/文本条件 `[B,798+L,2048]`，输出 `[B,32,20]`。
+DiT 293.8M 参数，完整新增 head 337.5M；仅支持从 Stage1 新训练和新版完整断点续训。
 
-公式为 `2 * (action - q01) / ((q99 + 1e-6) - q01) - 1`，不裁剪超出分位数的值。
-全量统计只读取动作标注与相机参数，临时列文件位于输出目录，完成后自动清理。
-临时磁盘占用约为 `有效窗口动作条目数 × 20 × 4` 字节。
-为容纳全量统计，多进程等待超时默认设置为 86400 秒，可通过
-`distributed_timeout_seconds` 配置调整。
-
-输出目录及每个 checkpoint 都保存 `action_norm.json`，记录原始 q01/q99、
-mean/std（仅用于查看分布）、epsilon、维度排列和统计来源；模型权重也保存 q01/q99。
-复制 checkpoint 时保留该文件与 `config.json`。恢复训练、使用 Stage2 权重初始化
-或推理时复用原参数，并检查 JSON 与权重一致，不重新统计。
-
-现有 Stage2 推理会自动反归一化，再转换旋转、输出夹爪开关及连续开合值。
-需要单独还原 `[B,H,20]` 预测时可调用：
+动作沿用 componentwise v2，仅对 XYZ 做分位数仿射缩放，rotation6D 与夹爪保持既定规则。
+真实 state 独立拟合训练集有效当前帧的关节 q01/q99，夹爪从 `[0,1]` 映射为 `[-1,1]`，不裁剪。
+输出目录及每个 checkpoint 必须保留 `action_norm.json`、`state_norm.json` 和 `config.json`。
+恢复训练和推理复用统计并校验其与模型 buffers 一致。
 
 ```python
-from arc.action_normalization import load_checkpoint_action_norm, quantile_unnormalize
+from arc.action_normalization import load_checkpoint_action_norm, componentwise_unnormalize
 
-stats = load_checkpoint_action_norm("outputs/my_run/final_checkpoint", num_arms=2)
-raw_actions = quantile_unnormalize(normalized_actions, stats["q01"], stats["q99"])
+stats = load_checkpoint_action_norm("outputs/4rc-stage2-v2-wrist/final_checkpoint", num_arms=2)
+raw_actions = componentwise_unnormalize(normalized_actions, stats["offset"], stats["scale"])
 ```
 
-旧 mean/std Stage2 checkpoint 不再支持；请从 Stage1 开始新训练。
-Stage1 与历史 TCP 重建分支的统计方式保持不变。
+完整结构与训练选项见 [训练说明](README_TRAIN_CN.md#11-第二阶段v2-tcp-动作生成)。

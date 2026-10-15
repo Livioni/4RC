@@ -435,326 +435,64 @@ python scripts/upload_robotwin_to_hf.py \
 “--keep-archives” 会保留上传成功的 tar；“--overwrite” 会重新上传远端已存在
 的 task；“--rebuild-archives” 会重新创建 staging 中已有的 tar。
 
-## 11. 第二阶段：重建条件下的 TCP 动作生成
+## 11. 第二阶段：V2 TCP 动作生成
 
-训练入口分为 train_4rc_stage1.py 和 train_4rc_stage2.py。第一阶段继续使用
-现有 geometry + TCP recovery 配置；第二阶段使用
-configs/train/4rc-stage2-action.py，联合优化历史重建与未来动作生成。
-
-### Stage2 只训练指定任务
-
-在 `configs/train/4rc-stage2-action.py` 中设置顶层 `tasks`：
-
-```python
-tasks = None  # 默认使用全部任务
-# 只训练指定任务时，改为：
-# tasks = ["adjust_bottle", "stack_blocks_two"]
-```
-
-任务名精确对应数据根目录下的文件夹名。列表统一作用于所有启用的数据源
-（包括 `RoboTwin` 和 `RoboTwin_random`），同时限制训练集和验证集；数据源采样
-权重保持原值。此配置只接入 Stage2，没有新增命令行参数。
-
-筛选发生在读取 episode 内容、应用每个数据源的 `max_episodes` 上限和划分
-训练/验证集之前。保留原有排序及哈希划分，因此同一个 episode 不会因任务列表
-变化而切换划分。动作窗口、当前数据统计和 `data_manifest.json` 仅包含所选任务；
-同版本 Stage2 checkpoint 的 v2 归一化统计会原样保留。
-
-`tasks` 可以是非空字符串列表或元组，重复名称自动去重；空列表、错误格式，或
-任一启用数据源缺少指定任务时会报错。权重为零的数据源跳过检查。未配置或设为
-`None` 时使用全部任务，旧配置仍可使用。所选数据没有训练 episode 时会报错；
-验证划分为空时沿用现有跳过验证的行为，`--eval-only` 则要求存在验证 episode。
-
-任务列表会随配置保存到 `config.json`。使用 `--resume` 且未指定 `--config` 时，
-会读取 checkpoint 内保存的配置；若要恢复时使用修改后的任务列表，显式指定：
+当前仅支持 `action_head_type="groot_tcp_v1"`。新训练严格加载 Stage1 的共享视觉、
+TCP 采样与重建模块，新增 head 随机初始化；旧 Stage2 权重和配置不支持恢复或迁移。
+`configs/train/` 下每个配置文件均独立包含完整参数，不继承其他配置。
 
 ```bash
 accelerate launch train_4rc_stage2.py \
   --config configs/train/4rc-stage2-action.py \
-  --resume outputs/4rc-stage2-action/checkpoint-1000
+  --stage1-checkpoint checkpoints/RoboTwin-Stage1/model.safetensors
+
+# 仅恢复新版训练的完整状态。
+accelerate launch train_4rc_stage2.py --resume outputs/4rc-stage2-v2/final_checkpoint
+
+# 评估新版 checkpoint，验证集划分需要包含有效 episode。
+python train_4rc_stage2.py --resume outputs/4rc-stage2-v2/final_checkpoint --eval-only
 ```
 
-### 启动、初始化与恢复
+默认 4 帧历史、32 步预测，短历史重复最早帧，短未来在 self-attention K/V 和损失中屏蔽。
+每个 episode 必须提供同帧 `robot_state.npy [T,14]`、当前左右腕 RGB 和非空 instruction。
+状态顺序为左臂 6 关节、左夹爪、右臂 6 关节、右夹爪，夹爪取值在 `[0,1]`；
+不使用预测 TCP 或未来状态替代真实关节状态。数据、相机参数和 TCP 标签的原有要求仍适用。
 
-RoboTwin / DROID 的 Stage1、Stage2 均只保留当前输出目录下最新的一组训练 checkpoint。
-按步数、按 epoch 和最终保存共用此规则：先在临时目录写完权重、优化器、随机状态及元数据，
-成功发布后再删除旧 checkpoint。Stage2 同时保存动作归一化统计，DROID 同时保存 split 快照。
-保存失败时保留此前完整 checkpoint；日志、可视化和其他目录不参与清理。
+| 序列 | 顺序 | 默认形状 |
+| --- | --- | --- |
+| 主序列 | state ×1 → 历史 TCP ×72 → noisy action ×32 | `[B,105,1280]` |
+| cross-attention 条件 | 当前第三人称 ×266 → 左腕 ×266 → 右腕 ×266 → T5 完整文本 ×L | `[B,798+L,2048]` |
+| 输出 velocity | 未来 32 步，每步双臂 TCP 20 维 | `[B,32,20]` |
 
-```bash
-# 第一阶段
-accelerate launch train_4rc_stage1.py \
-  --config configs/train/4rc-giant-train-mixed.py
+历史每帧、每臂的 3×3 局部特征全部保留，复用 Stage1 采样器的 arm/offset embedding。
+第三人称保留 3072 维帧内/跨帧拼接特征，仅在 action 条件分支将 18×23 网格抗锯齿
+bilinear 降采样到 14×19；几何恢复和 TCP 采样仍使用原网格。
+左右腕共享冻结 DINOv2 Giant，每路保留 266 tokens。冻结 T5-base 保留完整文本及有效 EOS，
+padding 由 mask 排除。DINOv2 和 T5 首次启动需预训练资源，可配置本地模型目录。
 
-# 使用第一阶段 checkpoint 初始化第二阶段
-accelerate launch --num_processes 4 train_4rc_stage2.py \
-  --stage1-checkpoint outputs/4rc-robotwin-mixed-tcp-point-query/final_checkpoint \
-  --batch-size 1
+DiT 为 12 个单 attention block，cross/self 交替，各 6 层；宽度 1280、32 heads、
+每头 40 维、FFN 5120、dropout 0.2，使用 flow-time AdaLN 和 PyTorch SDPA。
+全部有效主序列 token 双向交互，每个 cross 层读取完整条件。最后取 action 段，经
+`1280→1024` 投影与 `1024→1024→20` decoder 预测 velocity。
+DiT 实际为 293,807,104 参数，完整新增 head 为 337,511,956 参数。
+训练启动时另记录整套策略实际参数量至日志与 `config.json` 的 `parameter_counts`。
 
-# 使用已有第二阶段权重，以当前配置开始新训练
-accelerate launch train_4rc_stage2.py \
-  --stage2-checkpoint outputs/4rc-stage2-action/checkpoint-1000
-```
+Flow matching 使用 `u~Beta(1.5,1)`、`t=(1-u)*0.999`、
+`x_t=(1-t)*noise+t*action`，目标为 `action-noise`；时间编码为 1000 桶。
+默认 Euler 4 步，验证同时输出 4/8 步的动作指标、延迟和峰值显存。
+同一次采样缓存各 cross 层的条件 K/V，每个去噪步重新计算主序列。
 
-配置支持三种启动来源，优先级为 `resume > stage2_checkpoint > stage1_checkpoint`：
+动作保持 componentwise v2：只缩放 XYZ，rotation6D 和已经映射到 `[-1,1]` 的夹爪保持原规则。
+State 单独使用所选训练集有效当前帧的 12 关节 q01/q99，退化区间回退 min/max，
+跨度下限 `1e-3`；两个夹爪从 `[0,1]` 映射到 `[-1,1]`，不裁剪超分位值。
+输出目录和每个 checkpoint 保存 `action_norm.json`、`state_norm.json`、架构配置和模型 buffers，
+恢复及推理校验文件与权重一致，复用原统计量。
 
-```python
-stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"
-stage2_checkpoint = None  # Stage2 权重文件或目录；重新开始优化器、scheduler 和训练步数
-resume = None             # 完整 Stage2 checkpoint 目录；恢复全部训练状态
-```
+`train_condition_encoders` / `lr_condition_encoders` 控制 state、TCP、图像及位置/类型编码；
+`train_action_head` / `lr_action_head` 控制 action encoder、DiT 和 action decoder；
+语言投影及共享 4RC 模块保留各自训练开关。默认启用逐层 gradient checkpointing 和 bf16。
+GT/recovered TCP 中心选择仍由 `history_tcp_gt_initial_ratio` 与 `history_tcp_gt_final_ratio` 控制。
 
-当前 Stage2 仅支持 FiLM + componentwise v2。旧 cross-attention / v1 权重不再支持，
-请从 Stage1 checkpoint 开始新训练，并使用新的输出目录。
-
-从 Stage1 初始化时，加载重建模型并创建新的动作模块；从同版本 Stage2 初始化时，
-严格加载完整策略，包括动作头和归一化统计，不需要读取 Stage1 文件。
-`stage2_checkpoint` 不恢复优化器、scheduler、随机状态或累计步数，GT 条件比例
-也按新训练配置从头执行。可使用 `--stage2-checkpoint` 覆盖配置：
-
-```bash
-accelerate launch train_4rc_stage2.py \
-  --stage2-checkpoint checkpoints/RoboTwin-Stage2/60000/model.safetensors \
-  --output-dir outputs/4rc-stage2-index
-```
-
-Stage2 统一使用序号编码，默认 8 帧历史、16 个未来动作，关闭 TCP 物理速度损失。
-无需指定时间模式或频率参数。`stage2_checkpoint` 只读取同版本权重及归一化统计；
-损失权重和训练进度不会覆盖当前配置。`resume` 恢复当前版本的完整训练状态。
-
-TCP recovery head 的 position mean/std 始终保留。只有从 Stage1 创建新的动作头时，
-才使用当前训练集计算动作归一化统计；Stage2 初始化及 resume 均保留已训练的尺度。
-Safetensors 加载会恢复 DualDPT 共享参数别名，真实缺失或结构不匹配仍会报错。
-
-### 动作归一化与颜色增强
-
-每臂动作是 `[xyz, R[:,0], R[:,1], 2*gripper-1]`，双臂共 20 维，DROID 单臂 10 维。
-未来 TCP 的绝对 pose 统一表达在最后观测帧相机系；rotation6D 使用旋转矩阵前两列。
-
-`action_normalization="componentwise"`、`action_normalization_version=2`：
-
-- XYZ 按训练集中有效未来标签计算每维 q01/q99，以中点为 offset、半跨度为 scale。
-  分位数跨度小于 `1e-4 m` 时使用 min/max；最终跨度下限 `1e-3 m`，范围外数值不裁剪。
-- rotation6D 和已经映射至 `[-1,1]` 的夹爪使用 offset=0、scale=1。
-- 使用 `(action-offset)/scale` 归一化；所有未来步共享 `[1,D]` 统计。
-  统计阶段只计算 XYZ（双臂 6 维、单臂 3 维），仅为这些维度写临时列文件。
-  `action_norm.json` 保持动作对齐的数组格式，非 XYZ 统计槽为未使用的零占位；
-  实际 offset/scale 在这些维度恒为 0/1，并严格核对 checkpoint 中的对应 buffers。
-- 不包含旧 v1 归一化实现或权重迁移路径。修改任务集合后，从 Stage1 初始化才能重新拟合统计。
-
-全部 Stage2 配置设置 `color_augment=False`：关闭亮度、对比度、饱和度、色相及灰度增强，
-保留 `augment=True` 控制的随机模糊。第三视角与腕部图像共享窗口增强参数；Stage1 默认设置不变。
-
-### 历史长度与每卡 batch size
-
-```python
-history_frames = 8
-prediction_horizon = 16
-tcp_temporal_weight = 0.0
-batch_size = 1
-```
-
-batch_size 是每张 GPU 的 clip 数。脚本自动计算
-train_batch_images = batch_size * history_frames，并固定 scene_counts=(batch_size,)。
-
-| 每卡 batch size | RGB batch       | 历史图像数 |
-| --------------- | --------------- | ---------- |
-| 1               | [1,8,3,252,322] | 8          |
-| 2               | [2,8,3,252,322] | 16         |
-
-有效 batch size 为每卡 clip 数 × GPU 数 × gradient accumulation steps。
-历史窗口固定为配置长度；未来只读取 TCP 标签和坐标转换所需外参，不读取
-未来 RGB/depth。窗口正序、连续且不跨异常轨迹分段；每个锚点至少需要一个
-真实观测和一个未来标签。历史不足 8 帧时复制当前片段最早帧，保留
-重复帧的源时间戳。未来标签为锚点之后的 16 条动作记录；不足时重复最后一条，
-通过 `future_action_valid` 屏蔽补齐部分的 attention 和 loss。归一化统计及
-验证指标仅计真实未来标签，FDE 取最后一个有效步。预测动作没有规定执行频率。
-`--history-frames` 和 `--prediction-horizon` 可调整历史和预测长度。
-
-### 全局视觉、历史 token 与 DiT
-
-每次前向先恢复历史 geometry/TCP，再从各历史帧的最后一层 backbone 全局
-特征中，在左右 TCP 中心分别采样 3×3 patch，复用现有 visual query encoder。
-
-邻域特征投影到 768 维后，以中心 patch 为 query、9 个 patch 为 key/value，
-做 attention pooling，再加中心残差和 LayerNorm。每帧保留左右臂各一个
-token，8 帧共 16 个历史 tokens。
-
-池化结果加入 TCP 中心的二维位置、左右臂身份、TCP 历史类型、投影有效性
-及帧序号编码。二维位置和序号均使用 sin/cos 编码加 MLP；
-历史输入为 `[-7,...,0]`，未来为 `[1,...,16]`，这些数字表示先后顺序，不表示秒数。
-模型不接收时间戳或频率，因此重复时间戳无需虚拟补位。
-编码 MLP 使用序号，不接收机器人执行时间。
-
-Stage2 固定要求 `tcp_temporal_weight=0`，直接跳过物理速度计算。位置、旋转、夹爪和
-几何监督继续生效；flow-matching 的生成时间与向量场损失仍保留，它们不是机器人
-物理速度。执行动作的节奏由外部控制程序决定；去掉时间条件不保证不同视觉运动跨度下
-的泛化效果，需要按部署输入评估。
-
-同时取最后一个观测帧的最后一层 backbone 完整 patch 特征：按通道直接 concat
-`[帧内特征 1536 维 | 跨帧特征 1536 维]`，共 3072 维，复用 backbone 已有的拼接输出。
-保留整图全部 patch，按行优先排列；不池化、不包含 camera/time 特殊 tokens。
-两路不做加权求和或额外 attention 融合，也不沿 token 维拼接，token 数不变。
-独立的 global_encoder 使用 LayerNorm → Linear 将 3072 维投影到 action_dim，加入
-patch 中心二维位置编码、当前帧序号 0 的编码及全局视觉类型 embedding，
-再经过 LayerNorm。位置编码沿用归一化 padded 图像坐标的 sin/cos 加 MLP。
-类型 embedding 共三类：0 = TCP 历史，1 = 未来动作，2 = 全局视觉。
-
-Stage2 配置默认使用 20 层、768 维、12 heads 的 DiT，约 262M 参数（不含条件编码模块）。
-主序列固定为 `[最后观测帧全局 patches | TCP 局部历史 | 未来动作]`。
-默认 252×322 图像、14×14 patch 对应 18×23 = 414 个全局 tokens，
-加上 16 个 TCP 历史和 16 个未来动作，共 446 个 tokens；显存和计算量相应增加。
-全局与 TCP 历史 tokens 相互可见，但均不能读取未来动作；未来动作能读取
-全部观测条件和未被 padding 屏蔽的未来动作。仅未来动作加噪、接受生成时间
-tau 的 AdaLN-Zero 调制，并计算 flow matching loss。序号条件和生成时间
-使用独立编码模块。训练、验证和推理共用同一条条件构造路径。
-
-ActionCondition.history 现在表示 `[B,G+K×A,D]` 的完整观测前缀；
-history_valid 仍为 `[B,K,A]` 的 TCP 有效性，历史 TCP 全无效时仍报告推理失败。
-全局特征复用本次 backbone 输出，采样迭代不会重复编码。
-
-仅含 TCP 历史条件的早期 Stage2 checkpoint，以及全局视觉分支仅使用跨帧 1536 维
-特征的 Stage2 checkpoint，均与当前默认训练结构不兼容；严格加载会拒绝缺失或形状不匹配的参数。
-请从 Stage1 权重开始新的 Stage2 实验并使用新的输出目录。使用 3072 维 concat 输入
-且采用 FiLM + componentwise v2 训练得到的 Stage2 checkpoint 支持初始化、断点恢复和推理。
-RoboTwin FourRC 评测要求 3072 维 concat 和腕部输入；旧 cross-attention / v1 checkpoint 会被拒绝。
-
-T5-base encoder 参数冻结且保持 eval。逐 token 输出经可训练投影后，屏蔽 padding 并做均值池化。
-每层 DiT 的 self-attention 和 MLP 分支分别用语言向量生成逐通道 FiLM 参数：
-`(1+gamma)*LayerNorm(x)+beta`，同一参数广播到全局、腕部、TCP 和动作 tokens。
-FiLM 投影零初始化，随后仅对动作 tokens 施加 flow-time 的 AdaLN 调制。
-动作头仅保留 FiLM，语言 cross-attention 已删除；FiLM 参数属于 `train_action_head` 优化器组。
-局部 3×3 patch 原有九个相对位置 embedding、池化后 TCP 中心二维位置编码继续保留。
-
-### 最后观测帧左右腕部条件（可选）
-
-使用独立配置从 Stage1 开始新的腕部条件实验：
-
-```bash
-accelerate launch train_4rc_stage2.py \
-  --config configs/train/4rc-stage2-action-wrist.py
-```
-
-该配置开启 `use_wrist_condition=True`，输出到
-`outputs/4rc-stage2-action-clean-wrist`。该配置独立定义所有参数，训练超参数
-与 `4rc-stage2-action-ust.py` 一致，不导入或执行原配置。第三人称分支的训练开关沿用原配置；
-左右腕部另共享一个官方预训练 `facebook/dinov2-giant`（ViT-g/14）encoder，
-始终冻结并保持 eval。首次训练下载权重到仓库内 `.cache/huggingface`；
-`wrist_model` 也支持本地 Transformers 预训练目录。
-
-仅读取历史窗口最后一个真实观测帧编号对应的
-`images/left_view/XXXXXX.png` 和 `images/right_view/XXXXXX.png`，不读取未来腕部 RGB。
-训练时三种视角复用同一组 clip 图像增强参数。缺失图片或尺寸错误直接报错。
-batch 中 `wrist_images` 为 `[B,2,3,240,320]`、RGB `[0,1]`，依次为左、右，
-与第三人称 `images` 的 padded `[-1,1]` 格式不同。
-
-训练、验证和推理共用预处理：宽×高 `320×240 → 256×192`（抗锯齿 bicubic），
-左右各反射填充 5 像素、上下各填充 2 像素，得到 `266×196`，
-使用 ImageNet mean/std 归一化，不做中心裁剪。
-取 DINOv2 最后一层归一化后的 1536 维 patch 特征，去除 CLS，
-每侧保留 `19×14=266` 个行优先 tokens。
-
-两侧共享独立的可训练腕部投影，加入各自 patch 二维位置、当前序号 0
-和类型 embedding（3=左腕、4=右腕），再经过 LayerNorm。
-腕部投影继承 `train_history_pool` / `lr_history_pool`，冻结 encoder 不进入优化器。
-主序列为 `[第三人称全图 | 左腕 patches | 右腕 patches | TCP 历史 | 未来动作]`，
-默认共 `414+266+266+16+16=978` 个 tokens。全部观测条件不能读取未来动作；
-仅未来动作接受 flow matching 监督，腕部不新增 depth、相机标定或 TCP 标签。
-
-`make_condition`、`sample_actions` 和独立滑窗推理共用腕部编码路径。
-`sample_actions(..., wrist_images=wrist_images)` 要求传入最后观测帧的两侧图片；
-采样迭代不重复编码，验证模式也共享一次腕部编码。
-滑窗推理自动按 checkpoint 的腕部开关读取锚点帧图片。
-新 checkpoint 保存冻结 encoder 权重和 `wrist_encoder_config`，严格恢复时无需再次下载。
-现有配置及旧 checkpoint 默认关闭腕部条件；不能通过旧 Stage2 权重直接启用该分支。
-
-腕部接口和梯度回归检查：
-
-```bash
-python -m pytest tests/test_wrist_condition.py -q
-```
-
-每步每臂输出 xyz（3）+ rotation 6D（6）+ gripper（1），双臂共 20 维。
-位置使用 action 统计量标准化；旋转输出转成矩阵；夹爪训练为关闭 −1、
-打开 +1，推理以零为阈值。未来位姿统一表示在当前观测相机坐标系中。
-
-### Teacher forcing 与学习率
-
-训练历史采样中心按 clip 在 GT 与当前模型预测 TCP 投影之间随机选择，整段
-历史使用同一种来源。GT 概率从 history_tcp_gt_initial_ratio=1.0 线性下降到
-history_tcp_gt_final_ratio=0.5：首个更新 100% GT，最后一个更新 50% GT /
-50% 预测，中途约 75% GT。比例按累计 optimizer step 计算，续训不会重新开始；
-梯度累积期间概率相同，每个 micro-batch 独立选择。单步训练使用初始比例。
-初始恢复 query 与逐帧生成采样点分别管理，此课程不改变初始 query。
-GT 历史完全无效的窗口仍不训练；预测投影无效时使用缺失 token，不回退到 GT。
-日志 condition/history_gt_probability 记录计划概率，history_gt_fraction 记录
-当前 micro-batch 实际 GT 比例，history_valid_fraction 记录混合后的有效投影比例。
-本课程不额外加入位置扰动。
-
-推理用首帧左右两个二维点启动 TCP 恢复，随后根据恢复位置与标定内参投影。
-所有点和内参使用 padded 图像坐标：原图点增加 (1,6)，内参主点增加同样
-偏移；不要重复添加 padding。
-
-联合损失包括 geometry、TCP recovery 和 action flow matching，三个外部
-权重默认均为 1。生成损失更新全局编码、池化、共享 query encoder 和 backbone；
-GT 与 detach 后的预测采样中心均不提供通向 TCP 位置预测 head 的梯度，该 head 由恢复损失更新。
-
-| 参数组                    | 训练开关                  | 学习率                 |
-| ------------------------- | ------------------------- | ---------------------- |
-| backbone                  | train_backbone            | lr_backbone            |
-| geometry head             | train_geometry_head       | lr_head                |
-| sparse motion decoder     | train_motion_decoder      | lr_motion_decoder      |
-| 共享 visual query encoder | train_query_encoder       | lr_query_encoder       |
-| TCP recovery head         | train_tcp_head            | lr_tcp_head            |
-| 全局编码、历史池化、位置/时间/类型编码 | train_history_pool        | lr_history_pool        |
-| DiT                       | train_action_head         | lr_action_head         |
-| 文本投影                  | train_language_projection | lr_language_projection |
-
-旧模块学习率继承 mixed 配置，新模块默认 1e-4。关闭开关或把该组学习率设为
-0 会冻结参数。camera decoder 和 dense track head 不参与第二阶段训练。
-
-### 验证与推理接口
-
-全部 Stage2 配置默认 `enable_validation=False`、`validate_every_steps=0`。
-RoboTwin 设置 `validation_fraction=0`；训练不构建验证集/loader，也不运行周期或结束验证。
-DROID 保留已有训练 TXT 的成员范围，不将 val TXT 合并进训练。效果使用 RoboTwin 闭环任务成功率评估。
-
-以下独立 `--eval-only` 接口仅供显式评测使用：需另外提供有验证划分的配置
-（RoboTwin 要求 `validation_fraction>0`）。
-
-```bash
-python train_4rc_stage2.py \
-  --stage2-checkpoint outputs/4rc-stage2-action/final_checkpoint \
-  --eval-only --validation-batches 16
-```
-
-验证结果写入 validation/step-XXXXXXXX.json，包括：
-
-- recovered：首帧 query 初始化后使用恢复投影，为主要推理结果；
-- teacher_forced：使用全部历史 GT 投影，量化定位误差带来的差距；
-- shuffled_instruction：使用其他任务的 instruction，保持相同动作初始噪声；
-- 位置 ADE/FDE、旋转角误差、夹爪 F1/准确率、恢复失败率、重建指标和耗时。
-
-只有一个任务时不报告跨任务指令打乱结果。小规模调试没有验证 episode 时
-仍可训练，但 --eval-only 要求存在验证数据。sampling_steps 默认 8，可通过
-配置比较 4/8/16 步。
-
-`TCPActionPolicy.sample_actions` 接收按先后排列的 images、instructions、
-initial_query_points 和 intrinsics。images 为 padded `[B,K,3,H,W]`、范围 `[-1,1]`；
-intrinsics 为 `[B,K,3,3]`。接口不接收 `frame_times` 或 `action_frequency_hz`，
-为兼容旧调用传入时也不参与条件。不接收历史 GT 轨迹。
-
-```python
-result = policy.sample_actions(
-    images, instructions, initial_query_points, intrinsics=intrinsics, steps=8,
-)
-```
-
-默认输出包括 success、action_position `[B,16,2,3]`、action_rotation `[B,16,2,3,3]`、
-action_gripper `[B,16,2]` 和 future_step_indices `[B,16]`（1～16）。序号模式不返回
-future_frame_times，接口不接收时间戳和频率参数。失败样本的 success 为 false，
-位置/旋转为 NaN，夹爪为 −1。重建、全局编码、池化和 T5 编码在一次生成中只执行一次。
-
-```bash
-python -m pytest tests/test_action_policy.py tests/test_action_dataset.py tests/test_stage2_index_mode.py -q
-```
+推理接口必须显式传入 `current_robot_state [B,14]` 与 `wrist_images [B,2,3,240,320]`。
+整段滑窗入口和输入目录要求见 [Stage2 推理说明](README_STAGE2_INFERENCE_CN.md)。
+当前 V2 为双臂策略，已移除旧单臂 DROID Stage2 训练入口；DROID Stage1 独立使用。

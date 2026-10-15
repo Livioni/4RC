@@ -51,13 +51,6 @@ def require_action_normalization_config(config):
         )
 
 
-def assert_stage2_contract(config, saved):
-    """Reject semantic changes before constructing or loading a Stage2 model."""
-    for key in ("language_conditioning", "action_normalization", "action_normalization_version"):
-        if config.get(key) != saved.get(key):
-            raise ValueError(f"Cannot load Stage2 with changed {key}; start from Stage1")
-
-
 def componentwise_parameters(q01, q99, minimum, maximum):
     """XYZ affine parameters; rotation columns and gripper retain their units."""
     q01, q99, minimum, maximum = [np.asarray(v, dtype=np.float64) for v in (q01, q99, minimum, maximum)]
@@ -307,7 +300,7 @@ def initialize_action_normalization(policy, dataset, config, accelerator):
     """Fit only on rank zero, or reuse a checkpoint; publish one identical record."""
     from accelerate.utils import broadcast_object_list
 
-    checkpoint = config.get("resume") or config.get("stage2_checkpoint")
+    checkpoint = config.get("resume")
     result = [None]
     if accelerator.is_main_process:
         try:

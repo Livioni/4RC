@@ -23,14 +23,17 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from arc.datasets import WeightedMultiSourceBatchSampler, collate_training_samples
-from arc.datasets.robotwin_action import RoboTwinActionDataset, build_action_dataset
+from arc.datasets.robotwin_action import build_action_dataset
 from arc.loss import GeometryLoss, TCPTrackingLoss
 from arc.loss.action import flow_matching_loss, action_metric_sums, finalize_action_metrics
 from arc.models.arc.arc import Arc
-from arc.models.arc.arc_action import TCPActionPolicy
+from arc.models.arc.arc_action import TCPActionPolicy, ARCHITECTURE_KEYS, require_action_head_config
 from arc.action_normalization import (
-    configure_action_normalization, load_checkpoint_action_norm, assert_stage2_contract,
+    configure_action_normalization, load_checkpoint_action_norm,
     assert_action_norm_matches, initialize_action_normalization, save_action_norm,
+)
+from arc.state_normalization import (
+    load_checkpoint_state_norm, assert_state_norm_matches, initialize_state_normalization, save_state_norm,
 )
 from train_4rc_stage1 import (
     cosine_warmup_scheduler, distributed_scheduler_steps, prepare_geometry_batch,
@@ -44,7 +47,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config")
     parser.add_argument("--stage1-checkpoint")
-    parser.add_argument("--stage2-checkpoint", help="Stage2 weights or directory; initialize a new run")
     parser.add_argument("--resume")
     parser.add_argument("--output-dir")
     parser.add_argument("--batch-size", type=int)
@@ -71,7 +73,7 @@ def load_config(args):
         namespace = runpy.run_path(str(path))
         config = {key: value for key, value in namespace.items() if not key.startswith("_") and not callable(value)}
     for key in (
-        "stage1_checkpoint", "stage2_checkpoint", "resume", "output_dir", "batch_size", "history_frames",
+        "stage1_checkpoint", "resume", "output_dir", "batch_size", "history_frames",
         "prediction_horizon", "max_episodes", "max_train_steps", "num_train_epochs", "num_workers", "validation_batches",
     ):
         if getattr(args, key, None) is not None:
@@ -82,27 +84,21 @@ def load_config(args):
 def validate_config(config, *, eval_only=False):
     config = dict(config)
     configure_action_normalization(config)
-    config.setdefault("language_conditioning", "film")
-    if config["language_conditioning"] != "film":
-        raise ValueError("Stage2 requires FiLM language conditioning; start from Stage1")
+    require_action_head_config(config)
     config.setdefault("enable_validation", False)
     if not isinstance(config["enable_validation"], bool):
         raise ValueError("enable_validation must be a boolean")
-    config.setdefault("stage2_checkpoint", None)
-    config.setdefault("use_wrist_condition", False)
-    if not isinstance(config["use_wrist_condition"], bool):
-        raise ValueError("use_wrist_condition must be a boolean")
-    if config["use_wrist_condition"]:
-        config.setdefault("wrist_model", "facebook/dinov2-giant")
-        config.setdefault("wrist_cache_dir", ".cache/huggingface")
-    if config.get("time_encoding", "index") != "index" or config.get("tcp_temporal_weight", 0) != 0:
-        raise ValueError("Stage2 uses sequence indices with tcp_temporal_weight=0. "
-                         "Initialize old weights with --stage2-checkpoint and the current config.")
-    # These retired options are never passed to the model or saved again.
-    for key in ("time_encoding", "time_unit_seconds", "tcp_velocity_scale"):
-        config.pop(key, None)
-    config["tcp_temporal_weight"] = 0.0
-    for key in ("batch_size", "history_frames", "prediction_horizon", "sampling_steps", "action_dim", "action_depth", "action_heads", "text_max_length"):
+    if config["action_depth"] % 2 or config["condition_dim"] % 4:
+        raise ValueError("V2 requires even action_depth and condition_dim divisible by 4")
+    if not 0 <= config["action_dropout"] < 1:
+        raise ValueError("action_dropout must lie in [0,1)")
+    if not 1 <= config["prediction_horizon"] <= 1024:
+        raise ValueError("prediction_horizon must lie in [1,1024]")
+    grid = config["global_token_grid"]
+    if len(grid) != 2 or any(not isinstance(n, int) or n < 1 for n in grid):
+        raise ValueError("global_token_grid must contain two positive integers")
+    config["global_token_grid"] = list(grid)
+    for key in ("batch_size", "history_frames", "prediction_horizon", "sampling_steps", "action_dim", "action_depth", "action_heads", "condition_dim", "action_output_dim", "text_max_length"):
         if not isinstance(config[key], int) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
     if config["enable_validation"] or eval_only:
@@ -120,10 +116,10 @@ def validate_config(config, *, eval_only=False):
         raise ValueError("action_dim must be divisible by action_heads and 4")
     if config.get("normalize_geometry", False):
         raise ValueError("Stage two uses metric geometry; normalize_geometry must be False")
-    if eval_only and not (config.get("stage2_checkpoint") or config.get("resume")):
-        raise ValueError("--eval-only requires --stage2-checkpoint or --resume pointing to a Stage2 checkpoint")
-    if not any(config.get(key) for key in ("resume", "stage2_checkpoint", "stage1_checkpoint")):
-        raise ValueError("A new stage-two run requires --stage1-checkpoint or --stage2-checkpoint")
+    if eval_only and not config.get("resume"):
+        raise ValueError("--eval-only requires --resume pointing to a V2 Stage2 checkpoint")
+    if not (config.get("resume") or config.get("stage1_checkpoint")):
+        raise ValueError("A new V2 run requires --stage1-checkpoint")
     config["train_batch_images"] = config["batch_size"] * config["history_frames"]
     config["scene_counts"] = (config["batch_size"],)
     config["min_views"] = config["max_views"] = config["history_frames"]
@@ -131,7 +127,7 @@ def validate_config(config, *, eval_only=False):
     config["reverse_probability"] = 0.0
     if not eval_only:
         training_total_steps(1, config.get("num_train_epochs"), config.get("max_train_steps"))
-    for key in ("output_dir", "stage1_checkpoint", "stage2_checkpoint", "resume"):
+    for key in ("output_dir", "stage1_checkpoint", "resume"):
         if config.get(key):
             config[key] = str(Path(config[key]).expanduser())
     config["training_stage"] = 2
@@ -184,67 +180,58 @@ def load_model_weights(model, checkpoint):
 
 
 def build_policy(config):
-    stage2 = config.get("resume") or config.get("stage2_checkpoint")
-    action_norm = load_checkpoint_action_norm(stage2, 2) if stage2 else None
-    saved = None
-    if stage2:
-        path = Path(stage2)
-        checkpoint_config = (path if path.is_dir() else path.parent) / "config.json"
-        if checkpoint_config.is_file():
-            saved = json.loads(checkpoint_config.read_text())
-            assert_stage2_contract(config, saved)
-            for key in ("action_dim", "action_depth", "action_heads"):
-                if config[key] != saved[key]:
-                    raise ValueError(f"Cannot load Stage2 with changed architecture: {key}")
-            if config.get("tcp_query_window_size", 3) != saved.get("tcp_query_window_size", 3):
-                raise ValueError("Cannot load Stage2 with changed architecture: tcp_query_window_size")
-            if config.get("use_wrist_condition", False) != saved.get("use_wrist_condition", False):
-                raise ValueError("Cannot change use_wrist_condition when loading Stage2; start from Stage1")
-        if config.get("use_wrist_condition", False):
-            if not saved or "wrist_encoder_config" not in saved:
-                raise ValueError("Wrist Stage2 checkpoint requires its saved wrist_encoder_config")
-            config["wrist_encoder_config"] = saved["wrist_encoder_config"]
-    arc = Arc(tcp_query_window_size=config.get("tcp_query_window_size", 3))
-    if not stage2:
-        # Strict loading prevents silently starting with random recovery heads.
-        LOGGER.info("Load checkpoint from stage1: %s", config["stage1_checkpoint"])
+    require_action_head_config(config)
+    resume = config.get("resume")
+    if resume:
+        saved = json.loads((Path(resume) / "config.json").read_text())
+        require_action_head_config(saved)
+        for key in (*ARCHITECTURE_KEYS, "history_frames", "t5_model", "wrist_model"):
+            if config[key] != saved[key]:
+                raise ValueError(f"Cannot resume V2 with changed {key}")
+        config["wrist_encoder_config"] = saved["wrist_encoder_config"]
+    arc = Arc(tcp_query_window_size=config["tcp_query_window_size"])
+    if not resume:
+        LOGGER.info("Initialize shared visual/TCP modules from Stage1: %s", config["stage1_checkpoint"])
         load_model_weights(arc, config["stage1_checkpoint"])
     policy = TCPActionPolicy(
         arc, t5_model=config["t5_model"], text_max_length=config["text_max_length"],
         dim=config["action_dim"], depth=config["action_depth"], heads=config["action_heads"],
-        prediction_horizon=config["prediction_horizon"],
-        use_wrist_condition=config.get("use_wrist_condition", False),
-        wrist_model=config.get("wrist_model", "facebook/dinov2-giant"),
-        wrist_pretrained=not bool(stage2), wrist_encoder_config=config.get("wrist_encoder_config"),
+        condition_dim=config["condition_dim"], output_dim=config["action_output_dim"],
+        dropout=config["action_dropout"], global_token_grid=config["global_token_grid"],
+        gradient_checkpointing=config["action_gradient_checkpointing"],
+        prediction_horizon=config["prediction_horizon"], wrist_model=config["wrist_model"],
+        wrist_pretrained=not bool(resume), wrist_encoder_config=config.get("wrist_encoder_config"),
         wrist_cache_dir=config.get("wrist_cache_dir"),
     )
-    if policy.use_wrist_condition:
-        config["wrist_encoder_config"] = policy.wrist_encoder.encoder.config.to_dict()
-    if stage2:
-        if saved:
-            LOGGER.info("Stage2 sequence horizon: %s -> %s",
-                        saved["prediction_horizon"], config["prediction_horizon"])
-        LOGGER.info("%s Stage2 checkpoint: %s",
-                    "Resume" if config.get("resume") else "Initialize weights from", stage2)
-        load_model_weights(policy, stage2)
-        assert_action_norm_matches(policy, action_norm)
+    config["wrist_encoder_config"] = policy.wrist_encoder.encoder.config.to_dict()
+    if resume:
+        load_model_weights(policy, resume)
+        assert_action_norm_matches(policy, load_checkpoint_action_norm(resume, 2))
+        assert_state_norm_matches(policy, load_checkpoint_state_norm(resume))
+    excluded = ("arc.", "language_encoder.", "wrist_encoder.")
+    config["parameter_counts"] = {
+        "dit": sum(p.numel() for p in policy.dit.parameters()),
+        "new_head": sum(p.numel() for name, p in policy.named_parameters() if not name.startswith(excluded)),
+        "policy": sum(p.numel() for p in policy.parameters()),
+    }
+    LOGGER.info("Parameter counts: %s", config["parameter_counts"])
     return policy
 
 
 def build_optimizer(policy, config):
     policy.requires_grad_(False)
     groups = []
-    history_modules = [policy.history_pool, policy.global_encoder, policy.physical_time, policy.token_type]
-    if policy.wrist_visual_encoder is not None:
-        history_modules.append(policy.wrist_visual_encoder)
+    condition_modules = [policy.state_encoder, policy.history_encoder, policy.prefix_type,
+                         policy.global_encoder, policy.wrist_visual_encoder,
+                         policy.context_type, policy.context_norm]
     specifications = [
         ("backbone", [policy.arc.backbone], "train_backbone", "lr_backbone"),
         ("geometry_head", [policy.arc.head], "train_geometry_head", "lr_head"),
         ("motion_decoder", [policy.arc.motion_decoder], "train_motion_decoder", "lr_motion_decoder"),
         ("query_encoder", [policy.arc.tcp_visual_query_encoder], "train_query_encoder", "lr_query_encoder"),
         ("tcp_head", [policy.arc.tcp_track_head], "train_tcp_head", "lr_tcp_head"),
-        ("history_pool", history_modules, "train_history_pool", "lr_history_pool"),
-        ("action_head", [policy.dit], "train_action_head", "lr_action_head"),
+        ("condition_encoders", condition_modules, "train_condition_encoders", "lr_condition_encoders"),
+        ("action_head", [policy.action_encoder, policy.dit, policy.action_decoder], "train_action_head", "lr_action_head"),
         ("language_projection", [policy.language_projection], "train_language_projection", "lr_language_projection"),
     ]
     seen = set()
@@ -339,6 +326,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
     totals = defaultdict(lambda: defaultdict(float))
     reconstruction_totals = defaultdict(float)
     elapsed = defaultdict(float)
+    peak_memory = defaultdict(float)
     batches = 0
     for index, cpu_batch in enumerate(loader):
         batch = move_batch(cpu_batch, accelerator.device)
@@ -350,7 +338,7 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
             reconstruction, features = policy.reconstruct(batch["images"], batch["tcp_query_points"])
             recovered = policy.make_condition(
                 batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
-                wrist_features=wrist_features,
+                current_robot_state=batch["current_robot_state"], wrist_features=wrist_features,
             )
         if accelerator.device.type == "cuda":
             torch.cuda.synchronize()
@@ -363,26 +351,28 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
                     condition = policy.make_condition(
                         batch["images"], batch["intrinsics"], batch["instruction"], reconstruction, features,
                         centres=batch["history_tcp_query_points"], valid=batch["history_tcp_valid"],
-                        wrist_features=wrist_features,
+                        current_robot_state=batch["current_robot_state"], wrist_features=wrist_features,
                     )
                 elif mode == "shuffled_instruction":
-                    from dataclasses import replace
-                    text, text_valid = policy.language_encoder(batch["shuffled_instruction"])
-                    condition = replace(recovered, text=policy.language_projection(text), text_valid=text_valid)
+                    condition = policy.replace_instruction(recovered, batch["shuffled_instruction"])
                 else:
                     condition = recovered
-                generator = torch.Generator(device=accelerator.device).manual_seed(config["seed"] + index)
-                if accelerator.device.type == "cuda":
-                    torch.cuda.synchronize()
-                started = time.perf_counter()
-                prediction = policy.sample_condition(condition, steps=config["sampling_steps"], generator=generator)
-            if accelerator.device.type == "cuda":
-                torch.cuda.synchronize()
-            elapsed[mode] += time.perf_counter() - started
-            if mode == "recovered":
-                elapsed["recovered_end_to_end"] += encode_elapsed + time.perf_counter() - started
-            for name, value in action_metric_sums(prediction, batch["future_actions"], batch.get("future_action_valid")).items():
-                totals[mode][name] += float(value)
+                for steps in sorted({4, 8, config["sampling_steps"]}):
+                    label = f"{mode}_{steps}steps"
+                    generator = torch.Generator(device=accelerator.device).manual_seed(config["seed"] + index)
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
+                    started = time.perf_counter()
+                    prediction = policy.sample_condition(condition, steps=steps, generator=generator)
+                    if accelerator.device.type == "cuda":
+                        torch.cuda.synchronize()
+                        peak_memory[label] = max(peak_memory[label], torch.cuda.max_memory_allocated())
+                    duration = time.perf_counter() - started
+                    elapsed[label] += duration
+                    elapsed[f"{label}_end_to_end"] += encode_elapsed + duration
+                    for name, value in action_metric_sums(prediction, batch["future_actions"], batch.get("future_action_valid")).items():
+                        totals[label][name] += float(value)
         with torch.autocast(device_type=accelerator.device.type, enabled=False):
             geometry_loss = geometry(reconstruction, prepare_geometry_batch(dict(batch), reconstruction))
             tcp_loss = tcp(reconstruction, batch)
@@ -395,12 +385,14 @@ def evaluate(policy, loader, geometry, tcp, config, accelerator):
     metrics = {f"{mode}/{key}": value for mode, sums in totals.items() for key, value in finalize_action_metrics(sums).items()}
     metrics.update({key: value / batches for key, value in reconstruction_totals.items()})
     metrics.update({f"seconds_per_batch/{key}": value / batches for key, value in elapsed.items()})
+    metrics.update({f"peak_memory_bytes/{key}": value for key, value in peak_memory.items()})
     return metrics
 
 
-def save_stage2(accelerator, config, name, *, epoch, batch_in_epoch, global_step, action_norm):
+def save_stage2(accelerator, config, name, *, epoch, batch_in_epoch, global_step, action_norm, state_norm):
     def write_metadata(directory):
         save_action_norm(directory, action_norm)
+        save_state_norm(directory, state_norm)
         (directory / "config.json").write_text(json.dumps(config, indent=2))
 
     save_checkpoint(
@@ -434,8 +426,7 @@ def main():
         for filename in ("trainer_state.json", "model.safetensors", "optimizer.bin", "scheduler.bin"):
             if not (resume_dir / filename).is_file():
                 raise FileNotFoundError(
-                    f"Resume checkpoint is missing {filename}: {resume_dir}. "
-                    "Use --stage2-checkpoint instead of --resume to initialize a new run from weights."
+                    f"Resume checkpoint is missing {filename}: {resume_dir}"
                 )
     set_seed(config["seed"])
     accelerator = Accelerator(
@@ -468,6 +459,7 @@ def main():
     validation_loader = make_loader(validation_dataset, config, validation=True)[0] if validation_dataset else None
     if args.eval_only:
         initialize_action_normalization(policy, None, config, accelerator)
+        initialize_state_normalization(policy, None, config, accelerator)
         policy.to(accelerator.device)
         if accelerator.is_main_process and validation_loader is None:
             raise ValueError("No validation episodes; check validation_fraction and max_episodes")
@@ -477,6 +469,7 @@ def main():
 
     dataset = build_action_dataset(config, "train")
     action_norm = initialize_action_normalization(policy, dataset, config, accelerator)
+    state_norm = initialize_state_normalization(policy, dataset, config, accelerator)
     # Never overwrite policy.arc.tcp_track_head.position_mean/std here.
     if accelerator.is_main_process:
         manifest = {"stage1_validation_overlap": config["stage1_validation_overlap"]}
@@ -502,6 +495,7 @@ def main():
     if config.get("resume"):
         accelerator.load_state(config["resume"])
         assert_action_norm_matches(accelerator.unwrap_model(policy), action_norm)
+        assert_state_norm_matches(accelerator.unwrap_model(policy), state_norm)
         state = json.loads((Path(config["resume"]) / "trainer_state.json").read_text())
         epoch_start, batch_start, global_step = state["epoch"], state["batch_in_epoch"], state["global_step"]
         LOGGER.info("Resumed epoch=%d batch=%d step=%d", epoch_start, batch_start, global_step)
@@ -524,22 +518,14 @@ def main():
         total_steps, max(0, total_steps - global_step), num_train_epochs,
     )
     raw_policy = accelerator.unwrap_model(policy)
-    global_tokens = (
-        (RoboTwinActionDataset.PADDED_HEIGHT // raw_policy.arc.PATCH_SIZE)
-        * (RoboTwinActionDataset.PADDED_WIDTH // raw_policy.arc.PATCH_SIZE)
-    )
-    wrist_tokens = 0
-    if raw_policy.use_wrist_condition:
-        encoder = raw_policy.wrist_encoder
-        wrist_tokens = 2 * (encoder.image_height // encoder.patch_size) * (encoder.image_width // encoder.patch_size)
+    global_tokens = math.prod(raw_policy.global_encoder.target_grid)
     LOGGER.info(
-        "Per GPU: %d clips x %d history frames = %d third-person images + %d wrist images; "
-        "effective batch = %d clips; DiT tokens = %d (global=%d, wrists=%d)",
-        config["batch_size"], config["history_frames"], config["train_batch_images"],
-        2 * config["batch_size"] if raw_policy.use_wrist_condition else 0,
+        "Per GPU: %d clips x %d history frames; effective batch=%d; "
+        "main sequence=%d (state=1, TCP=%d, action=%d); context=%d+L",
+        config["batch_size"], config["history_frames"],
         config["batch_size"] * accelerator.num_processes * config["gradient_accumulation_steps"],
-        global_tokens + wrist_tokens + raw_policy.num_arms * config["history_frames"] + config["prediction_horizon"],
-        global_tokens, wrist_tokens,
+        1 + 18 * config["history_frames"] + config["prediction_horizon"],
+        18 * config["history_frames"], config["prediction_horizon"], global_tokens + 532,
     )
     LOGGER.info("Optimizer groups: %s", [(group["name"], group["lr"]) for group in optimizer.param_groups])
     next_epoch, next_batch = epoch_start, batch_start
@@ -583,15 +569,15 @@ def main():
                 if validation_enabled and config["validate_every_steps"] > 0 and global_step % config["validate_every_steps"] == 0:
                     run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
                 if config["checkpointing_steps"] > 0 and global_step % config["checkpointing_steps"] == 0:
-                    save_stage2(accelerator, config, f"checkpoint-{global_step}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
+                    save_stage2(accelerator, config, f"checkpoint-{global_step}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm, state_norm=state_norm)
                 if global_step >= total_steps:
                     break
         batch_start = 0
         if config.get("save_each_epoch") and global_step < total_steps:
-            save_stage2(accelerator, config, f"epoch-{epoch + 1}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
+            save_stage2(accelerator, config, f"epoch-{epoch + 1}", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm, state_norm=state_norm)
     if validation_enabled:
         run_validation(policy, validation_loader, geometry, tcp, config, accelerator, global_step)
-    save_stage2(accelerator, config, "final_checkpoint", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm)
+    save_stage2(accelerator, config, "final_checkpoint", epoch=next_epoch, batch_in_epoch=next_batch, global_step=global_step, action_norm=action_norm, state_norm=state_norm)
     accelerator.end_training()
 
 

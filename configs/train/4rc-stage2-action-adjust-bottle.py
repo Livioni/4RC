@@ -1,4 +1,4 @@
-"""Stage two: recover eight observations and generate sixteen ordered actions."""
+"""V2 adjust-bottle: independent full configuration, 4 history frames and 32 actions."""
 
 # ======================================================
 # 4RC Geometry + TCP Tracking + Action Configuration
@@ -8,9 +8,8 @@
 output_dir = "outputs/4rc-stage2-action-adjust-bottle"
 wandb_run_name = "4rc-stage2-action-adjust-bottle"
 logging_dir = "logs"
-stage1_checkpoint = None  # Used when neither Stage2 initialization nor resume is set.
-stage2_checkpoint = "outputs/4rc-stage2-action-no-temporal/checkpoint-250000/model.safetensors"  # Stage2 weight file or directory; new optimizer, scheduler and step count.
-resume = None  # Optional full-state recovery for a run using the current sequence configuration.
+stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"  # Shared visual/TCP initialization for every new run.
+resume = None  # Full-state resume of a V2 run only.
 
 # == Dataset Configuration ==
 tasks = ["adjust_bottle"]  # All tasks; applies to every enabled source, for training and validation.
@@ -23,19 +22,19 @@ data_sources = (
     {
         "name": "robotwin",
         "type": "robotwin",
-        "weight": 0.33,
+        "weight": 1.0,
         "options": {"root": "datasets/RoboTwin"},
     },
     {
         "name": "robotwin_random",
         "type": "robotwin",
-        "weight": 0.66,
+        "weight": 0.0,
         "options": {"root": "datasets/RoboTwin_random"},
     },
 )
 view = "third_views"
-history_frames = 8  # Include anchors 0..7; repeat the oldest frame if history is short.
-prediction_horizon = 16  # Next 16 action records, with no execution-frequency assumption; short futures are masked.
+history_frames = 4  # Repeat the oldest observed frame if history is short.
+prediction_horizon = 32  # Future padding is masked in attention and loss.
 batch_size = 3  # Per GPU; each sample contains history_frames input images.
 # Step indices encode observation order; repeated frames keep their source timestamps.
 # The action adapter requires forward windows within one valid segment. The runner derives
@@ -70,14 +69,23 @@ validate_every_steps = 0
 stage1_validation_overlap = "unknown"
 
 # == Model Configuration ==
-language_conditioning = "film"
+action_head_type = "groot_tcp_v1"
+state_normalization_version = 1
+global_token_grid = (14, 19)
+condition_dim = 2048
+action_output_dim = 1024
+action_dropout = 0.2
+action_gradient_checkpointing = True
+wrist_model = "facebook/dinov2-giant"
+wrist_cache_dir = ".cache/huggingface"
 action_normalization = "componentwise"
+action_normalization_version = 2
 train_backbone = True
 train_geometry_head = True
 train_motion_decoder = True  # Shared sparse TCP decoder; dense tracking is not run.
 train_query_encoder = True
 train_tcp_head = True
-train_history_pool = True  # Global visual encoder, TCP pooling, and time/type embeddings.
+train_condition_encoders = True  # State, unpooled TCP, image and type/position encoders.
 train_action_head = True
 train_language_projection = True
 # Camera decoder and dense track head are frozen by the stage-two optimizer.
@@ -85,12 +93,12 @@ tcp_query_window_size = 3
 
 t5_model = "google-t5/t5-base"  # Frozen encoder; a local pretrained directory also works.
 text_max_length = 128
-# About 262M parameters in the Action DiT (excluding conditioning modules).
-action_dim = 768
-action_depth = 20
-action_heads = 12
-# Sequence indices: history [-7..0], future [1..16]; no time or frequency condition.
-sampling_steps = 8
+# About 294M parameters in DiT; encoders and action decoder are counted separately.
+action_dim = 1280
+action_depth = 12
+action_heads = 32
+# Observation indices [-3..0], future positions [1..32]; flow time is a separate condition.
+sampling_steps = 4
 
 # == History TCP Condition Curriculum ==
 # Choose GT/recovered history per clip. Linearly interpolate over optimizer
@@ -114,7 +122,7 @@ lr_head = 2e-5
 lr_motion_decoder = 1e-5
 lr_query_encoder = 1e-4
 lr_tcp_head = 1e-4
-lr_history_pool = 1e-4
+lr_condition_encoders = 1e-4
 lr_action_head = 1e-4
 lr_language_projection = 1e-4
 adam_beta1 = 0.9
