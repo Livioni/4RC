@@ -17,6 +17,7 @@ from .robot import BASE_FRAME, ROBOT_ENTITY, PRED_ROBOT_ENTITY, TIME_TIMELINE, l
 
 
 PRED_COLOR = [255, 155, 55]
+GT_CAMERA_TCP_COLOR = [205, 100, 235]
 GT_COLOR = [55, 205, 120]
 AXIS_COLORS = [[235, 65, 65], [65, 210, 80], [65, 130, 255]]
 
@@ -127,12 +128,19 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
     if prediction.clouds is None or prediction.camera_to_base is None:
         raise ValueError("Rerun playback requires geometry and absolute camera predictions")
     tcp = tcp_to_base(prediction.tcp, prediction.camera_to_base)
+    # The dataset stores base-to-camera; load_ground_truth has already inverted
+    # it. Reuse the camera-frame predictions with this fixed calibrated pose.
+    tcp_gt_camera = tcp_to_base(
+        prediction.tcp,
+        np.broadcast_to(ground_truth.camera_to_base, prediction.camera_to_base.shape),
+    )
     recording.log("world", rr.CoordinateFrame(BASE_FRAME), rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
     recording.log("world/origin", rr.CoordinateFrame(BASE_FRAME),
                   rr.Arrows3D(origins=np.zeros((3, 3)), vectors=np.eye(3) * 0.10,
                                              colors=AXIS_COLORS, radii=0.001), static=True)
     for prefix, color, positions in (
             ("prediction", PRED_COLOR, tcp["position"][:, 0]),
+            ("prediction/gt_camera", GT_CAMERA_TCP_COLOR, tcp_gt_camera["position"][:, 0]),
             ("ground_truth", GT_COLOR, ground_truth.tcp_poses[:, :3, 3])):
         recording.log(prefix, rr.CoordinateFrame(BASE_FRAME), rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
         strips = trajectory_segments(positions)
@@ -166,6 +174,9 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
             recording.log(f"{prefix}/point_cloud", rr.Points3D(points, colors=colors, radii=args.point_size / 2))
         log_tcp(recording, "prediction", tcp["position"][slot, 0], tcp["rotation"][slot, 0],
                 PRED_COLOR, f"Pred TCP · open={tcp['gripper'][slot, 0]:.3f}")
+        log_tcp(recording, "prediction/gt_camera", tcp_gt_camera["position"][slot, 0],
+                tcp_gt_camera["rotation"][slot, 0], GT_CAMERA_TCP_COLOR,
+                "Pred TCP · GT camera extrinsic")
         ik_info = ""
         if robot_states is not None:
             succeeded = bool(robot_states["success"][slot])
@@ -198,7 +209,9 @@ def log_replay(recording, args, episode, paths: list[Path], prediction,
             f"{ik_info}"
             f"Replay: {int(ground_truth.frame_indices[0])}–{int(ground_truth.frame_indices[-1])} at {episode.frame_rate:g} Hz. "
             f"Skipped prefix: {int(ground_truth.frame_indices[0])} frames.\n\n"
-            f"**Orange:** predicted TCP · **Green:** GT TCP. Both scenes use robot-base coordinates (metres).\n\n"
+            f"**Orange:** predicted TCP + predicted camera extrinsic. "
+            f"**Purple:** predicted TCP + GT camera extrinsic (left view). "
+            f"**Green:** GT TCP. Both scenes use robot-base coordinates (metres).\n\n"
             f"Points: prediction **{len(pred_points):,}**, GT **{len(gt_points):,}**.\n\n"
             f"Predicted camera pose + depth; calibrated GT RGB-D; measured robot joints.\n\n"
             f"TCP confidence: {prediction.tcp['confidence'][slot, 0]:.3f} (raw score).\n\n"
