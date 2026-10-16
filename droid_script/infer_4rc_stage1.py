@@ -4,7 +4,7 @@
 Run from the repository root (activate the 4rc environment first)::
 
     python droid_script/infer_4rc_stage1.py --input datasets/droid_episodes/<episode>
-    python droid_script/infer_4rc_stage1.py --input datasets/droid_episodes/<episode> --interactive
+    python droid_script/infer_4rc_stage1.py --input datasets/robolab_eval_sets/AnimalsInBinTask/AnimalsInBinTask__20261009T135604Z_db476b7b_0008 --interactive
 """
 from __future__ import annotations
 
@@ -322,14 +322,31 @@ def infer_window(model: Any, paths: list[Path], query: np.ndarray, device: torch
 def infer_episode(model: Any, episode: Episode, paths: list[Path], query: np.ndarray,
                   query_source: str, *, device: torch.device, dtype: torch.dtype,
                   window_size: int = 9, keep_geometry: bool = False, max_points: int = 100_000,
-                  progress: Callable[[float, str], None] | None = None) -> Prediction:
+                  progress: Callable[[float, str], None] | None = None,
+                  window_query_source: str = "previous") -> Prediction:
+    if window_query_source not in ("previous", "gt"):
+        raise ValueError("window_query_source must be 'previous' or 'gt'")
     windows = build_sliding_windows(len(paths), window_size)
+    gt_queries = None
+    if window_query_source == "gt":
+        if episode.intrinsics is None:
+            raise ValueError("GT window queries require calibrated camera intrinsics and TCP labels")
+        uv, valid = ground_truth_queries(episode)
+        gt_queries = []
+        for start, _ in windows:
+            frame = _frame_index(paths[start])
+            if not valid[frame]:
+                raise ValueError(f"Camera {episode.camera}, frame {frame}: GT window query is invalid or outside the image")
+            gt_queries.append(validate_query(uv[frame], f"Frame {frame} GT"))
     query = validate_query(query).copy()
     values = {key: [] for key in ("position", "rotation", "gripper", "confidence")}
     records, source_windows, cameras = [], [], []
     clouds = [] if keep_geometry else None
     for wi, (start, end) in enumerate(windows):
         frame_ids = [_frame_index(path) for path in paths[start:end]]
+        if gt_queries is not None:
+            query = gt_queries[wi].copy()
+            query_source = f"projected GT TCP at frame {frame_ids[0]}"
         context = f"Camera {episode.camera}, window {wi + 1}/{len(windows)}, frames {frame_ids[0]}-{frame_ids[-1]}"
         if progress:
             progress(wi / len(windows), context)
@@ -366,7 +383,7 @@ def infer_episode(model: Any, episode: Episode, paths: list[Path], query: np.nda
         if keep_geometry:
             clouds.extend(window_clouds[skip:])
             cameras.append(c2w[skip:])
-        if end < len(paths):
+        if end < len(paths) and window_query_source == "previous":
             query_source = f"window {wi} prediction at frame {frame_ids[-1]}"
             query = project_query(tcp["position"][-1], boundary_k, f"Camera {episode.camera}, {query_source}")
     if progress:
@@ -410,8 +427,12 @@ def run_and_save(args, episode, model, start, query, query_source, device, dtype
     paths = episode.clip(start, args.max_frames)
     prediction = infer_episode(model, episode, paths, query, query_source, device=device,
                                dtype=dtype, window_size=args.window_size, keep_geometry=keep_geometry,
-                               max_points=args.max_points, progress=progress)
+                               max_points=args.max_points, progress=progress,
+                               window_query_source=getattr(args, "query_source", "previous"))
+    first_window = prediction.windows[0]
+    query, query_source = first_window["tcp_query_points_px"], first_window["query_source"]
     result = build_result(episode, paths, prediction, query, query_source, args.model, args.window_size)
+    result["windowing"]["query_source"] = getattr(args, "query_source", "previous")
     root = DEFAULT_OUTPUT_ROOT if episode.dataset == "droid" else Path("outputs") / episode.dataset / "stage1_inference"
     output = args.output or root / episode.path.name / episode.camera / "tcp_episode.json"
     saved = write_json_atomic(result, output)
@@ -430,9 +451,12 @@ def parse_args(argv=None):
     parser.add_argument("--start-frame", type=int, help="Explicit start; otherwise first visible GT TCP, or 0 for manual query")
     parser.add_argument("--max-frames", type=int, default=0, help="0: all remaining frames")
     parser.add_argument("--window-size", type=int, default=9)
+    parser.add_argument("--query-source", choices=("previous", "gt"), default="previous",
+                        help="Window query: previous window's final predicted TCP (default), or GT at every "
+                             "window start, including the first (overrides manual/interactive query)")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("auto", "float32", "float16", "bfloat16"), default="auto")
-    parser.add_argument("--visualize", action="store_true", help="Show Viser after non-interactive inference")
+    parser.add_argument("--visualize", action="store_true", help="Show Viser in OpenCV camera coordinates after non-interactive inference")
     parser.add_argument("--show-pred-trajectory", action=argparse.BooleanOptionalAction, default=True,
                         help="Initially show the predicted TCP trajectory in Viser (orange)")
     parser.add_argument("--show-gt-trajectory", action=argparse.BooleanOptionalAction, default=True,
@@ -475,7 +499,9 @@ def run(args):
         from droid_script.stage1_viewer import start_interactive
         start_interactive(args, episode, device, dtype)
         return
-    start, query, source = resolve_initial_query(episode, args.start_frame, args.tcp_query_point)
+    start, query, source = resolve_initial_query(
+        episode, args.start_frame,
+        None if getattr(args, "query_source", "previous") == "gt" else args.tcp_query_point)
     episode.clip(start, args.max_frames)
     print(f"Start frame: {start}; skipped prefix: {start} frames; query: {query.tolist()} ({source})", flush=True)
     model = load_model(args.model, device)
@@ -490,7 +516,7 @@ def run(args):
     print(f"Saved {result['num_frames']} frames ({result['start_frame']}-{result['end_frame']}) to {saved}", flush=True)
     if args.visualize:
         from droid_script.stage1_viewer import start_viewer
-        viewer = start_viewer(args, episode, prediction, paths)
+        viewer = start_viewer(args, episode, prediction, paths, camera_coordinates=True)
         try:
             while not viewer.stopped.wait(0.5):
                 pass

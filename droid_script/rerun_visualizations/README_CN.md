@@ -29,7 +29,7 @@ conda run --no-capture-output -n 4rc python -m pip install \
 ```bash
 conda run --no-capture-output -n 4rc python \
   droid_script/rerun_visualizations/infer_stage1_ik.py \
-  --input datasets/droid_episodes/AUTOLab__Fri_Aug_18_11:40:54_2023 \
+  --input datasets/robolab_eval_sets/AnimalsInBinTask/AnimalsInBinTask__20261009T135604Z_db476b7b_0008 \
   --camera 22008760
 ```
 
@@ -105,24 +105,19 @@ conda run --no-capture-output -n 4rc python \
 
 ## 界面
 
-- 左侧：预测深度、内参和绝对相机位姿生成的彩色点云；预测 TCP 经预测相机外参转换后的位姿坐标轴与橙色轨迹；同一预测 TCP 经真值相机外参转换后的位姿坐标轴与紫色轨迹。
-- 右侧：真实 RGB-D 和标定生成的点云；Franka Panda + Robotiq 2F-85 实测关节回放；真值 TCP 位姿与绿色轨迹。
-- 下方：所选相机原始 RGB，橙色/绿色分别标记预测/真值 TCP 的有效投影；白色初始 query 只在起始帧显示。旁边显示当前帧、点数和推理信息。
-- 所有内容共用原始帧号与源时间戳；没有时间戳时用帧号除以源帧率。时间面板可以播放、暂停和拖动；左右初始观察位置相同，可分别旋转和缩放。
+- 左侧：预测点云、模型直接输出的相机坐标 TCP 位姿与橙色轨迹；缓存模式还显示预测机器人。
+- 右侧：真实 RGB-D 点云、实测关节机器人、相机坐标 GT TCP 位姿与绿色轨迹。
+- 下方：原始 RGB，橙色/绿色分别标记预测/GT TCP 的有效投影；白色初始 query 只在起始帧显示。
 
-两个 3D 视图都使用 robot base 坐标系，单位米。预测侧使用模型预测的相机位姿，真值侧使用数据集真实外参；对照误差包含相机位姿预测误差。显示整段推理帧区间的 TCP 轨迹，当前坐标轴随时间变化。
+两个 3D 视图默认都使用 OpenCV 相机坐标系：+X 向右、+Y 向下、+Z 向前，单位米。预测 TCP 直接使用模型输出，GT TCP 直接读取相机坐标标签。整段轨迹连接各帧相对于相机的位置。
 
-### 左侧新增：使用真值相机外参的预测 TCP
+### 相机坐标与缓存兼容
 
-默认同时显示两种转换，不需要额外参数；直接推理、`--prediction` 缓存回放及 `.rrd` 导出均包含紫色轨迹。已有缓存直接重新运行回放命令即可，无需重新推理或计算 IK；已导出的旧 `.rrd` 需要重新导出。
+预测点云在显示前撤销缓存中的预测 camera → base 变换；GT RGB-D 直接反投影到相机坐标系。旧缓存无需重新推理，重新运行可视化命令即可；已有 `.rrd` 录制需要重新导出。
 
-- **橙色**：`T_base_tcp_pred = T_base_camera_pred @ T_camera_tcp_pred`，同时包含 TCP 与相机位姿预测的影响。
-- **紫色**：`T_base_tcp_gt_camera = inverse(T_camera_base_GT) @ T_camera_tcp_pred`，使用 `extrinsic/<camera>.npy` 的真值 base → camera 外参取逆。位置与姿态都转换，TCP 本身仍是模型预测值。
-- **绿色（右侧）**：真值 TCP 使用真值外参转换后的轨迹。
+预测机器人及 FK TCP 使用每帧预测外参的逆变换进入相机坐标系，GT 机器人使用真实 base → camera 外参。IK 求解和缓存仍使用原来的 base 坐标，显示变换不会改变 IK 残差大小。
 
-紫色轨迹在左侧实体 `prediction/gt_camera/trajectory`，当前位姿在 `prediction/gt_camera/tcp`，可通过 Rerun 实体树控制可见性。它与右侧绿色轨迹的差异反映相机坐标 TCP 的预测误差；同一刚体变换保持三维位置距离和旋转测地角不变。橙色与紫色的差异用于观察预测相机外参对 TCP 转换结果的影响。
-
-紫色轨迹仅作对照显示；左侧点云、预测机器人、IK 目标与残差线仍使用预测相机外参，因此它不一定贴合预测点云或预测机械臂。下方 RGB 的橙色预测点仍是同一相机坐标 TCP 的投影。
+原来的紫色“预测 TCP 经 GT 外参转换”轨迹已移除：在相机坐标系下它与橙色预测轨迹重合。橙色与绿色轨迹的差异直接反映相机坐标 TCP 预测误差；这不代表模型误差被修正。
 
 ## 相机、起点和推理参数
 

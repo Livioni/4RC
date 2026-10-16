@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a single-arm DROID Stage 1 checkpoint on a video or DROID/RoboLab episode.
 
-    python droid_script/infer_4rc_stage1_video.py --input video.mp4 --interactive
+    python droid_script/infer_4rc_stage1_video.py --input datasets/inthewild/apple_ood_droid.mp4 --interactive
     python droid_script/infer_4rc_stage1_video.py --input video.mp4 \
         --tcp-query-point 160 90 --visualize
 
@@ -123,8 +123,8 @@ def run_and_save(args, episode, model, start, query, query_source, device, dtype
                   original_image_size=list(episode.original_size), inference_image_size=[320, 180],
                   preprocessing="resize full frame to 320x180, then reflect-pad 1 pixel on every side",
                   intrinsics_source="predicted camera decoder; no input calibration",
-                  visualization_coordinate_frame="model-predicted world (DROID robot-base convention)",
-                  geometry_note="Metric scale and world frame are model predictions, not calibrated to this video.")
+                  visualization_coordinate_frame="OpenCV camera (+x right, +y down, +z forward)",
+                  geometry_note="Points and TCP use each frame's camera coordinates; metric scale is model-predicted, not calibrated.")
     for frame in result["frames"]:
         frame["time_seconds"] = frame["frame_index"] / episode.fps
     result["initial_query"]["pixel_space"] = "resized 320x180 RGB, before padding"
@@ -138,7 +138,7 @@ def run_and_save(args, episode, model, start, query, query_source, device, dtype
 def start_viewer(args, episode, prediction, paths):
     from droid_script.stage1_viewer import start_viewer as start
     return start(args, episode, prediction, paths, frame_rate=episode.fps,
-                 scene_frame="model-predicted world", load_ground_truth=False)
+                 camera_coordinates=True, load_ground_truth=False)
 
 
 def parse_args(argv=None):

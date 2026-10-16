@@ -137,7 +137,7 @@ def joint_values(joint, joints: np.ndarray, gripper_open: np.ndarray, *, closed_
 
 def log_robot(recording: rr.RecordingStream, tree: rr.urdf.UrdfTree, ground_truth=None, *,
               prefix="ground_truth", frame_indices=None, joints=None, gripper_open=None,
-              timestamps=None, closed_radians=0.8) -> None:
+              timestamps=None, closed_radians=0.8, base_frame=BASE_FRAME) -> None:
     if ground_truth is not None:
         frame_indices, joints = ground_truth.frame_indices, ground_truth.joints
         gripper_open = ground_truth.tcp_camera[:, 6]
@@ -148,7 +148,7 @@ def log_robot(recording: rr.RecordingStream, tree: rr.urdf.UrdfTree, ground_trut
     recording.log(
         f"{prefix}/robot/root_transform",
         rr.Transform3D(translation=[0, 0, 0], mat3x3=np.eye(3),
-                       parent_frame=BASE_FRAME, child_frame=frame_prefix + tree.root_link().name),
+                       parent_frame=base_frame, child_frame=frame_prefix + tree.root_link().name),
         static=True,
     )
     indexes = [rr.TimeColumn("frame", sequence=frame_indices),

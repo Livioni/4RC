@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import copy
 from pathlib import Path
 import threading
 from urllib.parse import urlsplit
@@ -17,12 +18,16 @@ PRED_COLOR = (255, 90, 40)
 GT_COLOR = (50, 220, 100)
 
 
-def load_gt_trajectory(episode, paths) -> np.ndarray:
-    """Read selected camera-frame labels and undo the dataset's world-to-camera pose."""
+def load_gt_trajectory(episode, paths, *, camera_coordinates=False) -> np.ndarray:
+    """Read selected GT positions in camera coordinates or transform them to world."""
     state_path = episode.path / "TCP" / episode.camera / "state.npy"
     state = np.load(state_path, allow_pickle=False, mmap_mode="r")
     if state.shape != (len(episode.image_paths), 7):
         raise ValueError(f"Expected TCP state [{len(episode.image_paths)},7] in {state_path}, got {state.shape}")
+    if camera_coordinates:
+        positions = np.array(state[[inference._frame_index(path) for path in paths], :3], dtype=np.float32)
+        positions[~np.isfinite(positions).all(-1)] = np.nan
+        return positions
     ext_path = episode.path / "extrinsic" / f"{episode.camera}.npy"
     w2c = np.load(ext_path, allow_pickle=False).astype(np.float32)
     if (w2c.shape != (4, 4) or not np.isfinite(w2c).all()
@@ -80,7 +85,8 @@ class Viewer:
 
 
 def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
-                 scene_frame="robot base coordinates", load_ground_truth=True) -> Viewer:
+                 scene_frame="robot base coordinates", load_ground_truth=True,
+                 camera_coordinates=False) -> Viewer:
     try:
         import viser
         import viser.transforms as tf
@@ -89,12 +95,24 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
     if prediction.clouds is None or prediction.camera_to_base is None:
         raise ValueError("Viewer requires predicted depth and camera geometry")
     frame_rate = episode.frame_rate if frame_rate is None else frame_rate
-    tcp = inference.tcp_to_base(prediction.tcp, prediction.camera_to_base)
+    if camera_coordinates:
+        scene_frame = "OpenCV camera (+x right, +y down, +z forward)"
+    tcp = (prediction.tcp if camera_coordinates else
+           inference.tcp_to_base(prediction.tcp, prediction.camera_to_base))
+
+    def cloud_points(slot):
+        points = prediction.clouds[slot]["points"]
+        if camera_coordinates:
+            c2w = prediction.camera_to_base[slot]
+            # Undo the world transform applied by frame_clouds (row-vector convention).
+            points = (points - c2w[:3, 3]) @ c2w[:3, :3]
+        return points
+
     gt_positions, gt_error = None, ""
     try:
         if not load_ground_truth:
             raise ValueError("Input video has no calibrated GT trajectory")
-        gt_positions = load_gt_trajectory(episode, paths)
+        gt_positions = load_gt_trajectory(episode, paths, camera_coordinates=camera_coordinates)
         if not np.isfinite(gt_positions).all(-1).any():
             raise ValueError("No finite GT TCP positions in the selected clip")
     except (OSError, ValueError) as error:
@@ -103,7 +121,7 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
     stopped = threading.Event()
     lock = threading.RLock()
     server.gui.set_panel_label(f"{episode.dataset.upper()} · {episode.camera}")
-    server.scene.set_up_direction("+z")
+    server.scene.set_up_direction("-y" if camera_coordinates else "+z")
     with server.gui.add_folder("Playback"):
         frame = server.gui.add_slider("Frame slot", min=0, max=len(paths) - 1, step=1, initial_value=0)
         previous = server.gui.add_button("Previous")
@@ -123,7 +141,9 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
         show_gt_trajectory = server.gui.add_checkbox("Show GT trajectory (green)",
                                                      initial_value=args.show_gt_trajectory and gt_positions is not None,
                                                      disabled=gt_positions is None)
-        server.gui.add_markdown("Full selected clip. Orange: prediction; green: GT.\n\n"
+        server.gui.add_markdown("TCP poses and points use each frame's OpenCV camera coordinates. "
+                                "The trajectory connects camera-relative positions across the clip."
+                                if camera_coordinates else "Full selected clip. Orange: prediction; green: GT.\n\n"
                                 "Prediction uses predicted camera poses; GT uses dataset calibration."
                                 if load_ground_truth else
                                 "Orange: predicted TCP trajectory. Scene uses model-predicted coordinates; "
@@ -144,11 +164,11 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
         gt_trajectory = add_trajectory(server.scene, "/trajectories/gt", gt_positions, GT_COLOR)
         gt_node = server.scene.add_icosphere("/tcp_gt", radius=0.006, color=GT_COLOR)
         gt_label = server.scene.add_label("/tcp_gt/label", "GT TCP", position=(0, 0, 0.02))
-    first_cloud = prediction.clouds[0]["points"]
+    first_cloud = cloud_points(0)
     center = np.median(first_cloud, axis=0) if len(first_cloud) else tcp["position"][0, 0]
     extent = (max(float(np.max(np.percentile(first_cloud, 95, axis=0) - np.percentile(first_cloud, 5, axis=0))), 0.3)
               if len(first_cloud) else 0.5)
-    camera_rotation = prediction.camera_to_base[0, :3, :3]
+    camera_rotation = np.eye(3) if camera_coordinates else prediction.camera_to_base[0, :3, :3]
 
     @server.on_client_connect
     def connect(client):
@@ -164,7 +184,7 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
             cloud = prediction.clouds[slot]
             confidence = cloud["confidence"]
             mask = confidence >= np.percentile(confidence, percentile.value) if len(confidence) else np.zeros(0, dtype=bool)
-            cloud_node.points = cloud["points"][mask]
+            cloud_node.points = cloud_points(slot)[mask]
             cloud_node.colors = cloud["colors"][mask]
             cloud_node.point_size = point_size.value
             cloud_node.visible = show_cloud.value
@@ -256,20 +276,26 @@ def build_interactive(args, episode, device, dtype):
     initial = initial_frame(episode, valid)
     base, _, gt_available = selection_for_frame(episode, initial, uv, valid)
 
-    def clear(camera, frame):
+    def clear(camera, frame, query_mode):
         selected_episode, uv, valid, _ = camera_context(camera)
         frame = int(frame)
         image, points, gt_available = selection_for_frame(selected_episode, frame, uv, valid)
+        if query_mode == "gt":
+            if gt_available:
+                return (*use_gt(camera, frame), gr.update(interactive=True))
+            return (image, points, "projected GT TCP", None,
+                    "当前帧没有有效 GT TCP，请更换起始帧或切换到上一窗口预测模式。",
+                    gr.update(interactive=False), gr.update(interactive=False))
         status = f"相机 {camera} · 起始帧 {frame}；跳过前 {frame} 帧。请点击一个 TCP。"
         if not gt_available:
             status += " 当前帧无有效 GT，请手动选点。"
         return image, points, "interactive click", None, status, gr.update(interactive=False), gr.update(interactive=gt_available)
 
-    def switch_camera(camera):
+    def switch_camera(camera, query_mode):
         with lock:
             selected_episode, _, valid, gt_error = camera_context(camera)
             frame = initial_frame(selected_episode, valid)
-            selection = clear(camera, frame)
+            selection = clear(camera, frame, query_mode)
             if runtime["viewer"] is not None:
                 runtime["viewer"].stop()
                 runtime["viewer"] = None
@@ -298,25 +324,36 @@ def build_interactive(args, episode, device, dtype):
         return (overlay(read_rgb(selected_episode.image_paths[frame]), point[0]), point,
                 "projected GT TCP", [camera, frame], "已使用当前帧 GT TCP。", gr.update(interactive=True))
 
-    def run(camera, frame, points, source, selection_context, request: gr.Request, progress=gr.Progress()):
+    def run(camera, frame, points, source, selection_context, query_mode, request: gr.Request, progress=gr.Progress()):
         with lock:
             try:
                 frame = int(frame)
-                if selection_context != [camera, frame]:
-                    raise ValueError("相机或起始帧已改变，请重新选择 TCP。")
-                selected_episode, _, _, _ = camera_context(camera)
-                query = inference.validate_query(points)
+                if query_mode not in ("previous", "gt"):
+                    raise ValueError("无效的 query 来源。")
+                selected_episode, uv, valid, _ = camera_context(camera)
+                if query_mode == "gt":
+                    if uv is None or not valid[frame]:
+                        raise ValueError("当前起始帧没有有效 GT TCP。")
+                    query = inference.validate_query(uv[frame])
+                    source = "projected GT TCP"
+                else:
+                    if selection_context != [camera, frame]:
+                        raise ValueError("相机或起始帧已改变，请重新选择 TCP。")
+                    query = inference.validate_query(points)
+                run_args = copy.copy(args)
+                run_args.query_source = query_mode
                 selected_episode.clip(frame, args.max_frames)
                 progress(0, desc="加载 DROID Stage 1 checkpoint")
                 if runtime["model"] is None:
                     runtime["model"] = inference.load_model(args.model, device)
                 result, prediction, paths, saved = inference.run_and_save(
-                    args, selected_episode, runtime["model"], frame, query, source, device, dtype,
+                    run_args, selected_episode, runtime["model"], frame, query, source, device, dtype,
                     keep_geometry=True, progress=lambda fraction, text: progress(0.1 + 0.85 * fraction, desc=text))
                 if runtime["viewer"] is not None:
                     runtime["viewer"].stop()
                     runtime["viewer"] = None
-                runtime["viewer"] = start_viewer(args, selected_episode, prediction, paths)
+                runtime["viewer"] = start_viewer(args, selected_episode, prediction, paths,
+                                                  camera_coordinates=True)
                 port = runtime["viewer"].server.get_port()
                 host = args.host
                 if host in ("0.0.0.0", "::"):
@@ -339,8 +376,13 @@ def build_interactive(args, episode, device, dtype):
 
     with gr.Blocks(title=f"{episode.dataset.upper()} Stage 1 TCP Inference") as demo:
         gr.Markdown(f"# {episode.dataset.upper()} Stage 1 单臂推理\nEpisode：`{episode.path.name}`\n\n"
-                    "选择相机和起始帧，点击一个 TCP 或使用 GT，然后推理到结尾。切换相机或起始帧会清除选点。")
+                    "选择相机、起始帧和 query 来源。上一窗口预测模式需选择初始 TCP；每窗口 GT 模式无需手动选点。")
         camera = gr.Dropdown(choices=cameras, value=episode.camera, label="相机", interactive=True)
+        query_mode = gr.Radio(
+            choices=[("上一窗口最后一帧的预测 TCP", "previous"), ("每个窗口使用 GT TCP", "gt")],
+            value=getattr(args, "query_source", "previous"), label="滑动窗口 query 来源",
+            info="GT 模式包含首个窗口；若窗口起始帧的 GT 无效则报错。切换模式会重置选点。",
+            interactive=True)
         gt_note = gr.Markdown(f"GT 选点不可用：{gt_error}" if gt_error else "")
         points = gr.State([])
         source = gr.State("interactive click")
@@ -350,25 +392,31 @@ def build_interactive(args, episode, device, dtype):
                 start = gr.Slider(minimum=0, maximum=len(episode.image_paths) - 2, step=1,
                                   value=initial, label="起始帧（原始帧号）")
                 picture = gr.Image(value=base, type="numpy", interactive=False, label="点击一个 TCP", buttons=[])
-                status = gr.Markdown(f"起始帧 {initial}；跳过前 {initial} 帧。请点击一个 TCP。")
+                status = gr.Markdown(
+                    "每个窗口将使用 GT TCP，可直接运行推理。"
+                    if getattr(args, "query_source", "previous") == "gt" and gt_available else
+                    "当前帧无有效 GT，请更换起始帧或 query 模式。"
+                    if getattr(args, "query_source", "previous") == "gt" else
+                    f"起始帧 {initial}；跳过前 {initial} 帧。请点击一个 TCP。")
                 with gr.Row():
                     gt = gr.Button("使用当前帧 GT TCP", interactive=gt_available)
                     reset = gr.Button("重置选点")
-                    execute = gr.Button("运行推理", variant="primary", interactive=False)
+                    execute = gr.Button("运行推理", variant="primary", interactive=getattr(args, "query_source", "previous") == "gt" and gt_available)
             with gr.Column():
                 inference_status = gr.Markdown("尚未开始推理。")
                 download = gr.File(label="下载 TCP JSON")
                 output = gr.JSON(label="单臂轨迹 JSON")
         viewer = gr.HTML("<p>推理后显示 Viser 点云与 TCP。</p>")
         selection_outputs = [picture, points, source, selection_context, status, execute]
-        camera.change(switch_camera, inputs=[camera],
+        camera.change(switch_camera, inputs=[camera, query_mode],
                       outputs=[start, *selection_outputs, gt, gt_note, output, download, inference_status, viewer],
                       concurrency_id="droid_inference", concurrency_limit=1)
-        start.input(clear, inputs=[camera, start], outputs=selection_outputs + [gt], queue=False)
-        reset.click(clear, inputs=[camera, start], outputs=selection_outputs + [gt], queue=False)
+        start.input(clear, inputs=[camera, start, query_mode], outputs=selection_outputs + [gt], queue=False)
+        reset.click(clear, inputs=[camera, start, query_mode], outputs=selection_outputs + [gt], queue=False)
+        query_mode.change(clear, inputs=[camera, start, query_mode], outputs=selection_outputs + [gt], queue=False)
         picture.select(select, inputs=[camera, start], outputs=selection_outputs, queue=False)
         gt.click(use_gt, inputs=[camera, start], outputs=selection_outputs, queue=False)
-        execute.click(run, inputs=[camera, start, points, source, selection_context],
+        execute.click(run, inputs=[camera, start, points, source, selection_context, query_mode],
                       outputs=[output, download, inference_status, viewer],
                       concurrency_id="droid_inference", concurrency_limit=1)
 
