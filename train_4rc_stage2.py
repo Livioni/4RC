@@ -259,6 +259,21 @@ def build_optimizer(policy, config):
             groups.append({"name": name, "params": parameters, "lr": lr})
     if not groups:
         raise ValueError("No trainable stage-two parameters")
+
+    # Stage2 drops the ray pyramid and supervises only its finest output.
+    # Freeze only the coarser output branches, not the fusion pyramid feeding
+    # the finest level or the LayerNorm shared by all output_conv2_aux levels.
+    scratch = policy.arc.head.scratch
+    finest_ray_parameters = set(scratch.output_conv1_aux[-1].parameters()) | set(
+        scratch.output_conv2_aux[-1].parameters()
+    )
+    coarse_ray_parameters = set(scratch.output_conv1_aux[:-1].parameters()) | set(
+        scratch.output_conv2_aux[:-1].parameters()
+    )
+    for parameter in coarse_ray_parameters - finest_ray_parameters:
+        parameter.requires_grad_(False)
+    # Keep the original optimizer group layout for existing resume checkpoints;
+    # AdamW skips these parameters because their gradients remain None.
     return torch.optim.AdamW(
         groups, betas=(config["adam_beta1"], config["adam_beta2"]),
         eps=config["adam_epsilon"], weight_decay=config["weight_decay"],

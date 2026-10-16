@@ -3,10 +3,10 @@
 # ======================================================
 
 # == Common Configuration ==
-output_dir = "outputs/4rc-stage2-gr00t"
-wandb_run_name = "4rc-stage2-gr00t"
+output_dir = "outputs/4rc-stage2-gr00t-qity"
+wandb_run_name = "4rc-stage2-gr00t-qity"
 logging_dir = "logs"
-stage1_checkpoint = "checkpoints/RoboTwin-Stage1/model.safetensors"  # Shared visual/TCP initialization for every new run.
+stage1_checkpoint = "outputs/4rc-robotwin-stage1/final_checkpoint/model.safetensors"  # Shared visual/TCP initialization for every new run.
 resume = None  # Full-state resume of a V2 run only.
 
 # == Dataset Configuration ==
@@ -111,7 +111,7 @@ max_train_steps = 500_000
 gradient_accumulation_steps = 2
 mixed_precision = "bf16"
 max_grad_norm = 1.0
-find_unused_parameters = True
+find_unused_parameters = False
 
 # == Optimizer Configuration ==
 # Each module has an independent rate. A False train flag or zero LR freezes it.
