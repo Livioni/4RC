@@ -4,7 +4,7 @@
 Run from the repository root (activate the 4rc environment first)::
 
     python droid_script/infer_4rc_stage1.py --input datasets/droid_episodes/<episode>
-    python droid_script/infer_4rc_stage1.py --input datasets/robolab_eval_sets/AnimalsInBinTask/AnimalsInBinTask__20261009T135604Z_db476b7b_0008 --interactive
+    python droid_script/infer_4rc_stage1.py --input datasets/droid_eval_sets/AUTOLab__Mon_Aug_21_14:20:05_2023 --interactive
 """
 from __future__ import annotations
 

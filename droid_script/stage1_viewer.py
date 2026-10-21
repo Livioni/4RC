@@ -135,6 +135,12 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
                                           step=0.00001, initial_value=args.point_size)
         show_cloud = server.gui.add_checkbox("Show predicted point cloud", initial_value=True)
         show_tcp = server.gui.add_checkbox("Show predicted TCP pose", initial_value=True)
+    with server.gui.add_folder("Coordinate frames"):
+        show_camera_frame = server.gui.add_checkbox("Show camera frame", initial_value=True)
+        show_robot_frame = server.gui.add_checkbox("Show robot frame (predicted)", initial_value=True)
+        server.gui.add_markdown(
+            "Axes: **X red · Y green · Z blue**, length 0.1 m.\n\n"
+            "Robot frame uses the model-predicted camera-to-base pose for the current frame.")
     with server.gui.add_folder(f"TCP trajectories ({scene_frame})"):
         show_pred_trajectory = server.gui.add_checkbox("Show predicted trajectory (orange)",
                                                        initial_value=args.show_pred_trajectory)
@@ -157,6 +163,17 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
     tcp_node = server.scene.add_frame("/tcp", axes_length=0.05, axes_radius=0.001,
                                       origin_radius=0.004, origin_color=PRED_COLOR)
     label = server.scene.add_label("/tcp/label", "Pred TCP", position=(0, 0, 0.065))
+    def add_coordinate_frame(name, title):
+        node = server.scene.add_frame(name, axes_length=0.1, axes_radius=0.002,
+                                      origin_radius=0.005)
+        labels = [server.scene.add_label(f"{name}/label", title, position=(0, 0, -0.025))]
+        for axis, direction in zip("XYZ", np.eye(3)):
+            labels.append(server.scene.add_label(f"{name}/{axis}", axis,
+                                                 position=tuple(direction * 0.115)))
+        return node, labels
+
+    camera_node, camera_labels = add_coordinate_frame("/frames/camera", "Camera frame")
+    robot_node, robot_labels = add_coordinate_frame("/frames/robot", "Robot frame (predicted)")
     pred_trajectory = add_trajectory(server.scene, "/trajectories/pred", tcp["position"][:, 0], PRED_COLOR)
     gt_trajectory = []
     gt_node = gt_label = None
@@ -181,6 +198,19 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
             return
         with lock, server.atomic():
             slot = int(frame.value)
+            c2b = prediction.camera_to_base[slot]
+            if camera_coordinates:
+                # Express the robot-base origin and axes in the OpenCV camera frame.
+                robot_node.wxyz = tf.SO3.from_matrix(c2b[:3, :3].T).wxyz
+                robot_node.position = -c2b[:3, :3].T @ c2b[:3, 3]
+            else:
+                # The robot frame is the scene origin; move the camera frame instead.
+                camera_node.wxyz = tf.SO3.from_matrix(c2b[:3, :3]).wxyz
+                camera_node.position = c2b[:3, 3]
+            for node in (camera_node, *camera_labels):
+                node.visible = show_camera_frame.value
+            for node in (robot_node, *robot_labels):
+                node.visible = show_robot_frame.value
             cloud = prediction.clouds[slot]
             confidence = cloud["confidence"]
             mask = confidence >= np.percentile(confidence, percentile.value) if len(confidence) else np.zeros(0, dtype=bool)
@@ -212,7 +242,8 @@ def start_viewer(args, episode, prediction, paths, *, frame_rate=None,
                             f"confidence: **{tcp['confidence'][slot, 0]:.3f}**\n\n"
                             f"Visible predicted cloud points: {int(mask.sum())}. Scene: {scene_frame}.")
 
-    for control in (frame, percentile, point_size, show_cloud, show_tcp, show_pred_trajectory, show_gt_trajectory):
+    for control in (frame, percentile, point_size, show_cloud, show_tcp, show_pred_trajectory,
+                    show_gt_trajectory, show_camera_frame, show_robot_frame):
         control.on_update(lambda _: render())
     previous.on_click(lambda _: setattr(frame, "value", (int(frame.value) - 1) % len(paths)))
     following.on_click(lambda _: setattr(frame, "value", (int(frame.value) + 1) % len(paths)))
