@@ -12,7 +12,7 @@ class FrozenDINOv2Encoder(nn.Module):
     image_width = 266
 
     def __init__(
-        self, model_name="facebook/dinov2-giant", *, pretrained=True,
+        self, model_name="facebook/dinov2-large", *, pretrained=True,
         model_config=None, cache_dir=None, encoder=None,
     ):
         super().__init__()

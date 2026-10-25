@@ -123,13 +123,13 @@ condition_dim = 2048
 action_output_dim = 1024
 action_dropout = 0.2
 action_gradient_checkpointing = True
-wrist_model = "facebook/dinov2-giant"
+wrist_model = "facebook/dinov2-large"
 wrist_cache_dir = ".cache/huggingface"
 action_normalization = "componentwise"
 action_normalization_version = 2
 train_backbone = True
-train_geometry_head = True
-decode_geometry = True  # Skip the geometry head in training and validation.
+train_geometry_head = False
+decode_geometry = False  # Skip the geometry head in training and validation.
 train_motion_decoder = True  # Shared sparse TCP decoder; dense tracking is not run.
 train_query_encoder = True
 train_tcp_head = True
@@ -183,7 +183,7 @@ warmup_steps = 1000
 eta_min_factor = 0.1
 
 # == Loss Configuration ==
-geometry_loss_weight = 0.2
+geometry_loss_weight = 0.0
 tcp_loss_weight = 0.2
 action_loss_weight = 1.0
 

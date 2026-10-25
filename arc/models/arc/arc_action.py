@@ -249,7 +249,7 @@ class TCPActionPolicy(nn.Module):
         self, arc, *, language_encoder=None, t5_model="google-t5/t5-base", text_max_length=128,
         dim=1280, depth=12, heads=32, condition_dim=2048, output_dim=1024, dropout=0.2,
         prediction_horizon=32, global_token_grid=(14, 19), gradient_checkpointing=True,
-        padding=(1, 1, 6, 6), wrist_model="facebook/dinov2-giant", wrist_pretrained=True,
+        padding=(1, 1, 6, 6), wrist_model="facebook/dinov2-large", wrist_pretrained=True,
         wrist_encoder_config=None, wrist_cache_dir=None, wrist_encoder=None,
     ):
         super().__init__()
