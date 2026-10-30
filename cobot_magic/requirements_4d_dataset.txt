@@ -1,0 +1,11 @@
+# CPU-only conversion and ground-truth replay; no model/IK dependencies.
+numpy>=1.24
+h5py>=3.8
+opencv-python>=4.8
+PyYAML>=6
+scipy>=1.10
+trimesh>=4
+pycollada>=0.8
+rerun-sdk==0.35.0
+# Optional for refine_depth_to_urdf.py only (already present in the 4rc environment):
+# open3d>=0.19
