@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert real ALOHA HDF5 episodes into calibrated dual-arm RoboLab-like data."""
+"""Convert real ALOHA HDF5 episodes, including wrist RGB, into dual-arm RoboLab-like data."""
 from __future__ import annotations
 
 import argparse
@@ -26,6 +26,9 @@ from cobot_magic.geometry import (
     RPY_CONVENTION, SOURCE_CAMERA, STATE_COLUMNS, WRISTS, RobotModel, file_digest,
     poses_to_states, read_calibration, rigid_transform,
 )
+
+
+RGB_CAMERAS = {CAMERA: SOURCE_CAMERA, "left_view": "cam_left_wrist", "right_view": "cam_right_wrist"}
 
 
 def json_value(value):
@@ -73,6 +76,20 @@ def discover_sources(path):
     return root, dict(groups)
 
 
+def source_rgb_cameras(source, count):
+    cameras = {}
+    for camera, source_camera in RGB_CAMERAS.items():
+        key = f"observations/images/{source_camera}"
+        if key not in source:
+            if camera == CAMERA:
+                raise ValueError(f"{source.filename}: missing {key}")
+            continue
+        if source[key].shape != (count, 480, 640, 3) or source[key].dtype != np.uint8:
+            raise ValueError(f"{source.filename}: expected {key} uint8 RGB [{count},480,640,3]")
+        cameras[camera] = source_camera
+    return cameras
+
+
 def inspect_source(path):
     with h5py.File(path, "r") as source:
         rgb_path, depth_path = (f"observations/{kind}/{SOURCE_CAMERA}"
@@ -83,6 +100,7 @@ def inspect_source(path):
         count = source["observations/qpos"].shape[0]
         if count < 1:
             raise ValueError(f"Empty episode: {path}")
+        rgb_cameras = source_rgb_cameras(source, count)
         for name in ("observations/qpos", "action", "observations/qvel", "observations/effort"):
             if name in source and (source[name].shape != (count, 14)
                                    or source[name].dtype.kind != "f"):
@@ -96,7 +114,7 @@ def inspect_source(path):
                               ("depth_alignment", "factory_calibrated_d2c_to_rectified_color")):
             if key in source.attrs and json_value(source.attrs[key]) != expected:
                 raise ValueError(f"{path}: unsupported {key}={source.attrs[key]!r}")
-        return {"frames": count,
+        return {"frames": count, "rgb_cameras": rgb_cameras,
                 "needs_fps": (f"observations/camera_timestamps/{SOURCE_CAMERA}" not in source
                               and "capture_fps_target" not in source.attrs)}
 
@@ -257,17 +275,25 @@ def validate_episode(path):
             or depth_meta.get("cameras", {}).get(CAMERA) != {"frames": count, "width": 320, "height": 240}):
         raise ValueError("Invalid depth metadata")
     expected_names = {f"{i:06d}.png" for i in range(count)}
+    rgb_cameras = meta.get("rgb_cameras", {CAMERA: SOURCE_CAMERA})
+    if (not isinstance(rgb_cameras, dict) or rgb_cameras.get(CAMERA) != SOURCE_CAMERA
+            or any(RGB_CAMERAS.get(camera) != source_camera
+                   for camera, source_camera in rgb_cameras.items())):
+        raise ValueError("Invalid RGB camera metadata")
+    # Incremental wrist extraction deliberately preserves the original metadata.
+    rgb_cameras = {**rgb_cameras, **{camera: source_camera for camera, source_camera in RGB_CAMERAS.items()
+                                   if (path / "images" / camera).is_dir()}}
     valid_depth = 0
-    for kind in ("images", "depths"):
-        directory = path / kind / CAMERA
-        if {p.name for p in directory.iterdir()} != expected_names:
-            raise ValueError(f"Non-contiguous or mismatched {kind} frames")
+    for kind, camera in [("images", camera) for camera in rgb_cameras] + [("depths", CAMERA)]:
+        directory = path / kind / camera
+        if not directory.is_dir() or {p.name for p in directory.iterdir()} != expected_names:
+            raise ValueError(f"Non-contiguous or mismatched {kind}/{camera} frames")
         for i in range(count):
             frame = cv2.imread(str(directory / f"{i:06d}.png"), cv2.IMREAD_UNCHANGED)
             shape = (240, 320, 3) if kind == "images" else (240, 320)
             dtype = np.uint8 if kind == "images" else np.uint16
             if frame is None or frame.shape != shape or frame.dtype != dtype:
-                raise ValueError(f"Invalid {kind} frame {i}")
+                raise ValueError(f"Invalid {kind}/{camera} frame {i}")
             if kind == "depths":
                 valid_depth += np.count_nonzero(frame)
     xyz = poses[..., :3, 3]
@@ -276,7 +302,7 @@ def validate_episode(path):
                    where=pixels[..., 2:] != 0)
     visible = ((xyz[..., 2] > 0) & (uv[..., 0] >= 0) & (uv[..., 0] < 320)
                & (uv[..., 1] >= 0) & (uv[..., 1] < 240))
-    return {"frames": count, "valid_depth_pixels": int(valid_depth),
+    return {"frames": count, "rgb_cameras": list(rgb_cameras), "valid_depth_pixels": int(valid_depth),
             "tcp_in_image_frames": dict(zip(ARMS, visible.sum(axis=0).tolist()))}
 
 
@@ -292,6 +318,7 @@ def convert_episode(source_path, destination, record, model, offsets, intrinsic,
             if not np.isfinite(action).all():
                 raise ValueError("Nonfinite source actions")
             count = len(qpos)
+            rgb_cameras = source_rgb_cameras(source, count)
             times, raw_times, fps, clock = read_timing(source, count, record)
             openness = np.clip(qpos[:, [6, 13]] / 0.10, 0, 1)
             base_poses = model.tcp_poses(qpos, offsets)
@@ -334,16 +361,20 @@ def convert_episode(source_path, destination, record, model, offsets, intrinsic,
                 "depth_type": "distance_to_image_plane", "frame_alignment": "index",
                 "cameras": {CAMERA: {"frames": count, "width": 320, "height": 240}},
             })
-            for kind in ("images", "depths"):
-                (temporary / kind / CAMERA).mkdir(parents=True)
+            for camera in rgb_cameras:
+                (temporary / "images" / camera).mkdir(parents=True)
+            (temporary / "depths" / CAMERA).mkdir(parents=True)
             for i in range(count):
-                rgb = cv2.resize(source[f"observations/images/{SOURCE_CAMERA}"][i],
-                                 (320, 240), interpolation=cv2.INTER_AREA)
+                for camera, source_camera in rgb_cameras.items():
+                    rgb = cv2.resize(source[f"observations/images/{source_camera}"][i],
+                                     (320, 240), interpolation=cv2.INTER_AREA)
+                    if not cv2.imwrite(str(temporary / "images" / camera / f"{i:06d}.png"),
+                                       cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)):
+                        raise OSError(f"Failed writing images/{camera} frame {i}")
                 depth = cv2.resize(source[f"observations/images_depth/{SOURCE_CAMERA}"][i],
                                    (320, 240), interpolation=cv2.INTER_NEAREST)
-                for kind, image in (("images", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)), ("depths", depth)):
-                    if not cv2.imwrite(str(temporary / kind / CAMERA / f"{i:06d}.png"), image):
-                        raise OSError(f"Failed writing {kind} frame {i}")
+                if not cv2.imwrite(str(temporary / "depths" / CAMERA / f"{i:06d}.png"), depth):
+                    raise OSError(f"Failed writing depths/{CAMERA} frame {i}")
                 if i == 0 or (i + 1) % 100 == 0 or i + 1 == count:
                     print(f"{source_path.name}: {i + 1}/{count} 帧", flush=True)
             layout = [f"{p}_joint{i}" for p in ("fl", "fr") for i in range(1, 8)]
@@ -352,6 +383,7 @@ def convert_episode(source_path, destination, record, model, offsets, intrinsic,
                 "format": FORMAT, "task": record["task"], "episode": destination.name,
                 "language_instruction": [record["instruction"]], "status": record["status"],
                 "complete": True, "camera_id": CAMERA, "source_camera": SOURCE_CAMERA,
+                "rgb_cameras": rgb_cameras,
                 "width": 320, "height": 240, "fps": fps, "frame_count": count,
                 "frame_alignment": "same source HDF5 row for RGB, depth, state and action; no resampling",
                 "timestamp_unit": "seconds", "timestamp_clock": clock,
@@ -399,6 +431,95 @@ def converted_episodes(path):
     if not episodes:
         raise ValueError(f"No converted episodes found under {path}")
     return sorted(episodes)
+
+
+def inspect_wrist_append(path):
+    """Plan an append without modifying any episode files or metadata."""
+    path = Path(path)
+    meta = json.loads((path / "metadata.json").read_text(encoding="utf-8"))
+    count = meta["frame_count"]
+    if (meta.get("format") != FORMAT or meta.get("complete") is not True
+            or not isinstance(count, int) or count < 1
+            or (meta["width"], meta["height"]) != (320, 240)):
+        raise ValueError(f"Unsupported converted episode: {path}")
+    source_path = Path(meta["source"]["path"]).expanduser()
+    with h5py.File(source_path, "r") as source:
+        qpos = np.load(path / "observations/joint_position.npy", allow_pickle=False)
+        if (qpos.shape != (count, 14)
+                or not np.array_equal(qpos, source["observations/qpos"])):
+            raise ValueError(f"Source joints/frame alignment mismatch: {path}")
+        timestamp_path = path / "observations/camera_timestamp.npy"
+        if timestamp_path.is_file():
+            key = f"observations/camera_timestamps/{SOURCE_CAMERA}"
+            if key not in source or not np.array_equal(
+                    np.load(timestamp_path, allow_pickle=False), source[key]):
+                raise ValueError(f"Source camera timestamps mismatch: {path}")
+        cameras = source_rgb_cameras(source, count)
+        for camera in ("left_view", "right_view"):
+            if camera not in cameras:
+                raise ValueError(f"{source_path}: missing wrist RGB {RGB_CAMERAS[camera]}")
+    expected = {f"{i:06d}.png" for i in range(count)}
+    existing = {}
+    for camera in ("left_view", "right_view"):
+        directory = path / "images" / camera
+        if directory.exists() and not directory.is_dir():
+            raise ValueError(f"Expected wrist image directory: {directory}")
+        names = {p.name for p in directory.glob("*.png")}
+        if names - expected:
+            raise ValueError(f"Unexpected wrist frame names: {directory}")
+        for name in names:
+            frame = cv2.imread(str(directory / name), cv2.IMREAD_UNCHANGED)
+            if frame is None or frame.shape != (240, 320, 3) or frame.dtype != np.uint8:
+                raise ValueError(f"Invalid existing wrist frame; will not overwrite: {directory / name}")
+        existing[camera] = len(names)
+    return {"episode": str(path), "source": str(source_path), "frames": count,
+            "existing": existing, "missing": {camera: count - n for camera, n in existing.items()}}
+
+
+def write_png_exclusive(target, image):
+    """Publish a complete PNG atomically; an existing destination always wins."""
+    success, encoded = cv2.imencode(".png", image)
+    if not success:
+        raise OSError(f"Failed encoding PNG: {target}")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix=f".{target.name}.",
+                                         delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded.tobytes())
+        try:
+            os.link(temporary, target)
+        except FileExistsError:
+            return False
+        return True
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def append_wrist_rgb(path):
+    """Resume wrist RGB extraction, leaving every existing file unchanged."""
+    path = Path(path)
+    plan = inspect_wrist_append(path)
+    written, skipped = {}, {}
+    with h5py.File(plan["source"], "r") as source:
+        for camera in ("left_view", "right_view"):
+            directory = path / "images" / camera
+            directory.mkdir(parents=True, exist_ok=True)
+            images = source[f"observations/images/{RGB_CAMERAS[camera]}"]
+            written[camera] = skipped[camera] = 0
+            for i in range(plan["frames"]):
+                target = directory / f"{i:06d}.png"
+                if os.path.lexists(target):
+                    skipped[camera] += 1
+                    continue
+                rgb = cv2.resize(images[i], (320, 240), interpolation=cv2.INTER_AREA)
+                if write_png_exclusive(target, cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)):
+                    written[camera] += 1
+                else:
+                    skipped[camera] += 1
+            print(f"{path.name}: {camera} 新增 {written[camera]}，跳过 {skipped[camera]}", flush=True)
+    return {"episode": str(path), "frames": plan["frames"], "written": written, "skipped": skipped}
 
 
 def recompute_episode(path, calibration_path, *, urdf=None, offset_left=None,
@@ -472,11 +593,11 @@ def recompute_episode(path, calibration_path, *, urdf=None, offset_left=None,
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--input", type=Path, default=argparse.SUPPRESS,
-                        help="HDF5 source (default: datasets/4_cams); with --recompute-tcp/--validate-only, "
+                        help="HDF5 source (default: datasets/4_cams); in existing-data modes, "
                              "the existing dataset, task directory or episode to process")
     parser.add_argument("--output", type=Path, default=argparse.SUPPRESS,
                         help="Conversion destination (default: datasets/4_cams_robolab); "
-                             "also accepted as the existing-data path for --recompute-tcp/--validate-only")
+                             "also accepted as the existing-data path")
     parser.add_argument("--calibration", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--urdf", type=Path,
                         help="Default: bundled URDF for conversion; recorded URDF for recalculation")
@@ -487,20 +608,26 @@ def parse_args(argv=None):
     parser.add_argument("--tcp-offset-right", nargs=3, type=float, metavar=("X", "Y", "Z"))
     parser.add_argument("--joint-default", action="append", default=[], metavar="NAME=VALUE",
                         help="Override an unobserved joint; repeat as necessary")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Inspect conversion or wrist append without writing or prompting")
     mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Inspect source episodes without writing or prompting")
     mode.add_argument("--validate-only", action="store_true",
                       help="Validate converted episodes selected by --input or --output")
     mode.add_argument("--recompute-tcp", action="store_true",
                       help="Update episodes selected by --input or --output in place with the current calibration; "
                            "reuse RGB-D/instructions")
+    mode.add_argument("--append-wrist-rgb", action="store_true",
+                      help="Add missing wrist PNGs to existing episodes using recorded source HDF5 paths; "
+                           "never overwrite any existing file or metadata")
     args = parser.parse_args(argv)
+    if args.dry_run and (args.recompute_tcp or args.validate_only):
+        parser.error("--dry-run supports conversion and --append-wrist-rgb only")
     # Preserve whether a path was explicitly supplied before applying conversion defaults.
     input_path, output_path = getattr(args, "input", None), getattr(args, "output", None)
-    if args.recompute_tcp or args.validate_only:
+    if args.recompute_tcp or args.validate_only or args.append_wrist_rgb:
         if (input_path is not None and output_path is not None
                 and input_path.expanduser().resolve() != output_path.expanduser().resolve()):
-            parser.error("--recompute-tcp/--validate-only update or check existing data in place; "
+            parser.error("Existing-data modes update or check existing data in place; "
                          "use --input or --output to select one existing path, not two different paths")
         output_path = input_path or output_path
     args.input = input_path or ROOT / "datasets/4_cams"
@@ -510,6 +637,19 @@ def parse_args(argv=None):
 
 def run(args):
     args.output = args.output.expanduser().resolve()
+    if args.append_wrist_rgb:
+        episodes = converted_episodes(args.output)
+        # Check every source and alignment before creating the first file.
+        plans = [inspect_wrist_append(episode) for episode in episodes]
+        if args.dry_run:
+            print(json.dumps(plans, ensure_ascii=False, indent=2))
+            return
+        reports = [append_wrist_rgb(episode) for episode in episodes]
+        print(json.dumps({"episodes": len(reports),
+                          "written": sum(sum(r["written"].values()) for r in reports),
+                          "skipped": sum(sum(r["skipped"].values()) for r in reports)},
+                         ensure_ascii=False), flush=True)
+        return
     if args.validate_only:
         for episode in converted_episodes(args.output):
             print(episode, json.dumps(validate_episode(episode), ensure_ascii=False), flush=True)

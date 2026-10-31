@@ -1,6 +1,7 @@
 # 四相机 HDF5 → 4d_dataset 风格双臂数据与 Rerun 回放
 
-转换只导出 `cam_third_person` 的 RGB-D，保留每个 episode 的双臂状态、动作、
+转换导出 `cam_third_person` 的 RGB-D，以及源文件中存在的 `cam_left_wrist`、
+`cam_right_wrist` 的 RGB，保留每个 episode 的双臂状态、动作、
 相机标定和 TCP。回放只读取转换结果，不加载神经网络或运行 IK。
 
 ## 环境
@@ -85,6 +86,20 @@ python cobot_magic/convert_to_4d_dataset.py --recompute-tcp \
 已有数据集根目录、任务目录或单个 episode；两者同时填写时必须指向同一路径。
 重算会原地更新选中的数据。
 
+已有数据只需补齐腕部 RGB 时，使用增量模式：
+
+```bash
+python cobot_magic/convert_to_4d_dataset.py --append-wrist-rgb \
+  --input /path/to/converted/task --dry-run
+python cobot_magic/convert_to_4d_dataset.py --append-wrist-rgb \
+  --input /path/to/converted/task
+```
+
+此模式根据各 episode 原 `metadata.json` 中的 `source.path` 查找 HDF5，
+核对源关节和时间戳后，仅新增 `images/left_view/`、`images/right_view/` 中缺失的 PNG。
+所有已有文件（包括 metadata 和已导出的腕图）均不改写；可中断后重跑。
+已有腕图无效时会报错，留给用户处理，不自动替换。
+
 重算读取已有观测关节，更新内外参、相机坐标 TCP 状态/完整位姿、基座坐标 TCP
 和来源元数据。RGB-D 使用硬链接复用，保留 instruction、动作和时间戳。
 在临时目录校验成功后才替换原 episode，发布失败时恢复原目录。
@@ -128,6 +143,8 @@ python cobot_magic/convert_to_4d_dataset.py --recompute-tcp \
 | 路径 | 含义 |
 | --- | --- |
 | `images/third_person/000000.png` | RGB，320×240 |
+| `images/left_view/000000.png` | 左腕 RGB，320×240（源文件存在时） |
+| `images/right_view/000000.png` | 右腕 RGB，320×240（源文件存在时） |
 | `depths/third_person/000000.png` | 对齐的 uint16 毫米深度 |
 | `intrinsic/third_person.npy` | `[3,3]`，对应导出图像 |
 | `extrinsic/third_person.npy` | `[4,4]`，footprint → camera |
@@ -145,6 +162,9 @@ python cobot_magic/convert_to_4d_dataset.py --recompute-tcp \
 
 源 qvel、effort、base_action 存在时分别保存为
 `observations/joint_velocity.npy`、`observations/effort.npy`、`action/base_action.npy`。
+`metadata.json` 的 `rgb_cameras` 记录导出目录名到源相机名的映射。
+腕部图像使用 RGB 面积插值缩至 320×240，与第三人称图像按同一源行和帧号对应；
+`--validate-only` 会检查所有已导出 RGB 相机的帧数、尺寸与类型。
 双臂顺序固定 `[left,right]`；TCP 每臂列为
 `[x,y,z,roll,pitch,yaw,gripper_open]`，位置米、角度弧度，
 `R = Rz(yaw) @ Ry(pitch) @ Rx(roll)`。
