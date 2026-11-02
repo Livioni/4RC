@@ -23,7 +23,7 @@ class NoActionEpisodes(RuntimeError):
 class RoboTwinActionDataset(RoboTwin4RC):
     def __init__(
         self, root, *, history_frames=4, prediction_horizon=32, split="train",
-        validation_fraction=0.1, split_key="robotwin", **options,
+        validation_fraction=0.1, split_key="robotwin", independent_validation=False, **options,
     ):
         if history_frames < 1 or prediction_horizon < 1:
             raise ValueError("History and prediction horizons must be positive")
@@ -32,7 +32,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
         self.history_frames = int(history_frames)
         self.prediction_horizon = int(prediction_horizon)
         self.split = split
-        super().__init__(
+        self._initialize_base(
             # Discover short episodes/segments too; repeated oldest frames fill
             # the history. The action sampler below still returns exactly H views.
             root, min_views=1, max_views=history_frames,
@@ -45,16 +45,16 @@ class RoboTwinActionDataset(RoboTwin4RC):
             key = f"{split_key}/{episode.task}/{episode.name}"
             fraction = int(hashlib.sha256(key.encode()).hexdigest()[:16], 16) / 2**64
             is_validation = fraction < validation_fraction
-            if is_validation != (split == "validation"):
+            if not independent_validation and is_validation != (split == "validation"):
                 continue
-            texts = self._read_json(episode.path / "metadata.json").get("instructions", [])
+            texts = self._episode_instructions(episode)
             if not isinstance(texts, list):
                 raise ValueError(f"Expected an instruction list in {episode.path}")
             texts = tuple(text.strip() for text in texts if isinstance(text, str) and text.strip())
             if not texts:
                 continue
             states = self._read_states(episode)
-            intrinsics = np.load(episode.path / "intrinsics" / f"{self.view}.npy")
+            intrinsics = self._read_intrinsics(episode)
             pixels = np.einsum("ij,taj->tai", intrinsics, states[..., :3])
             with np.errstate(divide="ignore", invalid="ignore"):
                 uv = pixels[..., :2] / pixels[..., 2:3]
@@ -77,10 +77,10 @@ class RoboTwinActionDataset(RoboTwin4RC):
             possible = np.concatenate(ranges) if ranges else np.empty(0, dtype=np.int64)
             if not len(possible):
                 continue
-            extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy")
+            extrinsics = self._read_extrinsics(episode)
             if not np.isfinite(extrinsics).all():
                 raise ValueError(f"Invalid camera extrinsics in {episode.path}")
-            robot_states = read_robot_states(episode.path, episode.num_frames)
+            robot_states = self._read_robot_states(episode)
             anchors = possible + history_frames - 1
             validate_robot_states(robot_states[anchors])
             kept.append(episode)
@@ -98,6 +98,24 @@ class RoboTwinActionDataset(RoboTwin4RC):
             for episode in kept
         ]
 
+    def _initialize_base(self, root, **options):
+        super().__init__(root, **options)
+
+    def _episode_instructions(self, episode):
+        return self._read_json(episode.path / "metadata.json").get("instructions", [])
+
+    def _read_intrinsics(self, episode):
+        return np.load(episode.path / "intrinsics" / f"{self.view}.npy")
+
+    def _read_extrinsics(self, episode):
+        return np.load(episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r")
+
+    def _read_robot_states(self, episode):
+        return read_robot_states(episode.path, episode.num_frames)
+
+    def _sample_anchor(self, sample):
+        return int(sample["frame_indices"][-1])
+
     def _read_states(self, episode):
         return np.stack([
             np.load(episode.path / self.tcp_directory / name, mmap_mode="r")
@@ -106,7 +124,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
 
     def iter_current_robot_states(self):
         for episode, starts in zip(self.episodes, self.starts):
-            states = read_robot_states(episode.path, episode.num_frames)
+            states = self._read_robot_states(episode)
             anchors = np.unique(starts + self.history_frames - 1)
             for begin in range(0, len(anchors), 8192):
                 yield np.asarray(states[anchors[begin:begin + 8192]], dtype=np.float32)
@@ -117,7 +135,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
             anchors = starts + self.history_frames - 1
             ends = np.asarray([end for _, end in episode.valid_segments], dtype=np.int64)
             segment_ends = ends[np.searchsorted(ends, anchors, side="right")]
-            extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r")
+            extrinsics = self._read_extrinsics(episode)
             yield from iter_future_action_rows(
                 self._read_states(episode), extrinsics, anchors, segment_ends, self.prediction_horizon,
             )
@@ -156,15 +174,15 @@ class RoboTwinActionDataset(RoboTwin4RC):
         episode_index = int(index[0] if isinstance(index, tuple) else index)
         sample = super().__getitem__(index)
         episode = self.episodes[episode_index]
-        future_indices = int(sample["frame_indices"][-1]) + np.arange(1, self.prediction_horizon + 1)
-        anchor = int(sample["frame_indices"][-1])
+        anchor = self._sample_anchor(sample)
+        future_indices = anchor + np.arange(1, self.prediction_horizon + 1)
         # Retain real source timestamps, including repeated oldest observations.
         segment_end = next(end for start, end in episode.valid_segments if start <= anchor < end)
         future_valid = future_indices < segment_end
         # Repeat the last valid state only for storage; masked positions carry no supervision.
         padded_indices = np.minimum(future_indices, segment_end - 1)
         future_state = torch.from_numpy(self._read_states(episode)[padded_indices].copy()).float()
-        extrinsics = np.load(episode.path / "extrinsics" / f"{self.view}.npy", mmap_mode="r")
+        extrinsics = self._read_extrinsics(episode)
         targets = future_actions_in_current_camera(
             future_state, torch.tensor(extrinsics[padded_indices]),
             sample["extrinsics"][-1],
@@ -192,7 +210,7 @@ class RoboTwinActionDataset(RoboTwin4RC):
 
     def _extra_sample_fields(self, episode, frame_indices, augmentation):
         transform = None if augmentation is None else partial(self._apply_augmentation, params=augmentation)
-        state = np.array(read_robot_states(episode.path, episode.num_frames)[frame_indices[-1]], dtype=np.float32)
+        state = np.array(self._read_robot_states(episode)[frame_indices[-1]], dtype=np.float32)
         validate_robot_states(state[None])
         return {"wrist_images": load_wrist_images(episode.path, frame_indices[-1], transform=transform),
                 "current_robot_state": torch.from_numpy(state)}
@@ -211,13 +229,16 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
         "max_tcp_angular_speed", "seed", "max_episodes",
     )
     for source in config["data_sources"]:
-        if source.get("type", "robotwin") != "robotwin":
-            raise ValueError("Stage two currently supports RoboTwin action labels")
+        source_type = source.get("type", "robotwin")
+        if source_type not in ("robotwin", "pen_cups"):
+            raise ValueError(f"Unsupported Stage2 source: {source_type}")
         if source.get("weight", 1.0) <= 0:
             continue
         options = {key: config[key] for key in common_keys if key in config}
         source_options = dict(source.get("options", {}))
         root = source_options.pop("root")
+        if split == "validation" and source_type == "pen_cups" and config.get("validation_data_root"):
+            root = config["validation_data_root"]
         options.update(source_options)
         # Stage2 uses one task selection for every enabled source and both splits.
         options["tasks"] = config.get("tasks")
@@ -226,15 +247,27 @@ def build_action_dataset(config: dict[str, Any], split="train") -> WeightedDatas
         options["augment"] = bool(config.get("augment", True)) and split == "train"
         options["color_augment"] = bool(config.get("color_augment", False))
         try:
-            dataset = RoboTwinActionDataset(
+            if source_type == "pen_cups":
+                from .pen_cups_action import PenCupsActionDataset
+                dataset_class = PenCupsActionDataset
+                options["frame_stride"] = config.get("frame_stride", 1)
+                validation_fraction = 0.0
+                # An independent validation root has no episode overlap.
+                if split == "validation":
+                    options["frame_stride"] = config.get("frame_stride", 1)
+            else:
+                dataset_class = RoboTwinActionDataset
+                validation_fraction = config.get("validation_fraction", 0.1)
+            dataset = dataset_class(
                 root, history_frames=config["history_frames"],
                 prediction_horizon=config["prediction_horizon"], split=split,
-                validation_fraction=config.get("validation_fraction", 0.1),
-                split_key=source["name"], **options,
+                validation_fraction=validation_fraction,
+                split_key=source["name"],
+                independent_validation=(source_type == "pen_cups" and split == "validation"), **options,
             )
         except NoActionEpisodes:
             if split == "validation":
                 continue
             raise
-        sources.append(DatasetSource(source["name"], "robotwin_action", dataset, source.get("weight", 1.0)))
+        sources.append(DatasetSource(source["name"], f"{source_type}_action", dataset, source.get("weight", 1.0)))
     return WeightedDatasetMixture(sources) if sources else None

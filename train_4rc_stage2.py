@@ -475,6 +475,8 @@ def main():
     init_kwargs = {}
     if config.get("wandb_run_name"):
         init_kwargs["wandb"] = {"name": config["wandb_run_name"]}
+    if config.get("swanlab_run_name") and "swanlab" in config["report_to"]:
+        init_kwargs["swanlab"] = {"experiment_name": config["swanlab_run_name"]}
     accelerator.init_trackers("4RC-Stage2-Action", config=tracker_config, init_kwargs=init_kwargs)
     geometry, tcp = build_criteria(config)
     geometry, tcp = geometry.to(accelerator.device), tcp.to(accelerator.device)

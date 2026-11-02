@@ -374,7 +374,10 @@ def main() -> None:
         key: json.dumps(value) if isinstance(value, (tuple, list, dict)) else value
         for key, value in config.items()
     }
-    accelerator.init_trackers("4RC-RoboTwin-TCP", config=tracker_config)
+    init_kwargs = {}
+    if config.get("swanlab_run_name") and "swanlab" in config.get("report_to", []):
+        init_kwargs["swanlab"] = {"experiment_name": config["swanlab_run_name"]}
+    accelerator.init_trackers("4RC-RoboTwin-TCP", config=tracker_config, init_kwargs=init_kwargs)
 
     dataset = build_training_dataset(config)
     batch_sampler = WeightedMultiSourceBatchSampler(

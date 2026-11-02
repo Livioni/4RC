@@ -10,8 +10,8 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-DEFAULT_MODEL_PATH = Path("outputs/4rc-stage2-action-bs4x3/checkpoint-90000")
-DEFAULT_REPO_ID = "HarrisonPENG/4RC-Action-RoboTwin-Stage2"
+DEFAULT_MODEL_PATH = Path("outputs/TCP4D-pen-cups-stage2")
+DEFAULT_REPO_ID = "HarrisonPENG/TCP4D-task1"
 DEFAULT_ENDPOINT = "https://huggingface.co"
 DEFAULT_EXCLUDES = ("optimizer*", "scheduler*", "random_states*")
 

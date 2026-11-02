@@ -616,3 +616,15 @@ def _build_droid_adapter(spec, config):
 
 
 register_dataset_adapter("droid", _build_droid_adapter)
+
+
+def _build_pen_cups_adapter(spec, config):
+    from .pen_cups import PenCups4RC
+
+    options = {key: config[key] for key in _ROBOTWIN_CONFIG_KEYS if key in config}
+    options.update(spec.get("options", {}))
+    root = options.pop("root")
+    return PenCups4RC(root, **options)
+
+
+register_dataset_adapter("pen_cups", _build_pen_cups_adapter)

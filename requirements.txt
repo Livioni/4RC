@@ -13,6 +13,7 @@ hydra-optuna-sweeper
 
 # --------- loggers --------- #
 wandb
+swanlab
 
 # --------- others --------- #
 rootutils       # standardizing the project root setup
@@ -46,5 +47,5 @@ pyglet<2
 huggingface-hub[torch]>=0.22
 modelscope-hub
 transformers>=4.40.0
-accelerate>=0.27.0
+accelerate>=1.8.0
 qwen-vl-utils
