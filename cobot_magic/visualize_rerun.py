@@ -192,7 +192,10 @@ def log_scene(recording, args, meta, indices, model, tree):
     recording.log("world/camera_frustum", rr.Pinhole(
         image_from_camera=intrinsic, width=IMAGE_WIDTH, height=IMAGE_HEIGHT,
         camera_xyz=rr.ViewCoordinates.RDF,
-        parent_frame=CAMERA_FRAME, child_frame="third_person_image", image_plane_distance=0.15), static=True)
+        # Leave child_frame implicit so it is exactly the coordinate frame of
+        # this entity path. Spatial2DView(origin="world/camera_frustum") then
+        # finds the Pinhole at its origin and can project 3D visualizers.
+        parent_frame=CAMERA_FRAME, image_plane_distance=0.15), static=True)
     recording.log("world/point_cloud", rr.CoordinateFrame(BASE_FRAME), static=True)
     log_robot(recording, model, tree, qpos, indices, timestamps)
     for arm, name in enumerate(ARMS):
