@@ -1,0 +1,4 @@
+# Install in the existing 4rc environment (project/model dependencies are unchanged).
+websockets>=15,<17
+msgpack>=1,<2
+numpy
