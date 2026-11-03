@@ -31,6 +31,7 @@ from cobot_magic.refine_depth_to_urdf import CORRECTED_DIRECTORY, validate_corre
 
 BASE_FRAME = "footprint"
 CAMERA_FRAME = "third_person_opencv"
+IMAGE_FRAME = "third_person_image"
 ROBOT_PREFIX = "aloha/"
 ROBOT_ENTITY = "robot_model"
 TIMELINE = "episode_time"
@@ -189,13 +190,13 @@ def log_scene(recording, args, meta, indices, model, tree):
     recording.log("world/camera_pose", rr.Transform3D(
         translation=camera_to_base[:3, 3], mat3x3=camera_to_base[:3, :3],
         parent_frame=BASE_FRAME, child_frame=CAMERA_FRAME), static=True)
-    recording.log("world/camera_frustum", rr.Pinhole(
+    recording.log("world/camera_frustum", rr.CoordinateFrame(IMAGE_FRAME), rr.Pinhole(
         image_from_camera=intrinsic, width=IMAGE_WIDTH, height=IMAGE_HEIGHT,
         camera_xyz=rr.ViewCoordinates.RDF,
-        # Leave child_frame implicit so it is exactly the coordinate frame of
-        # this entity path. Spatial2DView(origin="world/camera_frustum") then
-        # finds the Pinhole at its origin and can project 3D visualizers.
-        parent_frame=CAMERA_FRAME, image_plane_distance=0.15), static=True)
+        # The view origin must belong to the Pinhole's *child* (pixel) frame.
+        # Defining the transform's child_frame alone does not assign the
+        # entity's CoordinateFrame; specify both to avoid implicit-frame edges.
+        parent_frame=CAMERA_FRAME, child_frame=IMAGE_FRAME, image_plane_distance=0.15), static=True)
     recording.log("world/point_cloud", rr.CoordinateFrame(BASE_FRAME), static=True)
     log_robot(recording, model, tree, qpos, indices, timestamps)
     for arm, name in enumerate(ARMS):
