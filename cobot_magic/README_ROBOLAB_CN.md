@@ -197,9 +197,12 @@ rerun --web-viewer outputs/cobot_magic/episode_0.rrd
 默认 9090/9876，占用时选空闲端口；默认 WebGL，也可 `--renderer webgpu`。
 使用时间面板播放、暂停和拖动，Ctrl+C 停止服务。
 
-上方 3D 视图显示 footprint 坐标系中的彩色点云、完整 ALOHA URDF、
-相机视锥和双臂轨迹/姿态轴；橙色为左臂，蓝色为右臂，姿态轴 RGB 对应 XYZ。
-下方是同步 RGB（含 TCP 投影）、深度图和 instruction/TCP 数值。
+上方左侧 3D 视图显示 footprint 坐标系中的彩色点云、完整 ALOHA URDF、
+相机视锥和双臂轨迹/姿态轴；上方右侧是严格标定的相机投影窗口，使用 episode
+保存的 `intrinsic/third_person.npy` 和 `extrinsic/third_person.npy`，将点云、URDF
+和 TCP 投到 320×240 像素坐标，不使用手动调整的虚拟相机位姿或近似 FOV。
+橙色为左臂，蓝色为右臂，姿态轴 RGB 对应 XYZ。下方是同步原始 RGB
+（含 TCP 投影）、深度图和 instruction/TCP 数值，可与右上标定视图逐帧对比。
 点云筛选不改变深度图或导出标签。`--stride` 后的 `--max-frames` 指显示帧数。
 
 回放会检查 URDF SHA256、完整标签和 FK 一致性。数据移动后会尝试默认 URDF；

@@ -35,6 +35,8 @@ ROBOT_PREFIX = "aloha/"
 ROBOT_ENTITY = "robot_model"
 TIMELINE = "episode_time"
 COLORS = ([245, 145, 45], [60, 160, 245])
+IMAGE_WIDTH = 320
+IMAGE_HEIGHT = 240
 
 
 def format_vector(values):
@@ -68,13 +70,33 @@ def prepare_robot(model, directory):
 def make_blueprint(fps):
     return rrb.Blueprint(
         rrb.Vertical(
-            rrb.Spatial3DView(
-                origin="world", name="RGB-D point cloud · ALOHA · dual TCP",
-                contents=["world/**", f"{ROBOT_ENTITY}/**"],
-                eye_controls=rrb.EyeControls3D(position=[1.6, 1.5, 1.7],
-                                             look_target=[0.25, 0, 0.85], eye_up=[0, 0, 1])),
             rrb.Horizontal(
-                rrb.Spatial2DView(origin="rgb", name="RGB · orange=left, blue=right"),
+                rrb.Spatial3DView(
+                    origin="world", name="RGB-D point cloud · ALOHA · dual TCP",
+                    contents=["world/**", f"{ROBOT_ENTITY}/**"],
+                    eye_controls=rrb.EyeControls3D(position=[1.6, 1.5, 1.7],
+                                                 look_target=[0.25, 0, 0.85], eye_up=[0, 0, 1])),
+                # A Spatial2DView rooted at the Pinhole uses its exact saved K
+                # and the named-frame transform graph. Unlike EyeControls3D,
+                # this is a calibrated projection rather than an approximate
+                # perspective view with a manually selected pose/FOV.
+                rrb.Spatial2DView(
+                    origin="world/camera_frustum",
+                    name="Calibrated camera · point cloud + URDF + TCP",
+                    contents=[
+                        "world/camera_frustum",
+                        "world/point_cloud",
+                        "world/tcp/**",
+                        f"{ROBOT_ENTITY}/**",
+                    ],
+                    visual_bounds=rrb.VisualBounds2D(
+                        x_range=[0, IMAGE_WIDTH], y_range=[0, IMAGE_HEIGHT])),
+                column_shares=[1.5, 1]),
+            rrb.Horizontal(
+                rrb.Spatial2DView(
+                    origin="rgb", name="Recorded RGB · orange=left, blue=right",
+                    visual_bounds=rrb.VisualBounds2D(
+                        x_range=[0, IMAGE_WIDTH], y_range=[0, IMAGE_HEIGHT])),
                 rrb.Spatial2DView(origin="depth", name="Optical-axis depth · metres"),
                 rrb.TextDocumentView(origin="info", name="Instruction / TCP pose"),
                 column_shares=[1, 1, 1]),
@@ -168,7 +190,8 @@ def log_scene(recording, args, meta, indices, model, tree):
         translation=camera_to_base[:3, 3], mat3x3=camera_to_base[:3, :3],
         parent_frame=BASE_FRAME, child_frame=CAMERA_FRAME), static=True)
     recording.log("world/camera_frustum", rr.Pinhole(
-        image_from_camera=intrinsic, width=320, height=240, camera_xyz=rr.ViewCoordinates.RDF,
+        image_from_camera=intrinsic, width=IMAGE_WIDTH, height=IMAGE_HEIGHT,
+        camera_xyz=rr.ViewCoordinates.RDF,
         parent_frame=CAMERA_FRAME, child_frame="third_person_image", image_plane_distance=0.15), static=True)
     recording.log("world/point_cloud", rr.CoordinateFrame(BASE_FRAME), static=True)
     log_robot(recording, model, tree, qpos, indices, timestamps)
@@ -204,7 +227,7 @@ def log_scene(recording, args, meta, indices, model, tree):
             xyz = poses_camera[i, arm, :3, 3]
             uv = intrinsic @ xyz
             pixel = uv[:2] / uv[2] if xyz[2] > 0 else np.array([-1, -1])
-            if 0 <= pixel[0] < 320 and 0 <= pixel[1] < 240:
+            if 0 <= pixel[0] < IMAGE_WIDTH and 0 <= pixel[1] < IMAGE_HEIGHT:
                 recording.log(f"rgb/tcp/{name}", rr.Points2D(
                     [pixel], colors=COLORS[arm], radii=4, labels=[f"{name} TCP"], show_labels=True))
             else:
@@ -220,6 +243,8 @@ def log_scene(recording, args, meta, indices, model, tree):
             f"3D: footprint (+X forward, +Y left, +Z up), metres.\n\n"
             f"Orange=left; blue=right. Cloud: {len(points):,} points.\n\n"
             f"Depth source: **{args.depth_source}**.\n\n"
+            "Calibrated camera panel: saved K + footprint-to-camera extrinsic; "
+            "no manually tuned viewer pose/FOV.\n\n"
             "URDF: measured front arms; other joints use recorded defaults.\n\n"
             "TCP: fixed closed-fingertip center, link6 orientation.", media_type="text/markdown"))
         if slot == 0 or (slot + 1) % 50 == 0 or slot + 1 == len(indices):
