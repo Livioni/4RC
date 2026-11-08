@@ -141,7 +141,7 @@ def read_rgbd(data, frame):
     filename = f"{meta['camera_id']}/{frame:06d}.png"
     with Image.open(path / "images" / filename) as image:
         rgb = np.asarray(image.convert("RGB"))
-    with Image.open(path / "depths" / filename) as image:
+    with Image.open(path / "depths_completed" / filename) as image:
         depth = np.asarray(image)
     shape = (meta["height"], meta["width"])
     # Pillow versions may decode 16-bit grayscale PNG into int32.
